@@ -1,0 +1,106 @@
+# Orchestrator configuration for bernacle/analyticool.
+#
+# Operator-owned: this file lives in the orchestrator, never in the target
+# repository, so the repository cannot grant itself permissions.
+# To override it locally, copy it to ~/.orchestrator/repos/bernacle/analyticool.yaml.
+
+repo: bernacle/analyticool
+base_branch: main
+# local_path: ~/src/analyticool   # optional; omit to let the orchestrator keep its own clone (recommended)
+
+linear:
+  teams: [BRU]
+  states: {}            # e.g. { in_review: "In Review" } — requires permissions.linear.update_state
+
+branch:
+  template: "orch/{key}-{slug}"
+
+toolchain:
+  node: "24"            # CONTRIBUTING.md: Node 24 + pnpm 10.34.9 (via corepack / packageManager)
+
+# Mirrors .github/workflows/ci.yml (origin/main), in the same order. `orchestrator run --dry-run`
+# warns when CI gains a step that is missing here.
+setup:
+  - name: install
+    run: pnpm install --frozen-lockfile
+    timeout_minutes: 10
+checks:
+  - name: lint
+    run: pnpm lint
+  - name: format
+    run: pnpm format:check
+  - name: typecheck
+    run: pnpm typecheck
+  - name: test
+    run: pnpm test
+  - name: net-receipts
+    run: pnpm verify:net-receipts
+  - name: net-receipts-oracle
+    run: python3 verification/net-receipts/oracle.py
+  - name: build
+    run: pnpm build
+    timeout_minutes: 20
+
+agents:
+  planner:
+    adapter: claude-code
+    timeout_minutes: 15
+    max_budget_usd: 2
+  implementer:
+    adapter: claude-code
+    permission_mode: acceptEdits
+    timeout_minutes: 45
+    max_budget_usd: 10
+    allowed_tools:
+      - Read
+      - Edit
+      - Write
+      - Glob
+      - Grep
+      - "Bash(pnpm lint:*)"
+      - "Bash(pnpm format:*)"
+      - "Bash(pnpm typecheck:*)"
+      - "Bash(pnpm test:*)"
+      - "Bash(pnpm build:*)"
+      - "Bash(pnpm exec vitest:*)"
+      - "Bash(pnpm --filter:*)"
+      - "Bash(git status:*)"
+      - "Bash(git diff:*)"
+      - "Bash(git log:*)"
+      - "Bash(ls:*)"
+    # Dependency changes need a human: CONTRIBUTING.md forbids incidental frameworks/connectors.
+    disallowed_tools:
+      - "Bash(pnpm add:*)"
+      - "Bash(pnpm install:*)"
+      - "Bash(pnpm remove:*)"
+      - WebFetch
+  reviewer:
+    adapter: codex
+    sandbox: read-only
+    timeout_minutes: 30
+
+review:
+  blocking_severities: [blocker, major]
+  require_distinct_provider: true
+
+pull_request:
+  draft: true
+  labels: []
+
+permissions:
+  agents:
+    run: true           # live runs still require `orchestrator run … --execute`
+  github:
+    push: true
+    create_pr: true     # draft PRs only (pull_request.draft)
+    merge: false
+  linear:
+    comment: false      # flip to true to post PR links / merge eligibility on the issue
+    update_state: false
+
+merge:
+  mode: manual
+  require_ci: true
+  require_independent_review: true
+  max_fix_attempts: 3
+  method: squash

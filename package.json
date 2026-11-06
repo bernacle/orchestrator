@@ -1,0 +1,41 @@
+{
+  "name": "@bernacle/orchestrator",
+  "version": "0.1.0",
+  "description": "Supervised multi-repository engineering orchestrator for Linear, GitHub, Claude Code, Codex and T3 Code.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "orchestrator": "./bin/orchestrator.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "config",
+    "integrations"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli/main.ts",
+    "orchestrator": "tsx src/cli/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "pnpm typecheck && pnpm test",
+    "smoke:agents": "tsx scripts/smoke-agents.ts"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.12"
+  }
+}
