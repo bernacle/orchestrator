@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.orchestrator/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
