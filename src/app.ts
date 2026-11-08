@@ -1,10 +1,13 @@
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createRealAdapters } from "./adapters/index.js";
+import { SnapshotTracker } from "./adapters/snapshot.js";
 import { detectT3Origin } from "./adapters/t3.js";
 import type { Adapters } from "./adapters/types.js";
 import { ConfigError, loadRepoConfig, loadRepoConfigFile, resolvePaths, resolveRepoForIssue, type LoadedRepoConfig, type Paths } from "./config/load.js";
 import { Engine, type EngineOptions } from "./core/engine.js";
+import { ALWAYS_DENIED_ENV, credentialPaths, toolchainCaches } from "./core/isolation.js";
 import { Redactor } from "./core/redact.js";
 import { TERMINAL_STATES } from "./core/states.js";
 import { Store, type RunRecord } from "./core/store.js";
@@ -30,9 +33,24 @@ export function openApp(opts: { env?: NodeJS.ProcessEnv; adapters?: (loaded: Loa
     store,
     redactor,
     env,
-    adaptersFor: opts.adapters ?? (() => createRealAdapters(redactor, env)),
+    adaptersFor:
+      opts.adapters ??
+      (() => {
+        // The keyring token is not in the environment: register its value so redaction and the
+        // pre-push secret scan recognise it.
+        redactor.add(ghTokenFromKeyring(env));
+        return createRealAdapters(redactor, env, { denyRead: credentialPaths(env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(env) });
+      }),
     close: () => store.close(),
   };
+}
+
+function ghTokenFromKeyring(env: NodeJS.ProcessEnv): string | undefined {
+  try {
+    return execFileSync("gh", ["auth", "token"], { env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export class RunError extends Error {
@@ -51,6 +69,8 @@ export interface StartOptions extends Pick<EngineOptions, "onEvent" | "interrupt
   withAgentPlan?: boolean;
   ciWaitMinutes?: number;
   acceptDependencies?: string[];
+  /** Replay Linear data from a recorded issue.json (dry runs only). */
+  issueSnapshot?: string;
 }
 
 export function resolveConfig(app: App, issueKey: string, repo?: string, configFile?: string): LoadedRepoConfig {
@@ -59,10 +79,11 @@ export function resolveConfig(app: App, issueKey: string, repo?: string, configF
   return resolveRepoForIssue(issueKey, app.paths);
 }
 
-function engineFor(app: App, loaded: LoadedRepoConfig): Engine<RunContext> {
+function engineFor(app: App, loaded: LoadedRepoConfig, snapshot?: SnapshotTracker): Engine<RunContext> {
+  const adapters = app.adaptersFor(loaded);
   return new Engine<RunContext>({
     store: app.store,
-    adapters: app.adaptersFor(loaded),
+    adapters: snapshot ? { ...adapters, tracker: snapshot } : adapters,
     config: loaded.config,
     configSource: loaded.source,
     paths: app.paths,
@@ -73,6 +94,9 @@ function engineFor(app: App, loaded: LoadedRepoConfig): Engine<RunContext> {
 
 export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<RunContext>> {
   const issueKey = opts.issueKey.toUpperCase();
+  if (opts.issueSnapshot && !opts.dryRun) throw new RunError("--issue-snapshot is for dry runs only; a live run always reads Linear");
+  const snapshot = opts.issueSnapshot ? new SnapshotTracker(opts.issueSnapshot) : undefined;
+  if (snapshot && snapshot.issue.key !== issueKey) throw new RunError(`snapshot ${opts.issueSnapshot} is for ${snapshot.issue.key}, not ${issueKey}`);
   if (!/^[A-Z][A-Z0-9]*-\d+$/.test(issueKey)) throw new RunError(`"${opts.issueKey}" is not a Linear issue key (expected e.g. BRU-488)`);
   const loaded = resolveConfig(app, issueKey, opts.repo, opts.configFile);
 
@@ -94,12 +118,13 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
         ciWaitMinutes: opts.ciWaitMinutes ?? 30,
         origin: detectT3Origin(app.env),
         acceptedDependencies: (opts.acceptDependencies ?? []).map((k) => k.toUpperCase()),
+        ...(snapshot ? { issueSnapshot: { file: snapshot.file, takenAt: snapshot.takenAt } } : {}),
       },
       configSource: loaded.source,
       rounds: [],
     },
   });
-  return engineFor(app, loaded).drive(run.id, { ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  return engineFor(app, loaded, snapshot).drive(run.id, { ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
 export function findRunOrThrow(app: App, id: string): RunRecord<RunContext> {
@@ -119,14 +144,15 @@ export async function resumeRun(
   const source = run.context.configSource;
   const loaded = source && existsSync(source) ? loadRepoConfigFile(source) : loadRepoConfig(run.repo, app.paths);
   if (loaded.config.repo !== run.repo) throw new ConfigError(`${loaded.source} now configures ${loaded.config.repo}, but the run is for ${run.repo}`);
-  if (opts.ciWaitMinutes !== undefined || opts.acceptDependencies?.length) {
-    const accepted = [...new Set([...(run.context.options.acceptedDependencies ?? []), ...(opts.acceptDependencies ?? []).map((k) => k.toUpperCase())])];
-    run = app.store.patchContext<RunContext>(run.id, {
-      options: { ...run.context.options, ...(opts.ciWaitMinutes !== undefined ? { ciWaitMinutes: opts.ciWaitMinutes } : {}), acceptedDependencies: accepted },
-    });
-  }
+  const accepted = [...new Set([...(run.context.options.acceptedDependencies ?? []), ...(opts.acceptDependencies ?? []).map((k) => k.toUpperCase())])];
+  // An operator resume grants a fresh time window (the cost cap is never reset).
+  run = app.store.patchContext<RunContext>(run.id, {
+    limitWindowStartedAt: new Date().toISOString(),
+    options: { ...run.context.options, ...(opts.ciWaitMinutes !== undefined ? { ciWaitMinutes: opts.ciWaitMinutes } : {}), acceptedDependencies: accepted },
+  });
   app.store.appendEvent(run.id, run.state, "info", "run.resume", `Resume requested at ${run.state}`);
-  return engineFor(app, loaded).drive(run.id, { resume: true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  const snap = run.context.options.issueSnapshot;
+  return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined).drive(run.id, { resume: true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
 /**

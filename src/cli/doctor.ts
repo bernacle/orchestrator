@@ -9,6 +9,7 @@ import { LinearTracker } from "../adapters/linear.js";
 import { T3Cli } from "../adapters/t3.js";
 import { listRepoConfigs, loadRepoConfig, type LoadedRepoConfig, type Paths } from "../config/load.js";
 import { probe, runProcess } from "../core/exec.js";
+import { compareVersions, MIN_CLAUDE_VERSION_FOR_ISOLATION, sandboxSupport } from "../core/isolation.js";
 import { c } from "../report/render.js";
 
 export type Status = "ok" | "warn" | "fail" | "info";
@@ -39,6 +40,18 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
   const git = await probe("git");
   add("runtime", "git", git ? "ok" : "fail", git ?? "git not found");
 
+  // ---- isolation
+  const sb = sandboxSupport();
+  add("isolation", "checks", sb.available ? "ok" : "fail", sb.available ? `${sb.detail}: setup/checks run with confined writes, unreadable credentials, no network for checks` : `${sb.detail}; live runs are blocked while isolation.require=true`);
+  const cv = (await probe("claude"))?.match(/(\d+\.\d+\.\d+)/)?.[1];
+  add(
+    "isolation",
+    "implementer",
+    cv && compareVersions(cv, MIN_CLAUDE_VERSION_FOR_ISOLATION) >= 0 ? "ok" : "fail",
+    cv ? `Claude Code ${cv} (needs ≥ ${MIN_CLAUDE_VERSION_FOR_ISOLATION}): sandboxed Bash, fenced file tools, no hooks/MCP/connectors` : "claude not found",
+  );
+  add("isolation", "unattended", "info", "not available: every live run needs an explicit `run --execute` by the operator (see docs/isolation.md)");
+
   // ---- integrations
   const gh = await ghAuthStatus();
   add("github", "gh auth", gh.ok ? "ok" : "fail", gh.detail);
@@ -53,12 +66,14 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
   }
 
   const key = linearApiKey(env);
+  let linearUrlKey: string | null = null;
   if (!key) {
     add("linear", "api key", "fail", "LINEAR_API_KEY (or LINEAR_API_KEY_FILE) not set; needed to read issues");
   } else {
     try {
       const who = await new LinearTracker(key).whoami();
       add("linear", "api key", "ok", `${who.user} @ ${who.workspace}`);
+      linearUrlKey = who.urlKey;
     } catch (err) {
       add("linear", "api key", "fail", (err as Error).message);
     }
@@ -131,6 +146,10 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
     const implProvider = config.agents.implementer.adapter === "codex" ? "openai" : config.agents.implementer.adapter === "claude-code" ? "anthropic" : "mock";
     const revProvider = config.agents.reviewer.adapter === "codex" ? "openai" : config.agents.reviewer.adapter === "claude-code" ? "anthropic" : "mock";
     add(section, "agents", implProvider !== revProvider ? "ok" : "fail", `implementer ${config.agents.implementer.adapter} (${implProvider}), reviewer ${config.agents.reviewer.adapter} (${revProvider})`);
+    if (config.permissions.linear.comment || config.permissions.linear.update_state) {
+      const match = linearUrlKey !== null && linearUrlKey === config.linear.workspace;
+      add(section, "linear", match ? "ok" : "warn", match ? `writes allowed to workspace ${config.linear.workspace} (key matches)` : `writes configured for workspace "${config.linear.workspace}" but the key resolves to "${linearUrlKey ?? "unknown"}": comments will be skipped`);
+    }
     const p = config.permissions;
     add(
       section,

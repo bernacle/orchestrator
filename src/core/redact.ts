@@ -11,15 +11,17 @@
 const SECRET_ENV_NAME = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|_KEY$)/i;
 const MIN_SECRET_LENGTH = 8;
 
-const TOKEN_PATTERNS: RegExp[] = [
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, // GitHub tokens
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\blin_(?:api|oauth)_[A-Za-z0-9]{20,}\b/g, // Linear keys
-  /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, // Anthropic / OpenAI style
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g, // Slack
-  /\b(Bearer|token)\s+[A-Za-z0-9._~+/=-]{16,}/gi,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+const NAMED_PATTERNS: Array<[string, RegExp]> = [
+  ["GitHub token", /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g],
+  ["GitHub fine-grained token", /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g],
+  ["Linear API key", /\blin_(?:api|oauth)_[A-Za-z0-9]{20,}\b/g],
+  ["Anthropic/OpenAI key", /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g],
+  ["Slack token", /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g],
+  ["AWS access key", /\bAKIA[0-9A-Z]{16}\b/g],
+  ["bearer credential", /\b(Bearer|token)\s+[A-Za-z0-9._~+/=-]{16,}/gi],
+  ["private key", /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g],
 ];
+const TOKEN_PATTERNS: RegExp[] = NAMED_PATTERNS.map(([, re]) => re);
 
 export const REDACTED = "[REDACTED]";
 
@@ -51,6 +53,23 @@ export class Redactor {
       );
     }
     return out;
+  }
+
+  /**
+   * Find secrets in text without changing it (for refusing to commit or publish).
+   * Returns labels only, never the secret itself.
+   */
+  findSecrets(input: string): string[] {
+    const found = new Set<string>();
+    for (const value of this.values) if (input.includes(value)) found.add("a known secret value (from the operator environment)");
+    for (const [label, pattern] of NAMED_PATTERNS) {
+      // "token <word>" is too common in ordinary code and prose to refuse a commit over; it is still redacted in logs.
+      if (label === "bearer credential") continue;
+      pattern.lastIndex = 0;
+      if (pattern.test(input)) found.add(label);
+      pattern.lastIndex = 0;
+    }
+    return [...found];
   }
 
   /** Deep-redact any JSON-compatible value. */

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Supervised multi-repository engineering orchestrator for Linear, GitHub, Claude Code, Codex and T3 Code.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "packageManager": "pnpm@10.34.9",
   "engines": {
     "node": ">=22.5"
@@ -12,9 +12,10 @@
     "orchestrator": "./bin/orchestrator.js"
   },
   "files": [
+    "LICENSE",
     "bin",
-    "dist",
     "config",
+    "dist",
     "integrations"
   ],
   "scripts": {
@@ -37,5 +38,9 @@
     "tsx": "^4.23.15",
     "typescript": "~5.9.3",
     "vitest": "^4.1.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bernacle/orchestrator.git"
   }
 }

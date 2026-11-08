@@ -1,4 +1,8 @@
 import type { AgentConfig } from "../config/schema.js";
+import type { SandboxSpec } from "../core/isolation.js";
+import type { PrEvidence } from "../planning/dependencies.js";
+
+export type { PrEvidence };
 
 /**
  * Adapter contracts. The engine only talks to the outside world through
@@ -43,7 +47,7 @@ export interface IssueTracker {
   comment(key: string, body: string): Promise<{ id: string }>;
   setState(key: string, stateName: string): Promise<void>;
   /** For doctor: confirm credentials and report the workspace. */
-  whoami(): Promise<{ user: string; workspace: string }>;
+  whoami(): Promise<{ user: string; workspace: string; urlKey: string }>;
 }
 
 // ---- code host (GitHub) ----------------------------------------------------------
@@ -96,6 +100,11 @@ export interface CodeHost {
   getPullRequest(repo: string, number: number): Promise<PullRequestStatus>;
   /** Must pin the head SHA; implementations must never use admin overrides. */
   mergePullRequest(input: { repo: string; number: number; headSha: string; method: "squash" | "merge" | "rebase" }): Promise<void>;
+  /**
+   * Evidence that an issue was implemented in `repo`: the PR numbers given (e.g. written next to the key
+   * in the description), PR URLs attached to the issue, and PRs whose title or body mention the key.
+   */
+  linkedPullRequests(input: { repo: string; issueKey: string; prNumbers: number[]; attachmentUrls: string[] }): Promise<PrEvidence[]>;
 }
 
 // ---- workspace (git) -------------------------------------------------------------
@@ -131,6 +140,12 @@ export interface Workspace {
   /** Stage everything and commit. Returns null when there is nothing to commit. */
   commitAll(worktreePath: string, message: string): Promise<string | null>;
   push(worktreePath: string, branch: string): Promise<void>;
+  /** Which of `paths` exist at `ref` (read-only, from git objects). */
+  filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>>;
+  /** Remove a worktree the orchestrator created (preflight only). */
+  removeWorktree(repoPath: string, worktreePath: string): Promise<void>;
+  /** Create a detached worktree at `ref` (preflight only). */
+  createDetachedWorktree(repoPath: string, worktreePath: string, ref: string): Promise<void>;
 }
 
 // ---- coding agents ---------------------------------------------------------------
@@ -145,6 +160,8 @@ export interface AgentTask {
   resumeSessionId?: string;
   /** Pre-assigned id for a new session, persisted before launch so a crash can resume it. */
   sessionId?: string;
+  /** Spend cap for this call (adapters that support one); the orchestrator passes what is left of the run budget. */
+  maxBudgetUsd?: number;
   /** JSON Schema for structured final output. */
   outputSchema?: object;
   /** Where the adapter writes raw transcripts. */
@@ -178,6 +195,8 @@ export interface AgentRunner {
   run(task: AgentTask): Promise<AgentResult>;
   /** For doctor. */
   probe(): Promise<{ ok: boolean; detail: string }>;
+  /** Can this agent run with the isolation the orchestrator requires? Live runs block if not. */
+  verifyIsolation(): Promise<{ ok: boolean; detail: string }>;
 }
 
 // ---- checks ----------------------------------------------------------------------
@@ -196,7 +215,8 @@ export interface CheckResult {
 }
 
 export interface CheckRunner {
-  run(input: { name: string; command: string; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; optional: boolean; logPath: string; signal: AbortSignal }): Promise<CheckResult>;
+  /** `sandbox: null` runs unsandboxed; callers must only do that when the operator allowed it explicitly. */
+  run(input: { name: string; command: string; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; optional: boolean; logPath: string; signal: AbortSignal; sandbox: SandboxSpec | null }): Promise<CheckResult>;
 }
 
 // ---- bundle ----------------------------------------------------------------------

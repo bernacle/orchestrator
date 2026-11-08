@@ -39,6 +39,13 @@ Non-interactive execution is fully supported:
 - **Budget:** `--max-budget-usd` caps spend per invocation.
 - `--dangerously-skip-permissions` and `--permission-mode bypassPermissions` exist. The config schema rejects them, and no code path emits them.
 
+**Sandboxing (verified 2026-11-08, see [isolation.md](isolation.md))**
+- Claude Code's `sandbox` settings confine **Bash and its child processes** using Seatbelt on macOS: writes limited to the working directory, a network proxy with a domain allow-list (empty denies everything), `filesystem.denyRead`, and `credentials.envVars` deny.
+- `failIfUnavailable: true` makes it refuse to start without the sandbox, and `allowUnsandboxedCommands: false` removes the unsandboxed-retry escape hatch.
+- Read/Edit/Write are *not* covered by the OS sandbox. `permissions.blockReadsOutsideWorkingDirectories` (≥ 2.1.257) and `blockWritesOutsideWorkingDirectories` (≥ 2.1.314) fence them.
+- `--setting-sources ""` loads no user, project or local settings, so repository hooks and allow rules don't apply. `--strict-mcp-config` loads no MCP servers. `disableClaudeAiConnectors` removes claude.ai connectors, which would otherwise give an agent your Linear workspace.
+- Corepack must be allowed to read and write `~/.cache/node/corepack`, or `pnpm` fails inside the sandbox. Preflight caught this.
+
 When the orchestrator itself runs inside a Claude Code session, it strips `CLAUDECODE` / `CLAUDE_CODE_*` from the child environment so the implementer starts as an independent session.
 
 ## Codex

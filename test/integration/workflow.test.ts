@@ -141,14 +141,102 @@ describe("supervised run", () => {
     });
     let run = await start();
     expect(run.state).toBe("BLOCKED");
-    expect(run.reason).toMatch(/declared dependency ACM-7 "Prerequisite" is In Progress/);
+    expect(run.reason).toMatch(/prerequisite ACM-7 "Prerequisite".*In Progress/);
     expect(h.implementer.calls).toHaveLength(0);
 
     run = await resumeRun(h.app, run.id, { ciWaitMinutes: 0, acceptDependencies: ["acm-7"] });
     expect(run.state).toBe("READY_TO_MERGE");
-    expect(run.context.plan!.dependencies.declared).toEqual([expect.objectContaining({ key: "ACM-7", accepted: true, resolved: false })]);
+    expect(run.context.plan!.dependencies).toEqual([expect.objectContaining({ key: "ACM-7", classification: "accepted", blocking: false })]);
     const audit = h.app.store.events(run.id).filter((e) => e.type === "dependency.accepted");
     expect(audit[0]!.message).toContain("Operator accepted ACM-7");
+  });
+
+  it("baseline: a red base blocks before the agent starts", async () => {
+    h = createHarness({ config: { baseline_checks: true } });
+    const run = await start();
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/base [0-9a-f]{8} is red before any change: feature-exists/);
+    expect(h.implementer.calls).toHaveLength(0);
+  });
+
+  it("baseline: a green base is recorded and the run proceeds", async () => {
+    h = createHarness({ config: { baseline_checks: true, checks: [{ name: "readme", run: "test -f README.md" }] } });
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(run.context.baseline).toEqual([expect.objectContaining({ name: "readme", ok: true })]);
+    expect(h.app.store.events(run.id).some((e) => e.message.includes("baseline readme"))).toBe(true);
+  });
+
+  it("fails closed when the implementer's isolation cannot be verified", async () => {
+    h = createHarness();
+    h.implementer.isolationOk = false;
+    const run = await start();
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/required isolation unavailable for the implementer/);
+    expect(h.implementer.calls).toHaveLength(0);
+  });
+
+  it("fails the run when an agent changes files outside the worktree (tripwire)", async () => {
+    h = createHarness({
+      implement: (task) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        writeFileSync(join(h.clone, ".git", "hooks", "pre-push"), "#!/bin/sh\necho pwned\n");
+        return {};
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/unexpected change outside the worktree during implementer round 0: .*\.git\/hooks/);
+    expect(h.reviewer.calls).toHaveLength(0);
+    expect(h.host.prs).toHaveLength(0);
+  });
+
+  it("refuses to push a diff that contains a secret", async () => {
+    h = createHarness({
+      implement: (task) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\nconst key = 'lin_api_abcdefghijklmnopqrstuvwxyz0123';\n");
+        return {};
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/possible secret in the diff after round 0 \(Linear API key\)/);
+    expect(run.reason).not.toContain("lin_api_abcdef");
+    expect(git(h.origin, "branch", "--list")).not.toContain("orch/");
+  });
+
+  it("stops before an agent call once the run cost cap is spent", async () => {
+    let reviews = 0;
+    h = createHarness({
+      config: { limits: { max_run_cost_usd: 1 } },
+      implement: (task, call) => {
+        writeFileSync(join(task.cwd, "feature.txt"), `v${call}\n`);
+        return { costUsd: 0.8 };
+      },
+      review: () => ({ structured: ++reviews === 1 ? requestChanges() : approve }),
+    });
+    const run = await start();
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/run cost limit reached before implementer round 1: \$0\.80 of \$1\.00/);
+    expect(h.implementer.calls).toHaveLength(1);
+  });
+
+  it("posts only milestone comments, and only to the configured Linear workspace", async () => {
+    h = createHarness();
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(h.tracker.comments.map((c) => c.body.split("\n")[0])).toEqual([expect.stringContaining("opened a draft PR"), expect.stringContaining("ready for a human")]);
+    // Re-checking merge readiness does not post again.
+    await resumeRun(h.app, run.id, { ciWaitMinutes: 0 });
+    expect(h.tracker.comments).toHaveLength(2);
+
+    const other = createHarness();
+    other.tracker.urlKey = "someone-elses-workspace";
+    const r2 = await startRun(other.app, { issueKey: "ACM-1", repo: "acme/widget", configFile: other.configFile, dryRun: false, ciWaitMinutes: 0 });
+    expect(r2.state).toBe("READY_TO_MERGE");
+    expect(other.tracker.comments).toHaveLength(0);
+    expect(other.app.store.events(r2.id).some((e) => e.type === "linear.workspace_mismatch")).toBe(true);
+    other.cleanup();
   });
 
   it("blocks when the reviewer would be the implementer's own provider", async () => {
@@ -261,6 +349,16 @@ describe("dry run", () => {
     expect(states).toEqual(["PLANNING", "IMPLEMENTING", "TESTING", "REVIEWING", "PR_OPEN", "WAITING_FOR_CI", "READY_TO_MERGE", "COMPLETED"]);
     expect(h.app.store.events(run.id).filter((e) => e.type === "effect.simulated").length).toBeGreaterThan(5);
     expect(h.app.store.artifacts(run.id).map((a) => a.label)).toEqual(expect.arrayContaining(["execution plan", "execution plan (json)"]));
+  });
+
+  it("replays a recorded Linear snapshot for dry runs only, and says so in the plan", async () => {
+    h = createHarness();
+    const live = await start({ dryRun: true });
+    const snapshot = h.app.store.artifacts(live.id).find((a) => a.label === "ACM-1 snapshot")!.path;
+    const replay = await startRun(h.app, { issueKey: "ACM-1", repo: "acme/widget", configFile: h.configFile, dryRun: true, issueSnapshot: snapshot });
+    expect(replay.state).toBe("COMPLETED");
+    expect(replay.context.plan!.warnings.join(" ")).toMatch(/replayed from snapshot .* may be stale/);
+    await expect(startRun(h.app, { issueKey: "ACM-1", repo: "acme/widget", configFile: h.configFile, dryRun: false, issueSnapshot: snapshot })).rejects.toThrow(/dry runs only/);
   });
 
   it("allows a dry run even when an active live run exists, but not a second live run", async () => {

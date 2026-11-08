@@ -14,6 +14,8 @@ export const CheckSchema = z.object({
   timeout_minutes: duration.default(15),
   /** A failing optional check is reported but does not block review. */
   optional: z.boolean().default(false),
+  /** Network inside the check sandbox. Default: none for checks, outbound for setup (see isolation). */
+  network: z.enum(["none", "outbound"]).optional(),
 });
 export type CheckConfig = z.infer<typeof CheckSchema>;
 
@@ -105,6 +107,11 @@ export const RepoConfigSchema = z
       .object({
         /** Issue key prefixes that belong to this repository, e.g. ["BRU"]. */
         teams: z.array(z.string()).min(1),
+        /**
+         * Linear workspace (organization urlKey) the API key must belong to. Writes (comments, state
+         * changes) are refused if the key resolves to a different workspace.
+         */
+        workspace: z.string().optional(),
         /** Optional Linear project names that further scope matching. */
         projects: z.array(z.string()).default([]),
         /** Workflow state names to move issues to (requires permissions.linear.update_state). */
@@ -135,14 +142,40 @@ export const RepoConfigSchema = z
       })
       .prefault({}),
     pull_request: z.object({ draft: z.boolean().default(true), labels: z.array(z.string()).default([]) }).prefault({}),
+    /**
+     * Isolation for repository code (setup, checks) and agent shells. With `require: true` a live run
+     * is BLOCKED when the sandbox is unavailable instead of running unsandboxed.
+     */
+    isolation: z
+      .object({
+        require: z.boolean().default(true),
+        setup_network: z.enum(["none", "outbound"]).default("outbound"),
+        checks_network: z.enum(["none", "outbound"]).default("none"),
+      })
+      .prefault({}),
+    /** Hard limits for one run, across all agent calls and correction rounds. */
+    limits: z
+      .object({
+        max_run_cost_usd: z.number().positive().default(25),
+        max_run_minutes: z.number().int().positive().default(240),
+      })
+      .prefault({}),
+    /** Run the checks on the untouched base first; a red base blocks the run (the agent would chase it). */
+    baseline_checks: z.boolean().default(true),
     /** Files the orchestrator refuses to commit, whatever the agent wrote. */
-    forbidden_paths: z.array(z.string()).default([".env", ".env.*", "*.pem", "*.key", "id_rsa*", ".github/workflows/**"]),
+    forbidden_paths: z.array(z.string()).default([".env", ".env.*", "*.pem", "*.key", "id_rsa*", ".github/workflows/**", ".claude/**", ".codex/**", ".mcp.json", ".npmrc", ".git/**"]),
     permissions: PermissionsSchema,
     merge: MergeSchema.prefault({}),
   })
   .superRefine((c, ctx) => {
     if (c.merge.auto_authorization && c.merge.auto_authorization.repo !== c.repo) {
       ctx.addIssue({ code: "custom", message: `merge.auto_authorization.repo (${c.merge.auto_authorization.repo}) must equal repo (${c.repo})`, path: ["merge"] });
+    }
+    if (c.merge.mode === "auto" && !c.isolation.require) {
+      ctx.addIssue({ code: "custom", message: "merge.mode=auto requires isolation.require=true", path: ["isolation"] });
+    }
+    if ((c.permissions.linear.comment || c.permissions.linear.update_state) && !c.linear.workspace) {
+      ctx.addIssue({ code: "custom", message: "Linear writes require linear.workspace (the workspace urlKey the API key must belong to)", path: ["linear", "workspace"] });
     }
     if (c.merge.mode === "auto" && !c.permissions.github.merge) {
       ctx.addIssue({ code: "custom", message: "merge.mode=auto requires permissions.github.merge=true", path: ["permissions"] });

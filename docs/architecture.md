@@ -47,10 +47,36 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
 | "Tests pass" | orchestrator | runs the configured checks itself, recording exit codes and logs |
 | "Approved" | orchestrator | reviewer (different provider, read-only sandbox) returns schema-validated findings; approved only if `verdict=approve` **and** no findings at blocking severities; malformed output means BLOCKED, never approval |
 | "What was reviewed is what ships" | orchestrator + GitHub | reviewed SHA recorded; push only if HEAD == reviewed SHA; PR head must equal it; merge uses `--match-head-commit` |
-| "Safe to commit" | orchestrator | `forbidden_paths` (`.env*`, keys, CI workflows by default) block the run |
+| "Safe to commit" | orchestrator | `forbidden_paths` (`.env*`, keys, CI workflows, agent config by default) block the run; the diff and PR text are scanned for secrets before push |
+| "Nothing escaped the worktree" | orchestrator | tripwire fingerprints of shell rc files, git config/hooks/refs and agent settings, compared around every agent and check step |
 | "Allowed to push / PR / comment / merge" | operator config | `permissions.*`, default all false; dry runs deny everything |
 
 The implementer can't approve its own work, because the reviewer is a different adapter and the config can require a different provider (`review.require_distinct_provider`, on by default). Invariants are checked at PLANNING, and a violation blocks the run.
+
+## Dependency model
+
+`src/planning/dependencies.ts` classifies every issue the target issue relates to or mentions:
+
+| Class | Source | Blocks? | Becomes non-blocking when |
+|---|---|---|---|
+| `hard_blocker` | Linear "blocked by" relation | yes | the blocker is completed in Linear (update or unlink it there; `--accept-dependency` does not override Linear) |
+| `prerequisite` | prerequisite wording on the issue's line ("depends on", "requires", "merge … first", "after X lands"), a pure "Prerequisites"/"Blocked by"/"Dependencies" heading, or the operator brief | yes | completed in Linear; **or** its implementation PR is merged with none open; **or** the files the brief names exist at the base commit; **or** the operator passes `--accept-dependency` (audited) |
+| `satisfied` | any of the above, already done | no | |
+| `accepted` | operator override | no | |
+| `reference` | mentioned without prerequisite wording, e.g. a mixed "Dependencies & references" list, "Design: …", "see also", "optional" | no | |
+| `related` | Linear "related" relation only | no | |
+
+*Implementation PR* means a PR in the target repository that carries the key in its title or branch, or that is attached to the issue in Linear. A PR whose body merely mentions the key is recorded as context and never counts as completion. Explicit negations ("not a prerequisite", "optional", "follow-up") override wording heuristics. An issue that can't be read from Linear keeps an unknown state, so a prerequisite on it stays blocking. Every item carries its evidence (relation, description line, Linear state, PRs, files, operator decision), and the plan shows all of it.
+
+## Isolation
+
+See [isolation.md](isolation.md). In short:
+- children get an allow-listed environment
+- setup and checks run under a Seatbelt profile
+- the implementer's Bash runs in Claude Code's sandbox, with file tools fenced and repository settings, hooks, MCP and connectors excluded
+- the orchestrator never runs repository hooks itself
+- tripwires and secret scans turn suspected escapes into FAILED runs
+- live runs block when isolation can't be verified
 
 ## Configuration and multi-repo
 
@@ -81,10 +107,10 @@ Analyticool is configured `manual`, and its `main` is unprotected, so the auto p
 
 ## Known limitations (v1)
 
-- **Repository agent settings apply.** Claude Code loads the target repository's project settings (`CLAUDE.md`, `.claude/skills`, and any hooks in `.claude/settings*.json`). That is usually what you want for the implementer. But hooks are code from the repository, so check them before the first live run. Analyticool currently has skills and agents, and no settings file or hooks.
-- **The implementer is not OS-sandboxed.** Claude Code's permission rules are the boundary: edits are auto-accepted, the shell is allow-listed, and git push/commit and `gh` are denied. The orchestrator's own checks run as the operator. Codex as an implementer would use its `workspace-write` sandbox.
+- **Isolation is not a VM.** See [isolation.md](isolation.md#what-is-not-covered). Unattended runs stay disabled.
 - **CI feedback is check names and links**, not log excerpts (see roadmap).
-- **Declared dependencies are heading-based.** Issue keys under a "Dependencies" / "Prerequisites" / "Blocked by" heading are treated as dependencies, conservatively including plain references. The operator accepts non-prerequisites explicitly.
+- **Prerequisite wording is heuristic.** Ambiguous text is classified conservatively in the direction stated by the wording on that line, and the evidence is shown. Operator briefs exist for the cases the heuristic gets wrong.
+- **Snapshot replays** (`--issue-snapshot`) are for dry runs only, and are labelled stale in the plan.
 - **One driver per run, one machine.** Leases detect dead processes only on the same host. That's adequate for a local tool.
 
 ## Deliberate non-goals (v1)

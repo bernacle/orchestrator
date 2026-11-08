@@ -10,6 +10,8 @@ import type { RunContext } from "../core/workflow.js";
 import { c, nextStep, renderEvent, renderPlanMarkdown, renderRunDetail, renderStatusTable, stateColor } from "../report/render.js";
 import { renderCapabilities } from "./capabilities.js";
 import { renderDoctor, runDoctor } from "./doctor.js";
+import { runPreflight } from "./preflight.js";
+import { loadRepoConfig } from "../config/load.js";
 
 const pkg = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")) as { version: string };
 
@@ -94,8 +96,9 @@ program
   .option("--with-agent-plan", "in a dry run, also run the read-only planner agent (costs tokens, changes nothing)")
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; recorded in the audit trail)", (v: string, prev: string[]) => [...prev, v], [] as string[])
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt, 30)
+  .option("--issue-snapshot <issue.json>", "dry run only: replay Linear data recorded by an earlier run (runs/<id>/issue.json)")
   .option("--json", "print the final run record as JSON")
-  .action(async (issue: string, opts: { repo?: string; config?: string; dryRun?: boolean; execute?: boolean; withAgentPlan?: boolean; acceptDependency: string[]; ciWait: number; json?: boolean }) => {
+  .action(async (issue: string, opts: { repo?: string; config?: string; dryRun?: boolean; execute?: boolean; withAgentPlan?: boolean; acceptDependency: string[]; ciWait: number; issueSnapshot?: string; json?: boolean }) => {
     if (opts.dryRun && opts.execute) throw new RunError("--dry-run and --execute are mutually exclusive");
     const dryRun = !opts.execute;
     if (!opts.dryRun && !opts.execute) console.error(c.dim("No --execute given: running as a dry run."));
@@ -109,6 +112,7 @@ program
         withAgentPlan: Boolean(opts.withAgentPlan),
         acceptDependencies: opts.acceptDependency,
         ciWaitMinutes: opts.ciWait,
+        ...(opts.issueSnapshot ? { issueSnapshot: opts.issueSnapshot } : {}),
         ...(onEvent ? { onEvent } : {}),
         interrupt: interruptSignal(),
       });
@@ -210,6 +214,28 @@ program
     withApp((app) => {
       const { run, deferred } = cancelRun(app, id);
       console.log(deferred ? `Cancellation requested for ${run.id}; the driving process will stop shortly.` : `${run.id} cancelled.`);
+    }),
+  );
+
+program
+  .command("preflight")
+  .description("Run the repository's setup and checks in a throwaway sandboxed worktree, exactly as a live run would (no agent edits, nothing pushed)")
+  .requiredOption("--repo <owner/name>", "repository to check")
+  .option("--agent-probe", "also verify the implementer's Claude Code sandbox inside the worktree (cheap model, ~$0.05)")
+  .option("--keep", "keep the throwaway worktree for inspection")
+  .action((opts: { repo: string; agentProbe?: boolean; keep?: boolean }) =>
+    withApp(async (app) => {
+      const loaded = loadRepoConfig(opts.repo, app.paths);
+      const report = await runPreflight({
+        loaded,
+        adapters: app.adaptersFor(loaded),
+        paths: app.paths,
+        agentProbe: Boolean(opts.agentProbe),
+        keep: Boolean(opts.keep),
+        onStep: (s) => console.log(`${s.ok ? c.green("✓") : c.red("✗")} ${s.kind.padEnd(11)} ${s.name.padEnd(22)} ${s.durationMs !== undefined ? c.dim(`${Math.round(s.durationMs / 1000)}s `) : ""}${s.detail}`),
+      });
+      console.log(`\n${report.ok ? c.green("Preflight passed") : c.red("Preflight failed")}: ${report.repo} @ ${report.baseSha.slice(0, 8)}\nReport: ${report.reportPath}`);
+      process.exitCode = report.ok ? 0 : 1;
     }),
   );
 

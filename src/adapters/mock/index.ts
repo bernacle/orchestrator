@@ -30,8 +30,9 @@ export class MockTracker implements IssueTracker {
   async setState(key: string, state: string): Promise<void> {
     this.stateChanges.push({ key, state });
   }
+  urlKey = "mock-workspace";
   async whoami() {
-    return { user: "mock", workspace: "mock" };
+    return { user: "mock", workspace: `Mock (${this.urlKey})`, urlKey: this.urlKey };
   }
 }
 
@@ -119,6 +120,12 @@ export class MockCodeHost implements CodeHost {
     pr.checks = this.ciScript(pr, this.reads++);
     return { ...pr, checks: [...pr.checks] };
   }
+  /** Keyed by issue key. */
+  linked: Record<string, import("../types.js").PrEvidence[]> = {};
+  async linkedPullRequests(input: { issueKey: string }): Promise<import("../types.js").PrEvidence[]> {
+    return this.linked[input.issueKey] ?? [];
+  }
+
   async mergePullRequest(input: { number: number; headSha: string }): Promise<void> {
     const pr = this.prs.find((p) => p.number === input.number)!;
     if (pr.headSha !== input.headSha) throw new Error("head mismatch");
@@ -164,5 +171,10 @@ export class MockAgent implements AgentRunner {
 
   async probe() {
     return { ok: true, detail: "mock" };
+  }
+
+  isolationOk = true;
+  async verifyIsolation() {
+    return { ok: this.isolationOk, detail: this.isolationOk ? "mock isolation" : "mock: isolation unavailable" };
   }
 }

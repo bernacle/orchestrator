@@ -6,70 +6,27 @@ export function isResolved(ref: IssueRef): boolean {
   return DONE_STATE_TYPES.has(ref.state.type);
 }
 
-export interface DependencySummary {
-  blockedBy: Array<IssueRef & { resolved: boolean }>;
-  /** Issues named under a "Dependencies"-style heading in the description (not Linear relations). */
-  declared: Array<IssueRef & { resolved: boolean; accepted: boolean }>;
-  unresolved: IssueRef[];
-  blocks: IssueRef[];
-  related: IssueRef[];
+export interface ReadinessSummary {
   parent: IssueRef | null;
   openChildren: IssueRef[];
+  blocks: IssueRef[];
   /** Reasons a live run must stop before implementation. */
   blockers: string[];
   warnings: string[];
 }
 
-/**
- * @param declared  states of issues the description lists as dependencies
- * @param accepted  keys the operator explicitly accepted as non-blocking (audited)
- */
-export function analyzeDependencies(issue: Issue, declared: IssueRef[] = [], accepted: string[] = []): DependencySummary {
-  const acceptedSet = new Set(accepted.map((k) => k.toUpperCase()));
-  const blockedBy = issue.blockedBy.map((r) => ({ ...r, resolved: isResolved(r) }));
-  const relationKeys = new Set(blockedBy.map((r) => r.key));
-  const declaredDeps = declared
-    .filter((r) => !relationKeys.has(r.key) && r.key !== issue.key)
-    .map((r) => ({ ...r, resolved: isResolved(r), accepted: acceptedSet.has(r.key) }));
-  const unresolved = [...blockedBy.filter((r) => !r.resolved), ...declaredDeps.filter((r) => !r.resolved && !r.accepted)];
+/** The issue's own readiness (not its dependencies, see dependencies.ts). */
+export function analyzeReadiness(issue: Issue): ReadinessSummary {
   const openChildren = issue.children.filter((c) => !isResolved(c));
   const blockers: string[] = [];
   const warnings: string[] = [];
-
-  for (const dep of blockedBy.filter((r) => !r.resolved)) {
-    blockers.push(`blocked by ${dep.key} "${dep.title}" (${dep.state.name})${acceptedSet.has(dep.key) ? " — Linear blocking relations cannot be accepted away; resolve or unlink it" : ""}`);
-  }
-  for (const dep of declaredDeps.filter((r) => !r.resolved)) {
-    if (dep.accepted) warnings.push(`declared dependency ${dep.key} (${dep.state.name}) accepted as non-blocking by the operator`);
-    else blockers.push(`declared dependency ${dep.key} "${dep.title}" is ${dep.state.name}; resolve it, or pass --accept-dependency ${dep.key} if it is not a prerequisite`);
-  }
   if (isResolved(issue)) blockers.push(`issue is already ${issue.state.name}`);
   if (openChildren.length > 0) {
     blockers.push(`issue has ${openChildren.length} open sub-issue(s) (${openChildren.map((c) => c.key).join(", ")}); run the sub-issues instead`);
   }
   if (issue.parent && isResolved(issue.parent)) warnings.push(`parent ${issue.parent.key} is already ${issue.parent.state.name}`);
   if (issue.state.type === "triage" || issue.state.type === "backlog") warnings.push(`issue is in ${issue.state.name}; confirm it is ready for implementation`);
-
-  return { blockedBy, declared: declaredDeps, unresolved, blocks: issue.blocks, related: issue.related, parent: issue.parent, openChildren, blockers, warnings };
-}
-
-const DEP_HEADING = /^\s*(?:#{1,6}\s*|\*\*|__)\s*(?:dependencies|dependency|depends on|prerequisites?|requires|blocked by)\b/i;
-const ISSUE_KEY = /\b([A-Z][A-Z0-9]{1,9}-\d+)\b/g;
-
-/** Issue keys listed under a "Dependencies"-style heading. Prose elsewhere is not treated as a dependency. */
-export function extractDeclaredDependencies(description: string): string[] {
-  const lines = description.split(/\r?\n/);
-  const keys = new Set<string>();
-  let inSection = false;
-  for (const line of lines) {
-    if (DEP_HEADING.test(line)) {
-      inSection = true;
-      continue;
-    }
-    if (inSection && /^\s*#{1,6}\s+\S/.test(line)) inSection = false;
-    if (inSection) for (const m of line.matchAll(ISSUE_KEY)) keys.add(m[1]!);
-  }
-  return [...keys];
+  return { parent: issue.parent, openChildren, blocks: issue.blocks, blockers, warnings };
 }
 
 // Unambiguous phrases may appear without heading markup; generic words ("Done", "Requirements") need a heading.

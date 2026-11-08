@@ -3,7 +3,8 @@ import type { ResolvedToolchain } from "../adapters/checks.js";
 import type { AgentConfig, CheckConfig, RepoConfig } from "../config/schema.js";
 import { PermissionGate, type Permission } from "../core/policy.js";
 import type { RunState } from "../core/states.js";
-import type { DependencySummary } from "./issue.js";
+import type { ClassifiedDependency, DependencyReport } from "./dependencies.js";
+import type { ReadinessSummary } from "./issue.js";
 
 // ---- agent-produced implementation plan ------------------------------------------
 
@@ -90,6 +91,22 @@ export interface AgentAssignment {
   command: string;
 }
 
+export interface IsolationReport {
+  required: boolean;
+  ok: boolean;
+  checks: { mechanism: string; available: boolean; detail: string; setupNetwork: string; checksNetwork: string };
+  agents: Array<{ role: string; adapter: string; ok: boolean; detail: string }>;
+  environment: string;
+  tripwires: number;
+  limitations: string[];
+}
+
+export interface CostEstimate {
+  /** Upper bound on metered spend (Claude Code), from configured per-call budgets and the run cap. */
+  maxMeteredUsd: number;
+  lines: string[];
+}
+
 export interface ExecutionPlan {
   version: 1;
   runId: string;
@@ -98,7 +115,12 @@ export interface ExecutionPlan {
   configSource: string;
   issue: Pick<Issue, "key" | "title" | "url" | "state" | "team" | "project" | "labels" | "priority" | "assignee" | "updatedAt"> & { commentCount: number };
   acceptanceCriteria: { criteria: string[]; source: "section" | "checklist" | "none" };
-  dependencies: DependencySummary;
+  dependencies: ClassifiedDependency[];
+  readiness: Pick<ReadinessSummary, "parent" | "openChildren" | "blocks">;
+  brief: { source: string; sha256: string; decisions: string[] } | null;
+  isolation: IsolationReport;
+  limits: { maxRunCostUsd: number; maxRunMinutes: number; maxFixAttempts: number };
+  cost: CostEstimate;
   repository: {
     repo: string;
     baseBranch: string;
@@ -160,18 +182,15 @@ export function planChecks(config: RepoConfig, inspection: RepoInspection): { ch
 }
 
 export function agentAssignment(role: AgentAssignment["role"], cfg: AgentConfig, provider: string, command: string): AgentAssignment {
-  const access =
-    role === "implementer"
-      ? cfg.adapter === "claude-code"
-        ? `edits auto-accepted (${cfg.permission_mode}); shell limited to allow-list [${cfg.allowed_tools.filter((t) => t.startsWith("Bash")).join(", ") || "none"}]; git push/commit and gh denied`
-        : cfg.adapter === "codex"
-          ? `sandbox ${cfg.sandbox}`
-          : "mock"
-      : cfg.adapter === "codex"
-        ? "read-only sandbox, approvals disabled"
-        : cfg.adapter === "claude-code"
-          ? "read-only tools (Read, Grep, Glob)"
-          : "mock";
+  let access: string;
+  if (cfg.adapter === "mock") access = "mock";
+  else if (role === "implementer") {
+    access =
+      cfg.adapter === "claude-code"
+        ? `Bash inside Claude Code's sandbox (no network, writes only in the worktree, credential paths and tokens hidden); file tools fenced to the worktree; edits auto-accepted; shell allow-list [${cfg.allowed_tools.filter((t) => t.startsWith("Bash")).join(", ") || "none"}]; git push/commit, gh, curl, package installs denied; no repo hooks, MCP servers or claude.ai connectors; scrubbed environment`
+        : `codex sandbox ${cfg.sandbox}; scrubbed environment`;
+  } else if (cfg.adapter === "codex") access = "codex read-only sandbox (no writes, no network), approvals off; scrubbed environment; output redacted";
+  else access = "read-only tools (Read, Grep, Glob) fenced to the repository; no hooks, MCP servers or connectors; scrubbed environment";
   return { role, adapter: cfg.adapter, provider, model: ("model" in cfg && cfg.model) || "provider default", access, command };
 }
 
@@ -183,7 +202,10 @@ export interface BuildPlanInput {
   configSource: string;
   issue: Issue;
   criteria: { criteria: string[]; source: "section" | "checklist" | "none" };
-  dependencies: DependencySummary;
+  readiness: ReadinessSummary;
+  dependencies: DependencyReport;
+  brief: { source: string; sha256: string; decisions: string[] } | null;
+  isolation: IsolationReport;
   repoInfo: RepoInfo;
   baseBranch: string;
   protection: BranchProtection;
@@ -205,8 +227,14 @@ export interface BuildPlanInput {
 export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
   const { config } = input;
   const { checks, notCoveredLocally, ciSteps } = planChecks(config, input.inspection);
-  const blockers = [...input.dependencies.blockers, ...input.extraBlockers];
-  const warnings = [...input.dependencies.warnings, ...input.extraWarnings];
+  const blockers = [...input.readiness.blockers, ...input.dependencies.blockers, ...input.extraBlockers];
+  const warnings = [...input.readiness.warnings, ...input.dependencies.warnings, ...input.extraWarnings];
+  if (input.isolation.required && !input.isolation.ok) {
+    if (!input.isolation.checks.available) blockers.push(`required isolation unavailable for setup/checks: ${input.isolation.checks.detail}`);
+    for (const a of input.isolation.agents) if (!a.ok) blockers.push(`required isolation unavailable for the ${a.role} (${a.adapter}): ${a.detail}`);
+  } else if (!input.isolation.required) {
+    warnings.push("isolation.require is false: setup and checks may run without an OS sandbox");
+  }
 
   for (const inv of input.invariants) if (!inv.ok) blockers.push(`${inv.rule}: ${inv.detail}`);
   for (const c of checks) if (c.verification === "script-missing") blockers.push(`check "${c.name}" runs \`${c.command}\` but package.json has no such script`);
@@ -250,17 +278,19 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
       actions: [
         act("git.fetch", "local.worktree", `Fetch origin in ${input.clonePath}`),
         act("git.worktree", "local.worktree", `Create worktree ${input.worktreePath} on new branch ${input.branch} from origin/${input.baseBranch}`, `git worktree add --no-track -b ${input.branch} ${input.worktreePath} origin/${input.baseBranch}`),
-        ...setupChecks.map((c) => act(`setup.${c.name}`, "local.checks", `Setup: ${c.name}`, c.command)),
+        ...setupChecks.map((c) => act(`setup.${c.name}`, "local.checks", `Setup: ${c.name} (sandboxed, network=${config.isolation.setup_network}, scrubbed env)`, c.command)),
+        ...(config.baseline_checks ? [act("baseline", "local.checks", `Baseline: run all ${runChecks.length} checks on the untouched base (sandboxed); a red base blocks the run`)] : []),
         act("agent.implement", "agents.run", `Start ${impl.adapter} (${impl.model}) as implementer: ${impl.access}`, impl.command),
+        act("verify.tripwire", "read", `Compare ${input.isolation.tripwires} tripwire fingerprints outside the worktree (shell rc files, git config/hooks/refs, agent settings); any change fails the run`),
         act("verify.diff", "read", "Compute changed files with git (agent self-report is not trusted); refuse forbidden paths"),
-        act("git.commit", "local.worktree", "Commit the verified changes in the worktree"),
+        act("git.commit", "local.worktree", "Commit the verified changes (repository hooks disabled), then scan the diff for secrets"),
       ],
-      exits: ["BLOCKED if the agent fails or makes no changes", "otherwise TESTING"],
+      exits: ["BLOCKED if the agent fails, makes no changes, or a limit is reached", "FAILED on a tripwire or secret-scan hit", "otherwise TESTING"],
     },
     {
       state: "TESTING",
       summary: "Run repository checks in the worktree.",
-      actions: runChecks.map((c) => act(`check.${c.name}`, "local.checks", `${c.name}${c.optional ? " (optional)" : ""}, timeout ${c.timeoutMinutes}m`, c.command)),
+      actions: runChecks.map((c) => act(`check.${c.name}`, "local.checks", `${c.name}${c.optional ? " (optional)" : ""}, timeout ${c.timeoutMinutes}m, sandboxed (network=${config.checks.find((k) => k.name === c.name)?.network ?? config.isolation.checks_network})`, c.command)),
       exits: [`FIXING if a required check fails (max ${max} correction rounds)`, "FAILED when rounds are exhausted", "otherwise REVIEWING"],
     },
     {
@@ -282,7 +312,7 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
       state: "PR_OPEN",
       summary: "Publish the reviewed commit.",
       actions: [
-        act("verify.head", "read", "Verify worktree HEAD equals the reviewed SHA"),
+        act("verify.head", "read", "Verify worktree HEAD equals the reviewed SHA; scan the full diff and PR text for secrets"),
         act("git.push", "github.push", `Push ${input.branch} to origin (never force)`, `git push --set-upstream origin HEAD:refs/heads/${input.branch}`),
         act(
           "github.pr",
@@ -290,7 +320,7 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
           input.existingPr ? `Reuse PR #${input.existingPr.number}` : `Open a ${config.pull_request.draft ? "draft " : ""}PR into ${input.baseBranch}`,
           `gh pr create --repo ${config.repo} --base ${input.baseBranch} --head ${input.branch}${config.pull_request.draft ? " --draft" : ""}`,
         ),
-        act("linear.comment", "linear.comment", `Comment the PR link on ${input.issue.key}`),
+        act("linear.comment", "linear.comment", `Milestone comment on ${input.issue.key}: PR link (once)`),
       ],
       exits: ["WAITING_FOR_CI"],
     },
@@ -313,7 +343,7 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
       summary: `Evaluate merge eligibility. merge.mode=${config.merge.mode}.`,
       actions: [
         act("merge.evaluate", "read", "Check CI, independent approval, reviewed SHA == PR head, no blocking findings, GitHub review state"),
-        act("linear.comment", "linear.comment", `Report merge eligibility on ${input.issue.key}`),
+        act("linear.comment", "linear.comment", `Milestone comment on ${input.issue.key}: merge-ready (once)`),
         config.merge.mode === "auto"
           ? act("github.merge", "github.merge", "Merge with --match-head-commit (only if every auto-merge rule holds)")
           : act("github.merge", "read", "No automatic merge: a human merges the PR (manual mode)"),
@@ -350,7 +380,12 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
       commentCount: input.issue.comments.length,
     },
     acceptanceCriteria: input.criteria,
-    dependencies: input.dependencies,
+    dependencies: input.dependencies.items,
+    readiness: { parent: input.readiness.parent, openChildren: input.readiness.openChildren, blocks: input.readiness.blocks },
+    brief: input.brief,
+    isolation: input.isolation,
+    limits: { maxRunCostUsd: config.limits.max_run_cost_usd, maxRunMinutes: config.limits.max_run_minutes, maxFixAttempts: config.merge.max_fix_attempts },
+    cost: estimateCost(config),
     repository: {
       repo: config.repo,
       baseBranch: input.baseBranch,
@@ -383,4 +418,28 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
     blockers,
     warnings,
   };
+}
+
+/** Worst-case metered spend, from configured budgets. Codex runs on the operator's ChatGPT plan and reports no cost. */
+export function estimateCost(config: RepoConfig): CostEstimate {
+  const lines: string[] = [];
+  let total = 0;
+  const p = config.agents.planner;
+  if (p?.adapter === "claude-code") {
+    const b = p.max_budget_usd ?? 0;
+    total += b;
+    lines.push(`planner: ≤ $${b.toFixed(2)} (1 call)`);
+  }
+  const i = config.agents.implementer;
+  const rounds = 1 + config.merge.max_fix_attempts;
+  if (i.adapter === "claude-code") {
+    const b = i.max_budget_usd ?? 0;
+    total += b * rounds;
+    lines.push(`implementer: ≤ $${b.toFixed(2)} per call × up to ${rounds} calls (initial + ${config.merge.max_fix_attempts} corrections)`);
+  }
+  const r = config.agents.reviewer;
+  lines.push(r.adapter === "codex" ? `reviewer (codex): up to ${rounds} reviews; billed to the Codex/ChatGPT plan, cost not reported` : `reviewer (${r.adapter}): up to ${rounds} reviews`);
+  const capped = Math.min(total, config.limits.max_run_cost_usd);
+  lines.push(`run cap: $${config.limits.max_run_cost_usd.toFixed(2)} (limits.max_run_cost_usd), wall clock ${config.limits.max_run_minutes} min`);
+  return { maxMeteredUsd: capped, lines };
 }

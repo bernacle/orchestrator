@@ -4,10 +4,18 @@
 
 ## 1. First supervised live run (next)
 
-1. Run `orchestrator run BRU-488 --repo bernacle/analyticool --dry-run --with-agent-plan` and review the plan and any open questions.
-2. Run `orchestrator run BRU-488 --repo bernacle/analyticool --execute` and watch it with `orchestrator logs <id> -f`.
-3. Expected result: a **draft** PR, with the run parked in `READY_TO_MERGE` (manual). A human reviews and merges.
-4. Afterwards, tune `allowed_tools`, timeouts and budgets from the transcripts in `runs/<id>/`.
+1. `orchestrator preflight --repo bernacle/analyticool --agent-probe` (green on 2026-11-08).
+2. `orchestrator run BRU-488 --repo bernacle/analyticool --dry-run --with-agent-plan` with a fresh Linear key. Review the plan, the dependency evidence and the open questions, and answer the questions in the brief if you want them decided.
+3. `orchestrator run BRU-488 --repo bernacle/analyticool --execute`, then watch with `orchestrator logs <id> -f`.
+4. Expected result: a **draft** PR, with the run parked in `READY_TO_MERGE` (manual). A human reviews and merges.
+5. Afterwards, tune `allowed_tools`, timeouts and budgets from the transcripts in `runs/<id>/`.
+
+## 1b. Isolation toward unattended runs
+
+- Linux check sandbox (bubblewrap), with the same profile semantics. Until it exists, live runs on Linux are blocked.
+- An egress allow-list for setup (registry only) instead of open outbound.
+- Per-run cache directories, to rule out cache poisoning across repositories.
+- A VM or container around the whole agent process, plus a dedicated low-privilege GitHub identity. **Both are prerequisites** for any unattended mode.
 
 ## 2. Plan approval gate
 

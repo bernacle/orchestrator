@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ClaudeCodeAgent, childEnv } from "../../src/adapters/claude.js";
+import { ClaudeCodeAgent, stripParentSession } from "../../src/adapters/claude.js";
 import { CodexAgent } from "../../src/adapters/codex.js";
 import { GitHubHost, mapPr } from "../../src/adapters/github.js";
 import { LinearTracker, mapIssue } from "../../src/adapters/linear.js";
@@ -35,7 +35,7 @@ describe("ClaudeCodeAgent", () => {
     expect(args).toContain("--json-schema");
   });
   it("strips parent Claude Code session variables from the child env", () => {
-    expect(childEnv({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "x", CLAUDE_CONFIG_DIR: "/c", PATH: "/bin" })).toEqual({ CLAUDE_CONFIG_DIR: "/c", PATH: "/bin" });
+    expect(stripParentSession({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "x", CLAUDE_CONFIG_DIR: "/c", PATH: "/bin" })).toEqual({ CLAUDE_CONFIG_DIR: "/c", PATH: "/bin" });
   });
 });
 

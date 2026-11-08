@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { makeIssue } from "../../src/adapters/mock/index.js";
-import { analyzeDependencies, branchNameFor, extractAcceptanceCriteria, extractDeclaredDependencies, slugify } from "../../src/planning/issue.js";
+import { analyzeReadiness, branchNameFor, extractAcceptanceCriteria, slugify } from "../../src/planning/issue.js";
 import { parseAgentPlan, scriptNameFor } from "../../src/planning/plan.js";
 import { decideReview, parseReview, ReviewParseError } from "../../src/planning/review.js";
 import { forbiddenFiles } from "../../src/core/workflow.js";
@@ -28,38 +28,11 @@ describe("acceptance criteria", () => {
   });
 });
 
-describe("dependencies", () => {
+describe("readiness", () => {
   const ref = (key: string, type: string) => ({ key, title: key, state: { name: type, type } });
-  it("blocks on unresolved blockers and open sub-issues, not on resolved ones", () => {
-    const d = analyzeDependencies(makeIssue({ key: "X-1", blockedBy: [ref("X-0", "completed"), ref("X-2", "started")], children: [ref("X-3", "unstarted")] }));
-    expect(d.unresolved.map((r) => r.key)).toEqual(["X-2"]);
-    expect(d.blockers).toHaveLength(2);
-    expect(d.blockers[0]).toContain("X-2");
-  });
-  it("blocks when the issue itself is already done", () => {
-    expect(analyzeDependencies(makeIssue({ key: "X-1", state: { name: "Done", type: "completed" } })).blockers[0]).toMatch(/already Done/);
-  });
-});
-
-describe("declared dependencies", () => {
-  const ref = (key: string, type: string) => ({ key, title: key, state: { name: type, type } });
-  it("collects issue keys only under a dependencies-style heading", () => {
-    const d = "Mentions BRU-1 in prose.\n\n## Dependencies & references\n* Design: [BRU-456](https://linear.app/x/issue/BRU-456/slug)\n* Calc: BRU-463 / PR #6 (merge first)\n\n## Notes\nBRU-999";
-    expect(extractDeclaredDependencies(d)).toEqual(["BRU-456", "BRU-463"]);
-  });
-  it("blocks on unresolved declared dependencies unless the operator accepts them", () => {
-    const issue = makeIssue({ key: "BRU-488" });
-    const declared = [ref("BRU-456", "started"), ref("BRU-460", "completed")];
-    const blocked = analyzeDependencies(issue, declared);
-    expect(blocked.blockers).toEqual([expect.stringContaining("declared dependency BRU-456")]);
-    expect(blocked.blockers[0]).toContain("--accept-dependency BRU-456");
-    const accepted = analyzeDependencies(issue, declared, ["bru-456"]);
-    expect(accepted.blockers).toEqual([]);
-    expect(accepted.warnings.join(" ")).toMatch(/BRU-456 .* accepted as non-blocking/);
-  });
-  it("cannot accept away a Linear blocking relation", () => {
-    const issue = makeIssue({ key: "BRU-488", blockedBy: [ref("BRU-1", "started")] });
-    expect(analyzeDependencies(issue, [], ["BRU-1"]).blockers[0]).toMatch(/cannot be accepted away/);
+  it("blocks when the issue is done or still has open sub-issues", () => {
+    expect(analyzeReadiness(makeIssue({ key: "X-1", state: { name: "Done", type: "completed" } })).blockers[0]).toMatch(/already Done/);
+    expect(analyzeReadiness(makeIssue({ key: "X-1", children: [ref("X-3", "unstarted")] })).blockers[0]).toMatch(/open sub-issue/);
   });
 });
 

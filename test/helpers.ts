@@ -56,13 +56,17 @@ export function baseConfig(clone: string): Record<string, unknown> {
     repo: "acme/widget",
     base_branch: "main",
     local_path: clone,
-    linear: { teams: ["ACM"] },
+    linear: { teams: ["ACM"], workspace: "mock-workspace" },
     checks: [{ name: "feature-exists", run: "test -f feature.txt" }],
+    // The fixture's check only passes after the agent's change; baseline behaviour has its own tests.
+    baseline_checks: false,
     agents: {
       implementer: { adapter: "mock", provider: "anthropic-mock" },
       reviewer: { adapter: "mock", provider: "openai-mock" },
     },
     permissions: { agents: { run: true }, github: { push: true, create_pr: true, merge: false }, linear: { comment: true } },
+    // The real Seatbelt sandbox is used where it exists; elsewhere tests run checks unsandboxed.
+    isolation: { require: process.platform === "darwin" },
     merge: { mode: "manual", max_fix_attempts: 2 },
   };
 }

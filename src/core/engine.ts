@@ -14,6 +14,11 @@ export class BlockedError extends Error {
   override name = "BlockedError";
 }
 
+/** Thrown by handlers when a safety invariant is violated: the run ends FAILED, never resumes automatically. */
+export class FailedError extends Error {
+  override name = "FailedError";
+}
+
 /** Thrown when the run is cancelled or interrupted mid-step. */
 export class StopError extends Error {
   override name = "StopError";
@@ -61,6 +66,7 @@ export interface StepContext<C> {
   effect<T>(opts: EffectOptions<T>): Promise<T | null>;
   writeArtifact(kind: string, label: string, filename: string, content: string): string;
   artifactDir: string;
+  redactor: Redactor;
   throwIfStopped(): void;
 }
 
@@ -209,6 +215,10 @@ export class Engine<C extends object> {
       } catch (err) {
         if (err instanceof StopError || signal.aborted) return null;
         if (err instanceof BlockedError) return { to: "BLOCKED", reason: err.message };
+        if (err instanceof FailedError) {
+          emit(run, "error", "safety.violation", err.message);
+          return { to: "FAILED", reason: err.message };
+        }
         const message = this.deps.redactor.redact((err as Error).message ?? String(err));
         if (TRANSIENT.test(message) && attempt < 3) {
           emit(run, "warn", "step.retry", `Transient error in ${run.state} (attempt ${attempt}/3): ${message}`);
@@ -248,6 +258,7 @@ export class Engine<C extends object> {
       gate,
       signal,
       artifactDir,
+      redactor,
       now: () => this.now(),
       throwIfStopped,
       log: (level, type, message, data) => emit(current, level, type, message, data),

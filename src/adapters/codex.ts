@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { probe, runProcess } from "../core/exec.js";
 import type { AgentConfig } from "../config/schema.js";
-import { childEnv, tryJson } from "./claude.js";
+import { tryJson } from "./claude.js";
 import type { AgentResult, AgentRunner, AgentTask } from "./types.js";
 
 type CodexConfig = Extract<AgentConfig, { adapter: "codex" }>;
@@ -52,7 +52,7 @@ export class CodexAgent implements AgentRunner {
     if (task.outputSchema) writeFileSync(p.schema, JSON.stringify(task.outputSchema, null, 2));
     const result = await runProcess(this.bin, this.args(task), {
       cwd: task.cwd,
-      env: childEnv(task.env),
+      env: task.env,
       input: task.prompt,
       timeoutMs: task.timeoutMs,
       signal: task.signal,
@@ -88,6 +88,15 @@ export class CodexAgent implements AgentRunner {
       costUsd: null,
       durationMs: result.durationMs,
       transcripts: [p.events, p.last],
+    };
+  }
+
+  async verifyIsolation(): Promise<{ ok: boolean; detail: string }> {
+    const v = await probe(this.bin);
+    if (!v) return { ok: false, detail: `${this.bin} not found on PATH` };
+    return {
+      ok: true,
+      detail: `${v}: --sandbox read-only (Seatbelt on macOS) blocks writes and network for its commands; it can still read files, so its output is redacted before use`,
     };
   }
 

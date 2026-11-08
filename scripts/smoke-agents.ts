@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeCodeAgent } from "../src/adapters/claude.js";
 import { CodexAgent } from "../src/adapters/codex.js";
+import { resolvePaths } from "../src/config/load.js";
+import { ALWAYS_DENIED_ENV, childEnv, credentialPaths, isolationDirs, toolchainCaches } from "../src/core/isolation.js";
 import { AGENT_PLAN_SCHEMA, parseAgentPlan } from "../src/planning/plan.js";
 import { decideReview, parseReview, REVIEW_OUTPUT_SCHEMA } from "../src/planning/review.js";
 
@@ -30,12 +32,16 @@ try {
   git("-c", "user.name=smoke", "-c", "user.email=smoke@local", "commit", "-qam", "tweak add");
   const head = git("rev-parse", "HEAD");
   const artifacts = mkdtempSync(join(tmpdir(), "orch-smoke-artifacts-"));
-  const common = { cwd: dir, artifactDir: artifacts, env: process.env, signal: new AbortController().signal, timeoutMs: 5 * 60_000 };
+  // Same scrubbed environment and isolation the workflow uses.
+  const paths = resolvePaths();
+  const dirs = isolationDirs(paths.home);
+  const common = { cwd: dir, artifactDir: artifacts, signal: new AbortController().signal, timeoutMs: 5 * 60_000 };
 
   if (which === "all" || which === "codex") {
     const codex = new CodexAgent({ adapter: "codex", sandbox: "read-only", timeout_minutes: 5 });
     const r = await codex.run({
       ...common,
+      env: childEnv(process.env, { agent: "codex", dirs }),
       role: "reviewer",
       artifactPrefix: "review",
       outputSchema: REVIEW_OUTPUT_SCHEMA,
@@ -50,9 +56,13 @@ try {
   }
 
   if (which === "all" || which === "claude") {
-    const claude = new ClaudeCodeAgent({ adapter: "claude-code", permission_mode: "acceptEdits", allowed_tools: [], disallowed_tools: [], timeout_minutes: 5, max_budget_usd: 0.5 });
+    const claude = new ClaudeCodeAgent(
+      { adapter: "claude-code", permission_mode: "acceptEdits", allowed_tools: [], disallowed_tools: [], timeout_minutes: 5, max_budget_usd: 0.5 },
+      { denyRead: credentialPaths(process.env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(process.env) },
+    );
     const r = await claude.run({
       ...common,
+      env: childEnv(process.env, { agent: "claude-code", dirs }),
       role: "planner",
       artifactPrefix: "plan",
       outputSchema: AGENT_PLAN_SCHEMA,

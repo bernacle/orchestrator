@@ -2,28 +2,33 @@ import { createWriteStream, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { runProcess } from "../core/exec.js";
+import { sandboxedShell, type SandboxSpec } from "../core/isolation.js";
 import type { Redactor } from "../core/redact.js";
 import type { CheckResult, CheckRunner } from "./types.js";
 
 const TAIL_LINES = 60;
 
 /**
- * Runs operator-configured check commands through /bin/sh. Commands come
- * from the operator's repository config, never from agent output.
+ * Runs operator-configured check commands through /bin/sh. The command text
+ * comes from operator config, but what it executes (package scripts, tests,
+ * build plugins) is repository code that an agent may have edited, so it runs
+ * inside the OS sandbox with a scrubbed environment.
  */
 export class ShellCheckRunner implements CheckRunner {
   constructor(private readonly redactor: Redactor) {}
 
-  async run(input: { name: string; command: string; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; optional: boolean; logPath: string; signal: AbortSignal }): Promise<CheckResult> {
+  async run(input: { name: string; command: string; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; optional: boolean; logPath: string; signal: AbortSignal; sandbox: SandboxSpec | null }): Promise<CheckResult> {
     mkdirSync(dirname(input.logPath), { recursive: true });
     const log = createWriteStream(input.logPath);
-    const result = await runProcess("/bin/sh", ["-c", input.command], {
+    const exec = input.sandbox ? sandboxedShell(input.command, input.sandbox) : { command: "/bin/sh", args: ["-c", input.command] };
+    const result = await runProcess(exec.command, exec.args, {
       cwd: input.cwd,
       env: { ...input.env, CI: "1", FORCE_COLOR: "0" },
       timeoutMs: input.timeoutMs,
       signal: input.signal,
     });
-    const combined = this.redactor.redact(`$ ${input.command}\n${result.stdout}${result.stderr ? `\n--- stderr ---\n${result.stderr}` : ""}`);
+    const header = `$ ${input.command}${input.sandbox ? `  [sandbox: seatbelt, network=${input.sandbox.network}]` : "  [UNSANDBOXED]"}`;
+    const combined = this.redactor.redact(`${header}\n${result.stdout}${result.stderr ? `\n--- stderr ---\n${result.stderr}` : ""}`);
     log.end(combined);
     await new Promise<void>((r) => log.on("close", () => r()));
     return {

@@ -37,10 +37,16 @@ function agentPlanBlock(plan: AgentPlan | null): string {
     .join("\n");
 }
 
-export function plannerPrompt(issue: Issue, criteria: string[], guidanceFiles: string[]): string {
+function briefBlock(brief: string | null | undefined): string {
+  if (!brief) return "";
+  return ["## Operator scope decisions (authoritative: where they conflict with the issue text, follow these)", brief, ""].join("\n");
+}
+
+export function plannerPrompt(issue: Issue, criteria: string[], guidanceFiles: string[], brief?: string | null): string {
   return [
     issueBlock(issue, criteria),
     "",
+    briefBlock(brief),
     "## Your task",
     "Read the repository and produce the smallest implementation plan that satisfies the acceptance criteria.",
     guidanceFiles.length ? `Start with the repository guidance: ${guidanceFiles.join(", ")}.` : "",
@@ -49,11 +55,15 @@ export function plannerPrompt(issue: Issue, criteria: string[], guidanceFiles: s
   ].join("\n");
 }
 
-export function implementerPrompt(input: { issue: Issue; criteria: string[]; plan: AgentPlan | null; checks: string[]; guidanceFiles: string[] }): string {
+export function implementerPrompt(input: { issue: Issue; criteria: string[]; plan: AgentPlan | null; checks: string[]; guidanceFiles: string[]; brief?: string | null; openQuestions?: string[] }): string {
   return [
     issueBlock(input.issue, input.criteria),
     "",
+    briefBlock(input.brief),
     agentPlanBlock(input.plan),
+    input.openQuestions?.length
+      ? `\n## Open questions nobody has answered yet\nFor each, choose the most conservative option consistent with the operator scope decisions, keep it easy to change, and list the choice you made in your final summary under "Decisions for review":\n${input.openQuestions.map((q) => `- ${q}`).join("\n")}`
+      : "",
     "",
     "## Your task",
     "Implement this issue in the current git worktree.",
@@ -97,12 +107,14 @@ export function fixPromptForCi(failing: Array<{ name: string; detailsUrl?: strin
   ].join("\n");
 }
 
-export function reviewerPrompt(input: { issue: Issue; criteria: string[]; baseSha: string; headSha: string; checks: CheckResult[]; previous: Finding[] }): string {
+export function reviewerPrompt(input: { issue: Issue; criteria: string[]; baseSha: string; headSha: string; checks: CheckResult[]; previous: Finding[]; brief?: string | null }): string {
   return [
     "You are an independent code reviewer. You did not write this change and you must not modify any file.",
     "",
     issueBlock(input.issue, input.criteria),
     "",
+    briefBlock(input.brief),
+    input.brief ? "Treat work outside the operator scope decisions as scope creep (major), and missing in-scope items as incomplete." : "",
     "## What to review",
     `Run \`git diff ${input.baseSha}...${input.headSha}\` (and read surrounding code) to see the change.`,
     "Judge it against the acceptance criteria and the repository's conventions. Look for: incorrect behaviour, missing tests for changed behaviour, unhandled edge cases, security problems, scope creep, and changes unrelated to the issue.",
@@ -129,6 +141,8 @@ export function pullRequestBody(input: {
   implementer: string;
   reviewer: string;
   reviewedSha: string;
+  openQuestions?: string[];
+  briefSource?: string | null;
 }): string {
   return [
     `Resolves ${input.issue.key}: ${input.issue.title}`,
@@ -148,8 +162,9 @@ export function pullRequestBody(input: {
       ? `${input.reviewer} reviewed \`${input.reviewedSha.slice(0, 12)}\`: **${input.review.verdict}**. ${input.review.summary}\n\n${input.review.findings.length ? `Non-blocking findings:\n${formatFindings(input.review.findings)}` : ""}`
       : "_Not reviewed._",
     "",
+    input.openQuestions?.length ? `\n## Open product questions (decided conservatively by the implementer; please confirm)\n${input.openQuestions.map((q) => `- ${q}`).join("\n")}\n` : "",
     "---",
-    `Prepared by the orchestrator (run \`${input.runId}\`). Implementer: ${input.implementer}. Correction rounds: ${input.attempts}.`,
+    `Prepared by the orchestrator (run \`${input.runId}\`). Implementer: ${input.implementer}. Correction rounds: ${input.attempts}.${input.briefSource ? ` Operator brief: \`${input.briefSource}\`.` : ""}`,
     "This PR was opened as a draft. A human decides when it is ready and merges it.",
   ].join("\n");
 }

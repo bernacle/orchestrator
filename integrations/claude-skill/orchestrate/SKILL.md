@@ -18,10 +18,12 @@ You are the operator's front-end for the `orchestrator` CLI. The CLI does the wo
 - Do not edit code yourself during an orchestrated run, do not push, and do not merge. The orchestrator never merges in `manual` mode; neither do you.
 - Report the run id, final state, blockers and the plan path exactly as printed. If the state is BLOCKED, quote the reason and the suggested `orchestrator resume` command.
 - Self-reported agent success is not verification. Point to the orchestrator's check results and reviewer findings instead.
+- When reporting a plan, include the dependency table (classification + reason) and the isolation section verbatim; never summarise a blocker away. A FAILED run caused by a tripwire or secret-scan hit means "stop and tell the user", not "retry".
 
 ## Commands
 
 ```bash
+orchestrator preflight --repo bernacle/analyticool --agent-probe   # sandboxed setup + checks + sandbox probe, nothing pushed
 orchestrator run BRU-488 --repo bernacle/analyticool --dry-run     # plan only, no side effects
 orchestrator run BRU-488 --repo bernacle/analyticool --dry-run --with-agent-plan   # + read-only planner agent
 orchestrator run BRU-488 --repo bernacle/analyticool --execute     # supervised live run (confirmed by the user)

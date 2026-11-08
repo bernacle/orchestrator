@@ -89,12 +89,12 @@ export class LinearTracker implements IssueTracker {
     return body.data;
   }
 
-  async whoami(): Promise<{ user: string; workspace: string }> {
+  async whoami(): Promise<{ user: string; workspace: string; urlKey: string }> {
     const data = await this.gql<{ viewer: { name: string }; organization: { name: string; urlKey: string } }>(
       "query { viewer { name } organization { name urlKey } }",
       {},
     );
-    return { user: data.viewer.name, workspace: `${data.organization.name} (${data.organization.urlKey})` };
+    return { user: data.viewer.name, workspace: `${data.organization.name} (${data.organization.urlKey})`, urlKey: data.organization.urlKey };
   }
 
   async getIssue(key: string): Promise<Issue> {

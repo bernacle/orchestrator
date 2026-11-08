@@ -45,13 +45,23 @@ export function renderPlanMarkdown(p: ExecutionPlan): string {
   push(`### Acceptance criteria (${p.acceptanceCriteria.source === "none" ? "none found" : `from ${p.acceptanceCriteria.source}`})`);
   push(...(p.acceptanceCriteria.criteria.length ? p.acceptanceCriteria.criteria.map((x) => `- ${x}`) : ["- _none stated_"]), "");
 
-  const d = p.dependencies;
   push("### Dependencies");
-  push(`- Blocked by: ${d.blockedBy.length ? d.blockedBy.map((r) => `${r.key} [${r.state.name}]${r.resolved ? " ✓" : " ✗ unresolved"}`).join(", ") : "none"}`);
-  push(`- Declared in description: ${d.declared.length ? d.declared.map((r) => `${r.key} [${r.state.name}]${r.resolved ? " ✓" : r.accepted ? " ⚠ accepted by operator" : " ✗ unresolved"}`).join(", ") : "none"}`);
-  push(`- Blocks: ${d.blocks.map((r) => `${r.key} [${r.state.name}]`).join(", ") || "none"}`);
-  push(`- Parent: ${d.parent ? `${d.parent.key} "${d.parent.title}" [${d.parent.state.name}]` : "none"} · open sub-issues: ${d.openChildren.map((r) => r.key).join(", ") || "none"}`);
-  push(`- Related: ${d.related.map((r) => `${r.key} [${r.state.name}]`).join(", ") || "none"}`, "");
+  if (p.dependencies.length === 0) push("- none");
+  else {
+    push("| Issue | Linear state | Classification | Blocks? | Reason |", "|---|---|---|---|---|");
+    for (const d of p.dependencies) push(`| ${d.key} ${d.title.replace(/\|/g, "/").slice(0, 60)} | ${d.state.name} | **${d.classification}** | ${d.blocking ? "yes" : "no"} | ${d.reason.replace(/\|/g, "/")} |`);
+    push("", "<details><summary>Evidence per dependency</summary>", "");
+    for (const d of p.dependencies) {
+      push(`- **${d.key}** → ${d.classification}`);
+      for (const e of d.evidence) push(`  - [${e.kind}] ${e.detail}${e.url ? ` (${e.url})` : ""}`);
+    }
+    push("", "</details>");
+  }
+  const r = p.readiness;
+  push(`- Parent: ${r.parent ? `${r.parent.key} "${r.parent.title}" [${r.parent.state.name}]` : "none"} · open sub-issues: ${r.openChildren.map((x) => x.key).join(", ") || "none"} · blocks: ${r.blocks.map((x) => x.key).join(", ") || "none"}`, "");
+  if (p.brief) {
+    push("### Operator brief", `\`${p.brief.source}\` (sha256 \`${p.brief.sha256.slice(0, 12)}\`), authoritative over the issue text for scope.`, ...p.brief.decisions.map((x) => `- ${x}`), "");
+  }
 
   push("## Repository");
   push(
@@ -71,6 +81,21 @@ export function renderPlanMarkdown(p: ExecutionPlan): string {
     `- Existing PR: ${p.workspace.existingPr ? `#${p.workspace.existingPr.number} (${p.workspace.existingPr.state}) ${p.workspace.existingPr.url}` : "none"}`,
     "",
   );
+
+  const iso = p.isolation;
+  push(`## Isolation — ${iso.ok ? "✅ available" : iso.required ? "⛔ required but unavailable (live run blocked)" : "⚠ unavailable (isolation.require=false)"}`);
+  push(
+    `- Setup and checks: ${iso.checks.available ? iso.checks.detail : `**${iso.checks.detail}**`}; setup network=${iso.checks.setupNetwork}, checks network=${iso.checks.checksNetwork}`,
+    ...iso.agents.map((a) => `- ${a.role} (${a.adapter}): ${a.ok ? "" : "**unavailable** — "}${a.detail}`),
+    `- Environment: ${iso.environment}`,
+    `- Tripwires: ${iso.tripwires} paths outside the worktree fingerprinted around every agent and check step`,
+    "- Limitations:",
+    ...iso.limitations.map((l) => `  - ${l}`),
+    "",
+  );
+
+  push("## Limits and expected cost");
+  push(`- Max correction rounds: ${p.limits.maxFixAttempts} · run cost cap $${p.limits.maxRunCostUsd.toFixed(2)} · wall clock ${p.limits.maxRunMinutes} min`, ...p.cost.lines.map((l) => `- ${l}`), `- Worst-case metered spend: $${p.cost.maxMeteredUsd.toFixed(2)}`, "");
 
   push("## Agent assignments", "| Role | Adapter | Provider | Model | Access |", "|---|---|---|---|---|");
   for (const a of p.agents) push(`| ${a.role} | ${a.adapter} | ${a.provider} | ${a.model} | ${a.access} |`);

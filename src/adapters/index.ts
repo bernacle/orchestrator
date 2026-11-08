@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { Redactor } from "../core/redact.js";
 import { ShellCheckRunner } from "./checks.js";
-import { ClaudeCodeAgent } from "./claude.js";
+import { ClaudeCodeAgent, type AgentIsolation } from "./claude.js";
 import { CodexAgent } from "./codex.js";
 import { GitWorkspace } from "./git.js";
 import { GitHubHost } from "./github.js";
@@ -18,7 +18,7 @@ export function linearApiKey(env: NodeJS.ProcessEnv = process.env): string | und
   return undefined;
 }
 
-export function createRealAdapters(redactor: Redactor, env: NodeJS.ProcessEnv = process.env): Adapters {
+export function createRealAdapters(redactor: Redactor, env: NodeJS.ProcessEnv = process.env, isolation: AgentIsolation = { denyRead: [], deniedEnv: [] }): Adapters {
   const key = linearApiKey(env);
   redactor.add(key);
   return {
@@ -29,7 +29,7 @@ export function createRealAdapters(redactor: Redactor, env: NodeJS.ProcessEnv = 
     agent(config) {
       switch (config.adapter) {
         case "claude-code":
-          return new ClaudeCodeAgent(config);
+          return new ClaudeCodeAgent(config, isolation);
         case "codex":
           return new CodexAgent(config);
         case "mock":

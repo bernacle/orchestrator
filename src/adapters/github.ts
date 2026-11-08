@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ExecError, runChecked, runProcess } from "../core/exec.js";
-import type { BranchProtection, CheckBucket, CodeHost, PullRequestStatus, RepoInfo } from "./types.js";
+import type { BranchProtection, CheckBucket, CodeHost, PrEvidence, PullRequestStatus, RepoInfo } from "./types.js";
 
 /**
  * GitHub through the official `gh` CLI, using whatever identity `gh auth`
@@ -148,10 +148,43 @@ export class GitHubHost implements CodeHost {
     return mapPr(pr);
   }
 
+  async linkedPullRequests(input: { repo: string; issueKey: string; prNumbers: number[]; attachmentUrls: string[] }): Promise<PrEvidence[]> {
+    type Lite = { number: number; url: string; title: string; state: "OPEN" | "CLOSED" | "MERGED"; mergedAt: string | null; headRefName: string; body: string };
+    const fields = "number,url,title,state,mergedAt,headRefName,body";
+    const keyRe = new RegExp(`(^|[^A-Za-z0-9])${input.issueKey}([^0-9]|$)`, "i");
+    const link = (p: Lite): PrEvidence["link"] => (keyRe.test(p.title) ? "title" : keyRe.test(p.headRefName) ? "branch" : keyRe.test(p.body ?? "") ? "body" : "none");
+    const out = new Map<number, PrEvidence>();
+    const add = (p: Lite, via: PrEvidence["via"]) => {
+      if (!out.has(p.number)) out.set(p.number, { number: p.number, url: p.url, title: p.title, state: p.state, mergedAt: p.mergedAt, via, link: link(p) });
+    };
+    for (const n of input.prNumbers) {
+      try {
+        add(await this.json<Lite>(["pr", "view", String(n), "--repo", input.repo, "--json", fields]), "description");
+      } catch {
+        /* PR number from prose may not exist in this repo */
+      }
+    }
+    for (const n of prNumbersFromUrls(input.repo, input.attachmentUrls)) {
+      try {
+        add(await this.json<Lite>(["pr", "view", String(n), "--repo", input.repo, "--json", fields]), "linear-attachment");
+      } catch {
+        /* ignore */
+      }
+    }
+    const found = await this.json<Lite[]>(["pr", "list", "--repo", input.repo, "--state", "all", "--search", `${input.issueKey} in:title,body`, "--json", fields, "--limit", "20"]);
+    for (const p of found) add(p, "search");
+    return [...out.values()].filter((p) => p.via !== "search" || p.link !== "none");
+  }
+
   async mergePullRequest(input: { repo: string; number: number; headSha: string; method: "squash" | "merge" | "rebase" }): Promise<void> {
     if (!/^[0-9a-f]{40}$/.test(input.headSha)) throw new Error("refusing to merge without a full head SHA");
     await this.gh(["pr", "merge", String(input.number), "--repo", input.repo, `--${input.method}`, "--match-head-commit", input.headSha]);
   }
+}
+
+export function prNumbersFromUrls(repo: string, urls: string[]): number[] {
+  const re = new RegExp(`github\\.com/${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/pull/(\\d+)`, "i");
+  return urls.map((u) => u.match(re)?.[1]).filter((n): n is string => Boolean(n)).map(Number);
 }
 
 interface RawPr {

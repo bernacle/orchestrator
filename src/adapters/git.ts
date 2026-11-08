@@ -4,13 +4,21 @@ import { parse as parseYaml } from "yaml";
 import { runChecked, runProcess } from "../core/exec.js";
 import type { ChangedFile, RepoInspection, Workspace } from "./types.js";
 
+/**
+ * Applied to every git command the orchestrator runs. Repository hooks and fsmonitor commands are
+ * code the repository (or an agent, by editing the worktree) controls; the orchestrator runs git
+ * with the operator's credentials and outside any sandbox, so it never executes them. Checks run
+ * explicitly, sandboxed, instead of through hooks.
+ */
+export const SAFE_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "protocol.ext.allow=never"];
+
 const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md", ".github/pull_request_template.md", "docs/ARCHITECTURE.md"];
 
 export class GitWorkspace implements Workspace {
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
 
   private git(cwd: string, args: string[], timeoutMs = 120_000): Promise<string> {
-    return runChecked("git", args, { cwd, env: { ...this.env, GIT_TERMINAL_PROMPT: "0" }, timeoutMs });
+    return runChecked("git", [...SAFE_GIT, ...args], { cwd, env: { ...this.env, GIT_TERMINAL_PROMPT: "0" }, timeoutMs });
   }
 
   async ensureClone(repo: string, clonePath: string, opts: { fetch: boolean }): Promise<void> {
@@ -31,12 +39,12 @@ export class GitWorkspace implements Workspace {
     const headSha = await this.git(root, ["rev-parse", ref ?? "HEAD"]);
     const read = async (file: string): Promise<string | null> => {
       if (!ref) return existsSync(join(root, file)) ? readFileSync(join(root, file), "utf8") : null;
-      const r = await runProcess("git", ["show", `${ref}:${file}`], { cwd: root });
+      const r = await runProcess("git", [...SAFE_GIT, "show", `${ref}:${file}`], { cwd: root });
       return r.exitCode === 0 ? r.stdout : null;
     };
     const list = async (dir: string): Promise<string[]> => {
       if (!ref) return existsSync(join(root, dir)) ? readdirSync(join(root, dir)) : [];
-      const r = await runProcess("git", ["ls-tree", "--name-only", `${ref}:${dir}`], { cwd: root });
+      const r = await runProcess("git", [...SAFE_GIT, "ls-tree", "--name-only", `${ref}:${dir}`], { cwd: root });
       return r.exitCode === 0 ? r.stdout.split("\n").filter(Boolean) : [];
     };
 
@@ -62,8 +70,8 @@ export class GitWorkspace implements Workspace {
     for (const f of GUIDANCE_FILES) if ((await read(f)) !== null) guidanceFiles.push(f);
     // Nested agent guidance (e.g. apps/demo/AGENTS.md) applies to the code below it.
     const tracked = ref
-      ? (await runProcess("git", ["ls-tree", "-r", "--name-only", ref], { cwd: root })).stdout
-      : (await runProcess("git", ["ls-files"], { cwd: root })).stdout;
+      ? (await runProcess("git", [...SAFE_GIT, "ls-tree", "-r", "--name-only", ref], { cwd: root })).stdout
+      : (await runProcess("git", [...SAFE_GIT, "ls-files"], { cwd: root })).stdout;
     for (const f of tracked.split("\n")) {
       if (/(^|\/)(AGENTS|CLAUDE)\.md$/.test(f) && f.includes("/") && !f.startsWith("node_modules/") && !guidanceFiles.includes(f)) guidanceFiles.push(f);
     }
@@ -82,8 +90,8 @@ export class GitWorkspace implements Workspace {
   }
 
   async branchExists(repoPath: string, branch: string): Promise<{ local: boolean; remote: boolean }> {
-    const local = (await runProcess("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repoPath })).exitCode === 0;
-    const remote = (await runProcess("git", ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], { cwd: repoPath })).exitCode === 0;
+    const local = (await runProcess("git", [...SAFE_GIT, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repoPath })).exitCode === 0;
+    const remote = (await runProcess("git", [...SAFE_GIT, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], { cwd: repoPath })).exitCode === 0;
     return { local, remote };
   }
 
@@ -113,7 +121,7 @@ export class GitWorkspace implements Workspace {
   }
 
   async changedFiles(worktreePath: string, baseSha: string): Promise<ChangedFile[]> {
-    const out = await this.git(worktreePath, ["diff", "--name-status", "--no-renames", `${baseSha}...HEAD`]);
+    const out = await this.git(worktreePath, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "--no-renames", `${baseSha}...HEAD`]);
     return out
       .split("\n")
       .filter(Boolean)
@@ -124,15 +132,34 @@ export class GitWorkspace implements Workspace {
   }
 
   diff(worktreePath: string, baseSha: string): Promise<string> {
-    return this.git(worktreePath, ["diff", "--stat", "--patch", `${baseSha}...HEAD`]);
+    return this.git(worktreePath, ["diff", "--no-ext-diff", "--no-textconv", "--stat", "--patch", `${baseSha}...HEAD`]);
   }
 
   async commitAll(worktreePath: string, message: string): Promise<string | null> {
     await this.git(worktreePath, ["add", "--all"]);
-    const staged = await runProcess("git", ["diff", "--cached", "--quiet"], { cwd: worktreePath });
+    const staged = await runProcess("git", [...SAFE_GIT, "diff", "--cached", "--quiet"], { cwd: worktreePath });
     if (staged.exitCode === 0) return null;
     await this.git(worktreePath, ["commit", "--quiet", "-m", message]);
     return this.headSha(worktreePath);
+  }
+
+  async filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>> {
+    const out: Array<{ path: string; exists: boolean }> = [];
+    for (const path of paths) {
+      const r = await runProcess("git", [...SAFE_GIT, "cat-file", "-e", `${ref}:${path.replace(/^\.?\//, "")}`], { cwd: repoPath });
+      out.push({ path, exists: r.exitCode === 0 });
+    }
+    return out;
+  }
+
+  async createDetachedWorktree(repoPath: string, worktreePath: string, ref: string): Promise<void> {
+    mkdirSync(dirname(worktreePath), { recursive: true });
+    await this.git(repoPath, ["worktree", "add", "--detach", worktreePath, ref]);
+  }
+
+  async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
+    await this.git(repoPath, ["worktree", "remove", "--force", worktreePath]);
+    await this.git(repoPath, ["worktree", "prune"]);
   }
 
   async push(worktreePath: string, branch: string): Promise<void> {
