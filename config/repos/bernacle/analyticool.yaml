@@ -1,0 +1,142 @@
+# Orchestrator configuration for bernacle/analyticool.
+#
+# Operator-owned: this file lives in the orchestrator, never in the target
+# repository, so the repository cannot grant itself permissions.
+# To override it locally, copy it to ~/.orchestrator/repos/bernacle/analyticool.yaml.
+
+repo: bernacle/analyticool
+base_branch: main
+# local_path: ~/src/analyticool   # optional; omit to let the orchestrator keep its own clone (recommended)
+
+linear:
+  teams: [BRU]
+  # workspace: <linear-url-key>  # required before enabling Linear writes: the key must resolve to this workspace
+  #                              (set it in ~/.orchestrator/repos/bernacle/analyticool.yaml; `orchestrator doctor` shows the key's urlKey)
+  states: {}            # e.g. { in_review: "In Review" } — requires permissions.linear.update_state
+
+branch:
+  template: "orch/{key}-{slug}"
+
+toolchain:
+  node: "24"            # CONTRIBUTING.md: Node 24 + pnpm 10.34.9 (via corepack / packageManager)
+
+# Mirrors .github/workflows/ci.yml (origin/main), in the same order. Analyticool has no aggregate
+# verify script, so these are the CI steps themselves (no duplication). `orchestrator run --dry-run`
+# warns when CI gains a step that is missing here. All run sandboxed (see isolation below).
+setup:
+  - name: install
+    run: pnpm install --frozen-lockfile
+    timeout_minutes: 10
+checks:
+  - name: lint
+    run: pnpm lint
+  - name: format
+    run: pnpm format:check
+  - name: typecheck
+    run: pnpm typecheck
+  - name: test
+    run: pnpm test
+  - name: net-receipts
+    run: pnpm verify:net-receipts
+  - name: net-receipts-oracle
+    run: python3 verification/net-receipts/oracle.py
+  - name: build
+    run: pnpm build
+    timeout_minutes: 20
+
+agents:
+  planner:
+    adapter: claude-code
+    timeout_minutes: 15
+    max_budget_usd: 2
+  implementer:
+    adapter: claude-code
+    permission_mode: acceptEdits
+    timeout_minutes: 45
+    max_budget_usd: 12
+    allowed_tools:
+      - Read
+      - Edit
+      - Write
+      - Glob
+      - Grep
+      # Every Bash command also runs inside Claude Code's sandbox (no network, writes only in the
+      # worktree). Keep entries narrow: `pnpm --filter …` / `pnpm exec <any>` would allow arbitrary commands.
+      - "Bash(pnpm lint:*)"
+      - "Bash(pnpm format:*)"
+      - "Bash(pnpm typecheck:*)"
+      - "Bash(pnpm test:*)"
+      - "Bash(pnpm build:*)"
+      - "Bash(pnpm verify:net-receipts)"
+      - "Bash(python3 verification/net-receipts/oracle.py)"
+      - "Bash(pnpm exec vitest:*)"
+      - "Bash(pnpm exec eslint:*)"
+      - "Bash(pnpm exec prettier:*)"
+      - "Bash(pnpm exec tsc:*)"
+      - "Bash(git status:*)"
+      - "Bash(git diff:*)"
+      - "Bash(git log:*)"
+      - "Bash(ls:*)"
+    # Added to the orchestrator's built-in deny list (git push/commit, gh, curl, wget, ssh, npx,
+    # pnpm dlx, security, osascript, WebFetch, …). Dependency changes need a human:
+    # CONTRIBUTING.md forbids incidental frameworks/connectors.
+    disallowed_tools:
+      - "Bash(pnpm add:*)"
+      - "Bash(pnpm install:*)"
+      - "Bash(pnpm remove:*)"
+      - "Bash(pnpm update:*)"
+      - "Bash(pnpm --filter:*)"
+      - "Bash(pnpm exec node:*)"
+      - "Bash(pnpm exec sh:*)"
+      # Not run by CI or the orchestrator, and they need a browser and a dev server: keep the
+      # implementer from spending its time budget on them inside the sandbox.
+      - "Bash(pnpm test:smoke:*)"
+      - "Bash(pnpm exec playwright:*)"
+      - "Bash(pnpm dev:*)"
+      - "Bash(pnpm start:*)"
+  reviewer:
+    adapter: codex
+    sandbox: read-only
+    timeout_minutes: 30
+
+review:
+  blocking_severities: [blocker, major]
+  require_distinct_provider: true
+
+# Hard limits for one run (all agent calls and correction rounds together).
+limits:
+  max_run_cost_usd: 30
+  max_run_minutes: 240
+
+# Repository code (pnpm install scripts, tests, build) runs in a macOS Seatbelt sandbox with a
+# scrubbed environment. Without a sandbox, a live run is BLOCKED (require: true).
+isolation:
+  require: true
+  setup_network: outbound   # pnpm install needs the registry
+  checks_network: none      # CI-equivalent checks run offline
+
+baseline_checks: true       # run all checks on the untouched base first; a red base blocks the run
+
+pull_request:
+  draft: true
+  labels: []
+
+permissions:
+  agents:
+    run: true           # live runs still require `orchestrator run … --execute`
+  github:
+    push: true
+    create_pr: true     # draft PRs only (pull_request.draft)
+    merge: false
+  linear:
+    # Milestones only (PR opened, merge-ready), and only after the key is confirmed to belong to
+    # linear.workspace. Off until the key's write access is verified; see the readiness report.
+    comment: false
+    update_state: false
+
+merge:
+  mode: manual
+  require_ci: true
+  require_independent_review: true
+  max_fix_attempts: 3
+  method: squash
