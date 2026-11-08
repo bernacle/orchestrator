@@ -5,6 +5,7 @@ import { ClaudeCodeAgent } from "../adapters/claude.js";
 import { CodexAgent } from "../adapters/codex.js";
 import { GitHubHost, ghAuthStatus } from "../adapters/github.js";
 import { LinearCredentialStore, resolveLinearKey } from "../credentials/linear.js";
+import { approvalChannelStatus } from "../core/approval.js";
 import { LinearTracker } from "../adapters/linear.js";
 import { T3Cli } from "../adapters/t3.js";
 import { listRepoConfigs, loadRepoConfig, type LoadedRepoConfig, type Paths } from "../config/load.js";
@@ -81,6 +82,9 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
       add("linear", "api key", "fail", (err as Error).message);
     }
   }
+
+  const approval = await approvalChannelStatus();
+  add("approval", approval.channel, approval.available ? "ok" : "warn", approval.detail);
 
   const claude = await new ClaudeCodeAgent({ adapter: "claude-code", permission_mode: "acceptEdits", allowed_tools: [], disallowed_tools: [], timeout_minutes: 1 }).probe();
   add("agents", "claude", claude.ok ? "ok" : "fail", claude.detail);

@@ -65,7 +65,8 @@ Only then is a run created. The resolution is stored on the run (`context.option
 | "Allowed to push / PR / comment / merge" | operator config | `permissions.*`, default all false; dry runs deny everything |
 | "This repository may be used" | operator | an operator-owned config (`config/repos/` or `~/.orchestrator/repos/`, written by `repo authorize` on first use); files in the repository are ignored |
 | "This issue belongs to this repository" | operator / evidence | explicit `--repo`, a brief, a saved confirmation, a mapped Linear project, or the issue linking to the repository; never the key prefix |
-| "Start a live run" | operator | `--execute`; skills require the user's explicit request; `ORCHESTRATOR_NO_EXECUTE=1` disables it |
+| "Start (or resume) a live run" | a person, at a system prompt | `--execute` stops for macOS LocalAuthentication (Touch ID / password) naming the run's scope; the answer is used in-process and never stored as authority, so nothing an agent writes can stand in for it (`core/approval.ts`); `ORCHESTRATOR_NO_EXECUTE=1` refuses first |
+| "Authorize this repository / confirm this association" | a person, at a system prompt | same prompt before `repo authorize` writes config or `associate` saves a mapping |
 
 The implementer can't approve its own work, because the reviewer is a different adapter and the config can require a different provider (`review.require_distinct_provider`, on by default). Invariants are checked at PLANNING, and a violation blocks the run.
 

@@ -125,6 +125,6 @@ export function evaluateAssociation(input: {
     remedy: verified
       ? null
       : `Nothing links ${issue.key} to ${repo}: no operator brief, no saved confirmation, no mapped Linear project${config.linear.projects.length ? ` (${config.linear.projects.join(", ")})` : ""}, and the issue does not link to the repository. ` +
-        `If ${issue.key} really is ${repo} work, confirm it once with \`orchestrator associate ${issue.key} --repo ${repo} --yes\` (stored in ${associationsFile(paths)}), or pass --repo ${repo} explicitly.`,
+        `If ${issue.key} really is ${repo} work, confirm it once with \`orchestrator associate ${issue.key} --repo ${repo}\` (you confirm a system prompt; stored in ${associationsFile(paths)}), or pass --repo ${repo} explicitly.`,
   };
 }

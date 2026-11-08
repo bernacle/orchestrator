@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createRealAdapters } from "./adapters/index.js";
 import { SnapshotTracker } from "./adapters/snapshot.js";
 import { detectT3Origin } from "./adapters/t3.js";
@@ -17,6 +17,9 @@ import { TERMINAL_STATES } from "./core/states.js";
 import { Store, type RunRecord } from "./core/store.js";
 import { HANDLERS, type RunContext } from "./core/workflow.js";
 import { parseIssueRef } from "./intake/issue-ref.js";
+import { approvalChannelStatus, auditApproval, describeScope, runScope, systemApprover, type ApprovalPurpose, type ApprovalResult, type Approver } from "./core/approval.js";
+import { saveAssociation, type SavedAssociation } from "./intake/association.js";
+import { authorizeProposal, proposalFile } from "./intake/proposal.js";
 
 export interface App {
   paths: Paths;
@@ -29,6 +32,13 @@ export interface App {
   trackerFor(workspace: string | null): { tracker: IssueTracker; credential: ResolvedLinearKey };
   /** Git/SSH access for repository discovery (injected in tests). */
   discovery: DiscoveryDeps;
+  /**
+   * Asks a person to approve live runs, repository authorization and associations (core/approval.ts).
+   * Only code can replace it (tests); there is no flag or environment variable that does.
+   */
+  approver: Approver;
+  /** Whether the approval prompt can be shown in this session (no UI). Absent in tests. */
+  approvalStatus?: () => Promise<{ channel: string; available: boolean; detail: string }>;
   close(): void;
 }
 
@@ -38,6 +48,7 @@ export function openApp(
     adapters?: (loaded: LoadedRepoConfig) => Adapters;
     tracker?: (workspace: string | null) => IssueTracker;
     discovery?: DiscoveryDeps;
+    approver?: Approver;
     now?: () => Date;
   } = {},
 ): App {
@@ -71,6 +82,8 @@ export function openApp(
       return { tracker: new LinearTracker(credential.key, undefined, credential.problem ?? undefined), credential };
     },
     discovery: opts.discovery ?? defaultDiscoveryDeps(env),
+    approver: opts.approver ?? systemApprover(),
+    ...(opts.approver ? {} : { approvalStatus: () => approvalChannelStatus() }),
     close: () => store.close(),
   };
 }
@@ -91,7 +104,7 @@ export class RunError extends Error {
 export class IntakeError extends RunError {
   override name = "IntakeError";
   constructor(
-    readonly code: Problem["code"] | "execution_disabled" | "no_run",
+    readonly code: Problem["code"] | "execution_disabled" | "no_run" | "approval_required" | "not_permitted",
     message: string,
     readonly details: unknown = null,
   ) {
@@ -176,6 +189,19 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
   for (const w of inspected.warnings) opts.onEvent?.({ level: "warn", state: "QUEUED", type: "intake.warning", message: w });
   const linearWorkspace = opts.linearWorkspace?.toLowerCase() ?? ref.workspace;
 
+  // ---- live runs: repository permission, then a person's approval of this exact scope.
+  let authorization: RunContext["authorization"] = null;
+  if (!opts.dryRun) {
+    if (!loaded.config.permissions.agents.run) {
+      throw new IntakeError("not_permitted", `${loaded.config.repo}'s configuration (${loaded.source}) does not grant live runs (permissions.agents.run is false); only dry runs are possible`);
+    }
+    const { scope, hash } = runScope({ issue: issueKey, config: loaded.config, configSource: loaded.source, acceptedDependencies: opts.acceptDependencies ?? [] });
+    const title = inspected.issue.title ?? (await app.trackerFor(linearWorkspace ?? loaded.config.linear.workspace ?? null).tracker.getIssue(issueKey).then((i) => i.title).catch(() => null));
+    const last = app.store.runsFor(issueKey, loaded.config.repo, 10).find((r) => r.mode === "dry_run") as RunRecord<RunContext> | undefined;
+    const lastDryRun = last ? `${last.id} ${last.state}${last.context.plan ? `, ${last.context.plan.blockers.length} blocker(s)` : ""}, ${last.createdAt.slice(0, 16).replace("T", " ")}` : null;
+    authorization = await requireApproval(app, "live_run", { issue: issueKey, repo: loaded.config.repo, scopeHash: hash, ...describeScope(scope, { title, lastDryRun }) });
+  }
+
   const run = app.store.createRun<RunContext>({
     id: newRunId(issueKey),
     issueKey,
@@ -199,8 +225,10 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
       },
       configSource: loaded.source,
       rounds: [],
+      authorization,
     },
   });
+  if (authorization) app.store.appendEvent(run.id, "QUEUED", "info", "run.authorized", `Live run approved by ${authorization.user} via ${authorization.channel} (scope ${authorization.scopeHash.slice(0, 12)})`, authorization);
   return engineFor(app, loaded, snapshot, linearWorkspace).drive(run.id, { ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
@@ -218,18 +246,37 @@ export async function resumeRun(
 ): Promise<RunRecord<RunContext>> {
   let run = findRunOrThrow(app, id);
   if (TERMINAL_STATES.has(run.state)) throw new RunError(`run ${run.id} is ${run.state}; start a new run instead`);
+  if (run.mode === "supervised" && app.env.ORCHESTRATOR_NO_EXECUTE) throw new IntakeError("execution_disabled", "live runs are disabled in this environment (ORCHESTRATOR_NO_EXECUTE is set)");
   const source = run.context.configSource;
   const loaded = source && existsSync(source) ? loadRepoConfigFile(source) : loadRepoConfig(run.repo, app.paths);
   if (loaded.config.repo !== run.repo) throw new ConfigError(`${loaded.source} now configures ${loaded.config.repo}, but the run is for ${run.repo}`);
   const accepted = [...new Set([...(run.context.options.acceptedDependencies ?? []), ...(opts.acceptDependencies ?? []).map((k) => k.toUpperCase())])];
+
+  // Every resume of a live run asks a person again. The approval stored on the run is audit only:
+  // the store is a file an agent can write, so a stored record can never stand in for consent.
+  let authorization = run.context.authorization ?? null;
+  if (run.mode === "supervised") {
+    if (!loaded.config.permissions.agents.run) throw new IntakeError("not_permitted", `${run.repo}'s configuration no longer grants live runs (permissions.agents.run is false)`);
+    const { scope, hash } = runScope({ issue: run.issueKey, config: loaded.config, configSource: loaded.source, acceptedDependencies: accepted });
+    const changed = authorization && authorization.scopeHash !== hash ? " (scope changed since the run was approved)" : !authorization ? " (no approval on record)" : "";
+    const d = describeScope(scope, { title: run.context.issue?.title ?? null });
+    authorization = await requireApproval(app, "resume_live_run", {
+      issue: run.issueKey,
+      repo: run.repo,
+      scopeHash: hash,
+      reason: `resume live Orchestrator run ${run.id} at ${run.state}${changed}: ${d.reason.replace(/^start a live Orchestrator run of /, "")}`,
+      details: [`Run:         ${run.id} (${run.state}${run.reason ? `: ${run.reason}` : ""})`, ...d.details],
+    });
+    app.store.appendEvent(run.id, run.state, "info", "run.authorized", `Resume approved by ${authorization.user} via ${authorization.channel}${changed}`, authorization);
+  }
   // An operator resume grants a fresh time window (the cost cap is never reset).
   run = app.store.patchContext<RunContext>(run.id, {
     limitWindowStartedAt: new Date().toISOString(),
     options: { ...run.context.options, ...(opts.ciWaitMinutes !== undefined ? { ciWaitMinutes: opts.ciWaitMinutes } : {}), acceptedDependencies: accepted },
+    authorization,
   });
   app.store.appendEvent(run.id, run.state, "info", "run.resume", `Resume requested at ${run.state}`);
   const snap = run.context.options.issueSnapshot;
-  if (run.mode === "supervised" && app.env.ORCHESTRATOR_NO_EXECUTE) throw new IntakeError("execution_disabled", "live runs are disabled in this environment (ORCHESTRATOR_NO_EXECUTE is set)");
   return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
@@ -247,4 +294,54 @@ export function cancelRun(app: App, id: string): { run: RunRecord<RunContext>; d
   }
   const cancelled = app.store.transition<RunContext>(run.id, run.version, { to: "CANCELLED", reason: "cancelled by operator" });
   return { run: cancelled, deferred: false };
+}
+
+// ---- approvals ------------------------------------------------------------------------------
+
+/** Ask a person (never the caller's arguments) and record the answer; throws unless approved. */
+export async function requireApproval(
+  app: App,
+  purpose: ApprovalPurpose,
+  req: { issue: string | null; repo: string; scopeHash: string; reason: string; details: string[] },
+): Promise<NonNullable<RunContext["authorization"]>> {
+  const full = { purpose, ...req };
+  let res: ApprovalResult;
+  try {
+    res = await app.approver.request(full);
+  } catch (err) {
+    res = { approved: false, channel: app.approver.channel, detail: `approval failed: ${(err as Error).message}`, at: new Date().toISOString(), user: "unknown" };
+  }
+  auditApproval(app.paths.home, full, res);
+  if (!res.approved) {
+    throw new IntakeError("approval_required", `not approved: ${res.detail}. Nothing was started or changed. To ${req.reason}, run the same command again and confirm the system prompt on this Mac (an agent cannot answer it for you).`, { purpose, channel: res.channel, scopeHash: req.scopeHash });
+  }
+  return { purpose, scopeHash: req.scopeHash, approvedAt: res.at, channel: res.channel, user: res.user, detail: res.detail };
+}
+
+/** `orchestrator repo authorize`: grants the pending proposal's permissions after a person approves. */
+export async function authorizeRepository(app: App, repo: string, opts: { readOnly?: boolean; replace?: boolean } = {}): Promise<ReturnType<typeof authorizeProposal>> {
+  const pending = proposalFile(app.paths, repo);
+  if (!existsSync(pending)) throw new ConfigError(`no pending proposal for ${repo}; run \`orchestrator repo init\` in its checkout (or with --repo ${repo}) first`);
+  const sha = createHash("sha256").update(readFileSync(pending)).digest("hex");
+  await requireApproval(app, "authorize_repository", {
+    issue: null,
+    repo,
+    scopeHash: sha,
+    reason: opts.readOnly ? `authorize Orchestrator dry runs (no agent runs or remote writes) for ${repo}` : `authorize Orchestrator for ${repo} with the permissions in its proposal (agent runs, push, draft PRs; merge stays manual)`,
+    details: [`Proposal: ${pending} (sha256 ${sha.slice(0, 12)})`, `Scope:    ${opts.readOnly ? "read-only (dry runs only)" : "as proposed"}`],
+  });
+  // The proposal is re-hashed inside authorizeProposal; the approval names the same file.
+  return authorizeProposal(app.paths, repo, opts);
+}
+
+/** `orchestrator associate`: records that an issue is this repository's work after a person approves. */
+export async function confirmAssociation(app: App, input: { issue: string; repo: string; workspace: string | null }): Promise<SavedAssociation> {
+  await requireApproval(app, "confirm_association", {
+    issue: input.issue,
+    repo: input.repo,
+    scopeHash: `${input.issue}->${input.repo.toLowerCase()}`,
+    reason: `record that Linear issue ${input.issue} is work for ${input.repo}`,
+    details: [`Issue:      ${input.issue}${input.workspace ? ` (workspace ${input.workspace})` : ""}`, `Repository: ${input.repo}`],
+  });
+  return saveAssociation(app.paths, { tracker: "linear", issue: input.issue, repo: input.repo, workspace: input.workspace });
 }

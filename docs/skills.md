@@ -28,29 +28,64 @@ All three reach the same CLI, engine, durable run store and policies. The skill 
 
 ## How a request flows
 
-| Stage | Who | What happens | Needs your approval? |
+| Stage | Who | What happens | Who has to say yes, and how it's checked |
 |---|---|---|---|
-| 1. Discovery | the model | recognizes an Orchestrator request and loads the skill | no |
-| 2. Preparation | `orchestrator context <issue> --json` | read-only: issue reference, repository, configuration, Linear credentials, issue ↔ repository evidence, existing runs, available modes | no |
-| 3. Repository authorization | `orchestrator repo init` → `orchestrator repo authorize` | first use only: a proposal you review, then explicit authorization | **yes** |
-| 4. Run authorization | `orchestrator run <issue> --execute` | a live run for this issue | **yes** ("start it", "execute"; "implement X with Orchestrator" means prepare) |
-| 5. Execution | the engine | in its own clone and worktree, sandboxed (see [isolation.md](isolation.md)) | — |
-| 6. Review | the engine | independent reviewer from a different provider | — |
-| 7. Merge | you | `merge.mode: manual` by default; the engine never merges in manual mode | yours to do |
+| 1. Discovery | the model | recognizes an Orchestrator request and loads the skill | nobody (loading a skill grants nothing) |
+| 2. Preparation | `orchestrator context <issue> --json` | read-only: issue reference, repository, configuration, Linear credentials, issue ↔ repository evidence, existing runs, available modes | nobody |
+| 3. Dry run | `orchestrator run <issue>` | plan + simulated timeline; reads Linear and GitHub, fetches into the orchestrator's own clone, changes nothing | nobody |
+| 4. Repository authorization | `orchestrator repo init` → `orchestrator repo authorize` | first use only: a proposal you review, then an operator-owned config | **you, in a system prompt** (engine-enforced) |
+| 5. Run authorization | `orchestrator run <issue> --execute` | a live run of this issue with this exact scope | **you, in a system prompt** (engine-enforced), every live run and every resume |
+| 6. Execution | the engine | in its own clone and worktree, sandboxed (see [isolation.md](isolation.md)), within the config's `permissions` | — |
+| 7. Review | the engine | independent reviewer from a different provider | — |
+| 8. Merge | you | `merge.mode: manual` by default; the engine never merges in manual mode | yours to do |
 
-Loading the skill is not authorization. Without your explicit go-ahead in the conversation, the skill must not:
+A new natural-language request becomes a **dry run**. "Implement BRU-488 using Orchestrator" means prepare. When you say "start it" or "execute", the skill runs `--execute`, and then **you confirm on your Mac**.
 
-- run `--execute`, or resume a live run;
-- authorize a repository, or confirm an issue ↔ repository association;
-- change orchestrator config or permissions.
+## Live-run authorization: what is enforced, and what is only instructed
 
-The engine enforces the rest regardless of what an agent does: permissions come only from operator-owned config, there are no bypass modes, and every guarantee in the README still applies.
+### Enforced by Orchestrator itself, whatever the agent does
 
-A new natural-language request becomes a **dry run** unless you asked for a live run. For "start the Orchestrator implementation of BRU-488", the skill doesn't ask a second time. It checks that `context` reports no problems, that the `supervised` mode is available, and that a dry run in the conversation has no blockers. Then it starts the live run in the background and reports the run id.
+**A person approves every live run, through a channel an agent can't answer.**
 
-> **The CLI can't tell you from an agent acting for you.** The run-authorization rule lives in the skill, and in the host's permission prompts when the session has them (T3 sessions often run in full-access mode, so then they don't). Two hard stops are available whatever the agent decides:
-> - `ORCHESTRATOR_NO_EXECUTE=1` in an environment makes the engine refuse `--execute` and resuming live runs.
-> - `permissions.*: false` in a repository's config denies that capability to every caller.
+- **How it asks.** `orchestrator run … --execute` (and `resume` of a live run, `repo authorize`, `associate`) first checks the request. Then, before anything is created, it asks you to confirm with a **macOS LocalAuthentication prompt**: Touch ID, Apple Watch or your login password.
+- **What the prompt names.** The exact scope: issue, repository, agents, the pushes and PRs it may make, the merge mode and the budget. The same scope is printed to the terminal, so the agent can relay it.
+- **Why an agent can't answer it.** The sheet is drawn by the system, which ignores synthetic clicks and keystrokes. It is raised through `/usr/bin/osascript` by absolute path, so a PATH entry can't stand in for it.
+- **No stored approval exists to forge.** The answer is used in the process that asked, then discarded. The run records it only as audit (`context.authorization`, a `run.authorized` event, and `~/.orchestrator/audit/approvals.jsonl`). There is no `--yes`, `--approved` or `--confirm` flag, and no environment variable that skips the prompt. Tests inject a stand-in approver in code only.
+- **Bound to one scope.** Each approval covers one issue, repository, config file, permission set, agents, limits, merge policy and accepted dependencies. Every new live run asks again.
+- **Resume asks again too.** The run store is a file an agent could write, so a stored approval is never accepted as consent on resume.
+- **Refusal stops everything.** If you refuse, cancel or don't answer within 180 s, nothing is created. The command fails with `approval_required` and says why. The same happens if the prompt can't be shown, for example over SSH with no desktop session. On macOS there is no weaker fallback.
+- **Repository authorization stays a separate check.** An approval never widens a repository's `permissions`: `agents.run` must be granted to ask at all, and push and PR permissions still apply at each step. Repository authorization is checked first, and run authorization is asked for each run.
+- **`ORCHESTRATOR_NO_EXECUTE=1`** refuses live runs and live resumes before anyone is asked.
+- **Other operating systems** use a typed confirmation on the controlling terminal (`/dev/tty`, not stdin), where you type the issue key. This is weaker: a process that allocates a pseudo-terminal can type it.
+
+`orchestrator doctor` and `orchestrator context` report whether the approval prompt is available in the current session.
+
+### Instructed (model behaviour, not enforcement)
+
+The skill tells the agent:
+
+- to treat "implement X with Orchestrator" as *prepare*;
+- to start a live run only when you ask for one in the conversation, and only after a clean dry run;
+- to tell you to confirm the prompt on your Mac;
+- never to work around the prompt;
+- never to edit, push or merge an orchestrated issue itself.
+
+A model can ignore instructions. The prompt above is what holds when it does.
+
+### What this cannot stop
+
+A full-access agent shell can do anything you can. It can edit Orchestrator's code or call its internals to skip the check. It can run `claude` or `git push` without Orchestrator. And if the app hosting it has been granted macOS Accessibility (UI scripting) permission, it might drive other UI, though not the system authentication sheet.
+
+The boundary guarantees that *Orchestrator* never becomes the vehicle for unapproved live work. To contain a misbehaving agent itself, run it with approval-required permissions in T3 or the provider; Orchestrator's preparation commands are pre-approved in the Claude skill, so they don't stall there. Keep repository `permissions` minimal, too.
+
+### Approving a live run, step by step
+
+1. In any project: *"I want to implement BRU-488 using Orchestrator."* The skill prepares and shows a dry run.
+2. *"Looks good, start it."* The skill runs `orchestrator run BRU-488 --execute` in the background.
+3. A macOS prompt appears: *"osascript is trying to start a live Orchestrator run of BRU-488 on bernacle/analyticool: claude-code implements in an isolated worktree, codex reviews, pushes a branch, opens a draft PR; merge manual; budget $30."* Confirm with Touch ID or your password.
+4. The run starts. Ask for status, review findings or resume in plain language. Each resume shows the prompt again.
+
+From a terminal, `orchestrator run BRU-488 --execute` behaves the same way.
 
 ## Automatic discovery: what is and isn't guaranteed
 
@@ -86,14 +121,23 @@ What is measured, not guaranteed: whether a model picks the skill for a particul
 
 Targets:
 
-- **Claude Code:** `$CLAUDE_CONFIG_DIR/skills` (or `~/.claude/skills`), plus every Claude config dir that T3 provider instances are configured with. T3 can run Claude Code with its own home path per instance. The installer reads `~/.t3/userdata/settings.json` for those paths and never writes it. Override the detection with `--claude-home <dir>` (repeatable).
+- **Claude Code:** `$CLAUDE_CONFIG_DIR/skills` (or `~/.claude/skills`), plus every Claude config dir that T3 provider instances are configured with. T3 can run Claude Code with its own home path per instance; on this machine, T3's "Personal" Claude instance uses `~/.claude-work2`. The installer reads `~/.t3/userdata/settings.json` for those paths and never writes it. Override the detection with `--claude-home <dir>` (repeatable). The Claude package pre-approves (`allowed-tools`) only `context`, `status`, `review`, `run` and `repo init`. This is safe because `run --execute` is gated by the engine's prompt. `resume`, `repo authorize`, `associate` and `auth` still go through Claude Code's own permission prompt in approval-required sessions.
 - **Codex:** `~/.agents/skills` (override with `--codex-skills-dir`). If an Orchestrator-owned copy also exists in `$CODEX_HOME/skills`, the installer removes it, because Codex would list both. A copy it doesn't own is only reported.
 
-The installed skill calls the CLI by its absolute path, so it works without `orchestrator` on `PATH`. If you move the checkout, run `orchestrator skill install --all` again; `skill status` flags a dead path.
+### Stable launcher and runtime
+
+Installed skills call one command: **`~/.orchestrator/bin/orchestrator`** (under `$ORCHESTRATOR_HOME`). It is a small shell launcher written by `skill install`. They never call a checkout path or a Node binary directly, which keeps them working when:
+
+- the development worktree is deleted or the checkout moves. Re-running `orchestrator skill install --all` from the new location repoints the launcher, and the skills themselves don't change. If the target is gone, the launcher exits with a message saying exactly that;
+- an agent's shell has another Node first on PATH. Codex's login shell resolved `node` to v16. The launcher picks the first Node ≥ 22.5 from: `$ORCHESTRATOR_NODE`, the Node that ran the install, `~/.nvm/versions/node/*`, Homebrew, `/usr/local`, then `PATH`.
+
+Install from a **stable** location: a regular checkout such as `~/Dev/orchestrator`, or a global package install (`corepack pnpm add -g` / `npm install -g` of this package, which ships `bin`, `dist`, `config` and `integrations`). `skill install` **refuses** to point the launcher at a linked git worktree, a temp directory or `~/.t3/worktrees/…`, because those get deleted. `--allow-ephemeral` exists for development only. `skill status` shows the launcher's target and whether it is stable, ephemeral or gone.
+
+Requirements: Node ≥ 22.5 (24 recommended) somewhere the launcher can find, plus `git`, `gh`, `claude` and `codex` on the agent's PATH for live runs.
 
 Ownership and upgrades:
 
-- Each installed directory has a `.orchestrator-skill.json` marker: owner, version, CLI path, and the sha256 of every file written. Without a marker, a directory is somebody else's skill: install and uninstall leave it alone.
+- Each installed directory has a `.orchestrator-skill.json` marker: owner, version, the launcher path, and the sha256 of every file written. Without a marker, a directory is somebody else's skill: install and uninstall leave it alone.
 - `install` is idempotent. It also upgrades an outdated, unmodified install.
 - `update --all` upgrades existing installs only.
 - A file whose hash changed was edited by you. Updates and uninstalls keep it unless you pass `--force`. A forced update first moves your copy to `SKILL.md.orig-<timestamp>`.
@@ -124,7 +168,7 @@ The working directory is only used to identify the repository. Runs never execut
 The issue's key prefix never decides the repository. BRU-488 being a BRU issue doesn't make it Analyticool work. When the repository was found from the working directory or a team mapping, the engine needs evidence:
 
 1. an operator brief for the issue and repository (`config/briefs/<owner>/<repo>/<KEY>.md`);
-2. a confirmation you gave before (`orchestrator associate BRU-488 --repo owner/name --yes`, stored in `~/.orchestrator/associations.json`);
+2. a confirmation you gave before (`orchestrator associate BRU-488 --repo owner/name`, confirmed in a system prompt, stored in `~/.orchestrator/associations.json`);
 3. the issue's Linear project mapped in the repository config (`linear.projects`);
 4. the issue linking to `github.com/<owner>/<repo>` (attachment or description). This is untrusted text, so it can only confirm a repository you already configured and selected.
 
@@ -136,7 +180,7 @@ Discovery is not authorization. For a repository with no operator config:
 
 1. `orchestrator repo init --json` inspects the repository read-only (`git show`; nothing in the working tree is executed). It reads the remote default branch as last fetched, or HEAD. From there it takes the scripts, the lockfile and package manager, the Node engine and the CI workflow steps. Checks mirror the CI workflow's single-line run steps (installs excluded); without CI, they come from conventional script names. Then it writes a **pending** proposal to `~/.orchestrator/proposals/<owner>/<name>.yaml`. The proposal grants nothing. Any orchestrator-looking config inside the repository is reported and ignored.
 2. The skill shows you the proposal summary: tracker, agents, setup and checks, CI steps, execution policy, GitHub and Linear permissions, budget and merge policy.
-3. Only after your approval, `orchestrator repo authorize <owner/name> --yes` writes `~/.orchestrator/repos/<owner>/<name>.yaml`. That file has an `authorization` block recording who approved it, when, the scope, and the sha256 of the proposal you reviewed. Add `--read-only` to allow dry runs only.
+3. `orchestrator repo authorize <owner/name>` asks you to confirm a system prompt, then writes `~/.orchestrator/repos/<owner>/<name>.yaml`. That file has an `authorization` block recording who approved it, when, the scope, and the sha256 of the proposal you reviewed. Add `--read-only` to allow dry runs only.
 
 Proposed defaults:
 
@@ -178,8 +222,12 @@ JSON output is versioned: `{"schemaVersion": 1, "kind": "...", "data": ...}`. Er
 | Claude Code in T3 doesn't see it | Check `skill status`: the T3 instance's Claude config dir must be listed. If not, use `--claude-home <that dir>`. If the `skills` directory was just created, run `/reload-skills` or start a new session. |
 | Codex lists it twice | Remove the copy that `skill status` reports in `$CODEX_HOME/skills`. |
 | `repository_unresolved` | Run from the project checkout, or pass `--repo owner/name`. |
-| `needs_configuration` | First use: `orchestrator repo init`, review it, then `orchestrator repo authorize owner/name --yes`. |
-| `association_unverified` | Confirm once with `orchestrator associate KEY --repo owner/name --yes`, add a brief, or map the Linear project. |
+| `needs_configuration` | First use: `orchestrator repo init`, review it, then `orchestrator repo authorize owner/name` and confirm the prompt. |
+| `association_unverified` | Confirm once with `orchestrator associate KEY --repo owner/name` (system prompt), add a brief, or map the Linear project. |
+| `approval_required` | Nobody confirmed the prompt: refused, cancelled, timed out (180 s), or the prompt couldn't be shown (no desktop session, e.g. SSH). Nothing started. Run it again while you're at the Mac. `orchestrator doctor` shows whether the prompt is available. |
+| `not_permitted` | The repository's config doesn't grant `permissions.agents.run`: only dry runs. Re-authorize without `--read-only` if you want live runs. |
+| `orchestrator: the installation this launcher points at is gone` | The checkout or worktree the launcher pointed at was deleted. Run `orchestrator skill install --all` from a stable checkout or global install. |
+| `orchestrator: no Node.js >= 22.5 found` | Install Node 24 (e.g. `nvm install 24`), or set `ORCHESTRATOR_NODE=/path/to/node`. |
 | `linear_auth` | `orchestrator auth linear login` in a terminal. |
 | `workspace_mismatch` | The URL's workspace isn't where the issue lives, or isn't the repository's `linear.workspace`. Use the issue's real URL or the key. |
-| `command not found` from the skill | The checkout moved: `orchestrator skill install --all` from the new location. |
+| `command not found` from the skill | The launcher isn't installed: `orchestrator skill install --all` from a stable checkout. |

@@ -43,8 +43,14 @@ export interface RenderedSkill {
   files: Record<string, string>;
 }
 
-/** Subcommands that never change anything (no run, no config, no credential). */
-export const READ_ONLY_SUBCOMMANDS = ["context", "status", "review"];
+/**
+ * Subcommands Claude Code may run without its own permission prompt while the skill is active.
+ * Safe to pre-approve because none of them can start live work or grant anything without the
+ * engine's own human approval: context/status/review only read; `run` is a dry run unless
+ * `--execute`, which the engine gates behind a system prompt; `repo init` writes a pending
+ * proposal that grants nothing. `resume`, `repo authorize`, `associate` and `auth` still ask.
+ */
+export const PREAPPROVED_SUBCOMMANDS = ["context", "status", "review", "run", "repo init"];
 
 export function frontmatter(fields: Record<string, unknown>): string {
   return `---\n${stringify(fields, { lineWidth: 0 }).trimEnd()}\n---\n\n`;
@@ -61,9 +67,8 @@ export function renderSkill(provider: Provider, opts: { cli: string; version: st
       description: meta.description,
       ...(meta.when_to_use ? { when_to_use: meta.when_to_use } : {}),
       ...(meta.argument_hint ? { "argument-hint": meta.argument_hint } : {}),
-      // Pre-approve only the strictly read-only subcommands, so a session with permission prompts
-      // does not stall on preparation. Runs, resumes and authorization steps still ask.
-      "allowed-tools": READ_ONLY_SUBCOMMANDS.map((c) => `Bash(${opts.cli} ${c}:*)`),
+      // See PREAPPROVED_SUBCOMMANDS: preparation never stalls on a prompt; live work is gated by the engine.
+      "allowed-tools": PREAPPROVED_SUBCOMMANDS.map((c) => `Bash(${opts.cli} ${c}:*)`),
       metadata: owned,
     };
     return { provider, name: meta.name, files: { "SKILL.md": frontmatter(fm) + text } };

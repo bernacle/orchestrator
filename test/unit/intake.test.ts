@@ -197,7 +197,7 @@ describe("issue ↔ repository association", () => {
   it("never treats the team prefix alone as evidence", () => {
     const r = eval_(makeIssue({ key: "ACM-1" }));
     expect(r.verified).toBe(false);
-    expect(r.remedy).toMatch(/orchestrator associate ACM-1 --repo acme\/widget --yes/);
+    expect(r.remedy).toMatch(/orchestrator associate ACM-1 --repo acme\/widget`/);
   });
 
   it("accepts a link from the issue to the repository, and reports links to others", () => {

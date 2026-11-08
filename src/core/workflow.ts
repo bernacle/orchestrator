@@ -75,6 +75,18 @@ export interface RunContext {
     };
   };
   configSource: string;
+  /**
+   * A person's approval of this live run's scope (core/approval.ts): asked for in the starting (or
+   * resuming) process, never read from arguments or files. Null for dry runs.
+   */
+  authorization?: {
+    purpose: string;
+    scopeHash: string;
+    approvedAt: string;
+    channel: string;
+    user: string;
+    detail: string;
+  } | null;
   /** Start of the current limit window (run creation, reset on operator resume). */
   limitWindowStartedAt?: string;
   issue?: Issue;

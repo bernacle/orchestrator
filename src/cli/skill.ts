@@ -1,6 +1,9 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Command } from "commander";
-import { PACKAGE_ROOT } from "../config/load.js";
+import { RunError } from "../app.js";
+import { PACKAGE_ROOT, resolvePaths } from "../config/load.js";
+import { ephemeralReasons, readShimTarget, shimPath, writeShim } from "../skills/launcher.js";
 import { probe } from "../core/exec.js";
 import { defaultTargets, installTo, skillEnv, skillStatus, uninstallFrom, type ActionResult, type TargetStatus } from "../skills/install.js";
 import { loadSkillSource, PROVIDERS, type Provider } from "../skills/render.js";
@@ -8,22 +11,31 @@ import { verifyClaude, verifyCodex } from "../skills/verify.js";
 import { c } from "../report/render.js";
 import { output, printJson } from "./common.js";
 
-/** The orchestrator launcher in this checkout. */
+/** The orchestrator launcher in this checkout (or global install). */
 export function launcherPath(): string {
   return join(PACKAGE_ROOT, "bin", "orchestrator.js");
 }
 
 /**
- * The command baked into installed skills: this Node binary + the launcher, both absolute. Agent
- * shells often have another Node first on PATH (a login shell picked Node 16 under Codex), and
- * `orchestrator` itself is usually not on PATH, so neither is relied on.
+ * The command baked into installed skills: the stable shim in ORCHESTRATOR_HOME/bin (see
+ * skills/launcher.ts), never a checkout path or a Node binary, so skills survive worktree
+ * deletion, checkout moves and agent shells with an older Node first on PATH.
  */
 export function launcherCommand(): string {
-  return [process.execPath, launcherPath()].map(shellQuote).join(" ");
+  return shimPath(resolvePaths().home);
 }
 
-function shellQuote(p: string): string {
-  return /^[\w./@+-]+$/.test(p) ? p : `'${p.replace(/'/g, "'\\''")}'`;
+/** Point the shim at this installation. Refuses ephemeral roots unless allowed. */
+export function ensureLauncher(opts: { allowEphemeral?: boolean }): { path: string; changed: boolean; previous: string | null; ephemeral: string[] } {
+  const ephemeral = ephemeralReasons(PACKAGE_ROOT);
+  if (ephemeral.length && !opts.allowEphemeral) {
+    throw new RunError(
+      `refusing to install skills from ${PACKAGE_ROOT}: ${ephemeral.join("; ")}. Installed skills would break when it disappears. ` +
+        "Install from a stable checkout (e.g. ~/Dev/orchestrator after `git pull`) or a global install (`corepack pnpm add -g` / `npm install -g` of this package), " +
+        "or pass --allow-ephemeral for a temporary development install.",
+    );
+  }
+  return { ...writeShim(resolvePaths().home, { packageRoot: PACKAGE_ROOT, node: process.execPath }), ephemeral };
 }
 
 export function skillVersion(pkgVersion: string): string {
@@ -87,11 +99,16 @@ export function registerSkillCommands(program: Command, pkgVersion: string): voi
   commonOptions(skill.command("install"))
     .description("Install (or upgrade) the skill. Idempotent; never touches skills it does not own")
     .option("--force", "replace operator-edited skill files (the edited copies are kept as *.orig-<timestamp>)")
-    .action((opts: TargetOpts) => {
+    .option("--allow-ephemeral", "allow installing from a linked worktree or temp directory (development only: skills break when it is deleted)")
+    .action((opts: TargetOpts & { allowEphemeral?: boolean }) => {
       output.json = Boolean(opts.json);
+      const providers = providersFrom(opts, false);
+      const launcher = ensureLauncher({ ...(opts.allowEphemeral ? { allowEphemeral: true } : {}) });
       const se = skillEnv();
-      const results = providersFrom(opts, false).flatMap((p) => defaultTargets(p, se, overridesFrom(opts)).map((t) => installTo(t, { cli: launcherCommand(), version: skillVersion(pkgVersion), se, ...(opts.force ? { force: true } : {}) })));
-      if (opts.json) return printJson("skill_install", results);
+      const results = providers.flatMap((p) => defaultTargets(p, se, overridesFrom(opts)).map((t) => installTo(t, { cli: launcher.path, version: skillVersion(pkgVersion), se, ...(opts.force ? { force: true } : {}) })));
+      if (opts.json) return printJson("skill_install", { launcher: { ...launcher, packageRoot: PACKAGE_ROOT }, results });
+      console.log(`${launcher.changed ? c.green("launcher     ") : c.dim("launcher     ")} ${launcher.path} → ${PACKAGE_ROOT}${launcher.previous && launcher.previous !== PACKAGE_ROOT ? c.dim(` (was ${launcher.previous})`) : ""}`);
+      if (launcher.ephemeral.length) console.log(c.yellow(`warning: ${launcher.ephemeral.join("; ")}: re-run \`orchestrator skill install --all\` from a stable checkout before deleting it`));
       printActions(results);
       if (results.some((r) => r.action === "installed" || r.action === "updated")) {
         console.log(c.dim("\nIn any project: ask \"Use Orchestrator to implement BRU-488\", or type /orchestrate BRU-488 (Claude Code) / $orchestrate BRU-488 (Codex).\nCheck discovery with: orchestrator skill verify --all"));
@@ -102,10 +119,12 @@ export function registerSkillCommands(program: Command, pkgVersion: string): voi
   commonOptions(skill.command("update"))
     .description("Upgrade existing Orchestrator-owned installs to this version (installs nothing new)")
     .option("--force", "replace operator-edited skill files (the edited copies are kept as *.orig-<timestamp>)")
-    .action((opts: TargetOpts) => {
+    .option("--allow-ephemeral", "allow updating from a linked worktree or temp directory (development only)")
+    .action((opts: TargetOpts & { allowEphemeral?: boolean }) => {
       output.json = Boolean(opts.json);
+      const launcher = ensureLauncher({ ...(opts.allowEphemeral ? { allowEphemeral: true } : {}) });
       const se = skillEnv();
-      const results = providersFrom(opts, true).flatMap((p) => defaultTargets(p, se, overridesFrom(opts)).map((t) => installTo(t, { cli: launcherCommand(), version: skillVersion(pkgVersion), se, onlyInstalled: true, ...(opts.force ? { force: true } : {}) })));
+      const results = providersFrom(opts, true).flatMap((p) => defaultTargets(p, se, overridesFrom(opts)).map((t) => installTo(t, { cli: launcher.path, version: skillVersion(pkgVersion), se, onlyInstalled: true, ...(opts.force ? { force: true } : {}) })));
       if (opts.json) return printJson("skill_update", results);
       printActions(results);
     });
@@ -130,13 +149,28 @@ export function registerSkillCommands(program: Command, pkgVersion: string): voi
       const providers = providersFrom(opts, true);
       const statuses: TargetStatus[] = providers.flatMap((p) => skillStatus(p, se, { cli: launcherCommand(), version, ...overridesFrom(opts) }));
       const versions = Object.fromEntries(await Promise.all(providers.map(async (p) => [p, await probe(p === "claude" ? "claude" : "codex")] as const)));
+      const target = readShimTarget(launcherCommand());
+      const launcher = {
+        path: launcherCommand(),
+        installed: Boolean(target),
+        packageRoot: target?.packageRoot ?? null,
+        packageRootExists: target ? existsSync(join(target.packageRoot, "bin", "orchestrator.js")) : false,
+        ephemeral: target ? ephemeralReasons(target.packageRoot) : [],
+        thisInstall: PACKAGE_ROOT,
+      };
       const data = {
         skillVersion: version,
+        launcher,
         cli: { command: launcherCommand(), version: pkgVersion },
         providers: providers.map((p) => ({ provider: p, cliVersion: versions[p] ?? null, targets: statuses.filter((s) => s.provider === p), limitations: KNOWN_LIMITS[p] })),
       };
       if (opts.json) return printJson("skill_status", data);
-      console.log(`${c.bold("Orchestrator skill")} ${version}  ${c.dim(`CLI ${launcherCommand()}`)}`);
+      console.log(`${c.bold("Orchestrator skill")} ${version}`);
+      if (!launcher.installed) console.log(c.yellow(`launcher ${launcher.path}: not installed (run orchestrator skill install --all)`));
+      else {
+        const state = !launcher.packageRootExists ? c.red("BROKEN: target is gone") : launcher.ephemeral.length ? c.yellow(`ephemeral: ${launcher.ephemeral.join("; ")}`) : c.green("stable");
+        console.log(`launcher ${launcher.path} → ${launcher.packageRoot} (${state})${launcher.packageRoot !== PACKAGE_ROOT ? c.dim(`; this CLI runs from ${PACKAGE_ROOT}`) : ""}`);
+      }
       for (const p of data.providers) {
         console.log(`\n${c.bold(p.provider === "claude" ? "Claude Code" : "Codex")} ${p.cliVersion ? c.dim(p.cliVersion) : c.yellow("(not found on PATH)")}`);
         for (const t of p.targets) {
@@ -180,6 +214,7 @@ export function registerSkillCommands(program: Command, pkgVersion: string): voi
       const se = skillEnv();
       const targets = opts.dir ? [{ provider: "claude" as const, dir: opts.dir, why: "--dir" }] : defaultTargets("claude", se);
       console.error(c.yellow("install-skill is deprecated; use: orchestrator skill install --all"));
-      printActions(targets.map((t) => installTo(t, { cli: launcherCommand(), version: skillVersion(pkgVersion), se })));
+      const launcher = ensureLauncher({});
+      printActions(targets.map((t) => installTo(t, { cli: launcher.path, version: skillVersion(pkgVersion), se })));
     });
 }

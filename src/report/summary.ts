@@ -1,4 +1,7 @@
 import { realpathSync } from "node:fs";
+import { join } from "node:path";
+import { resolvePaths } from "../config/load.js";
+import { readShimTarget, shimPath } from "../skills/launcher.js";
 import type { RunRecord, Store } from "../core/store.js";
 import { TERMINAL_STATES } from "../core/states.js";
 import type { RunContext } from "../core/workflow.js";
@@ -97,10 +100,11 @@ export function reviewFindings(run: RunRecord<RunContext>): {
 }
 
 /**
- * How to invoke this CLI in a printed command that an agent will run: this Node binary + the
+ * How to invoke this CLI in a printed command that an agent will run: the stable launcher when it
+ * points at this installation (what installed skills use), otherwise this Node binary + the
  * launcher's absolute path (`orchestrator` when running from source via tsx).
  */
-export function cliInvocation(_env: NodeJS.ProcessEnv = process.env, argv1: string | undefined = process.argv[1], node: string = process.execPath): string {
+export function cliInvocation(env: NodeJS.ProcessEnv = process.env, argv1: string | undefined = process.argv[1], node: string = process.execPath): string {
   if (!argv1 || !/orchestrator(\.js)?$/.test(argv1)) return "orchestrator";
   let self: string;
   try {
@@ -108,7 +112,18 @@ export function cliInvocation(_env: NodeJS.ProcessEnv = process.env, argv1: stri
   } catch {
     return "orchestrator";
   }
-  // Always absolute: an agent's shell may have another Node (or no `orchestrator`) first on PATH.
   const quote = (p: string) => (/^[\w./@+-]+$/.test(p) ? p : `'${p.replace(/'/g, "'\\''")}'`);
+  const shim = shimPath(resolvePaths(env).home);
+  const target = readShimTarget(shim);
+  if (target && safeReal(join(target.packageRoot, "bin", "orchestrator.js")) === self) return quote(shim);
+  // An agent's shell may have another Node (or no `orchestrator`) first on PATH.
   return `${quote(node)} ${quote(self)}`;
+}
+
+function safeReal(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
 }

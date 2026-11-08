@@ -66,6 +66,8 @@ export interface RequestContext {
   association: AssociationResult | null;
   runs: { active: RunSummary[]; recent: RunSummary[] };
   modes: ExecutionMode[];
+  /** How a person approves a live run here (enforced by the engine, not by the skill). */
+  approval: { channel: string; available: boolean; detail: string } | null;
   problems: Problem[];
   warnings: string[];
   nextActions: NextAction[];
@@ -210,6 +212,8 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
     if (!sb.available && loaded.config.isolation.require) liveMissing.push(`no sandbox: ${sb.detail}`);
   }
   if (app.env.ORCHESTRATOR_NO_EXECUTE) liveMissing.push("ORCHESTRATOR_NO_EXECUTE is set: live runs are disabled in this environment");
+  const approval = app.approvalStatus ? await app.approvalStatus() : null;
+  if (approval && !approval.available) liveMissing.push(approval.detail);
   const modes: ExecutionMode[] = [
     { id: "dry_run", command: `${target} --dry-run --json`, available: dryMissing.length === 0, description: "plan and simulate: reads Linear and GitHub, fetches into the orchestrator's own clone, changes nothing", missing: dryMissing },
     {
@@ -237,17 +241,17 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
   }
   if (has("needs_configuration")) {
     next.push({ id: "propose_configuration", command: `${cli} repo init${repoFlag || (selection.repo ? ` --repo ${selection.repo}` : "")} --team ${fetchedIssue?.team.key ?? ref.key.split("-")[0]} --json`, description: "discover the repository's checks and write a pending proposal (grants nothing)", needsUserApproval: false });
-    next.push({ id: "authorize_repository", command: `${cli} repo authorize ${selection.repo} --yes`, description: "authorize the reviewed proposal (add --read-only to grant no remote writes)", needsUserApproval: true });
+    next.push({ id: "authorize_repository", command: `${cli} repo authorize ${selection.repo}`, description: "authorize the reviewed proposal; the user confirms a system prompt (add --read-only to grant no remote writes)", needsUserApproval: true });
   }
   if (has("linear_auth")) next.push({ id: "linear_login", command: `${cli} auth linear login${workspace ? ` --workspace ${workspace}` : ""}`, description: "store a Linear API key once (the user runs this in a terminal; never paste keys into chat)", needsUserApproval: true, userRunsIt: true });
-  if (has("association_unverified")) next.push({ id: "confirm_association", command: `${cli} associate ${ref.key} --repo ${selection.repo} --yes`, description: `record that ${ref.key} is ${selection.repo} work (only after the user confirms it)`, needsUserApproval: true });
+  if (has("association_unverified")) next.push({ id: "confirm_association", command: `${cli} associate ${ref.key} --repo ${selection.repo}`, description: `record that ${ref.key} is ${selection.repo} work; the user confirms a system prompt`, needsUserApproval: true });
   for (const r of runs.active) {
     next.push({ id: "inspect_run", command: `${cli} status ${r.id} --json`, description: `inspect ${r.id} (${r.state})`, needsUserApproval: false });
     if (!r.driving) next.push({ id: "resume_run", command: `${cli} resume ${r.id}`, description: `resume ${r.id} from ${r.state}${r.blockedFrom ? ` (blocked in ${r.blockedFrom})` : ""}`, needsUserApproval: true });
   }
   if (problems.length === 0) {
     next.push({ id: "dry_run", command: modes[0]!.command, description: modes[0]!.description, needsUserApproval: false });
-    if (modes[2]!.available) next.push({ id: "execute", command: modes[2]!.command, description: modes[2]!.description, needsUserApproval: true });
+    if (modes[2]!.available) next.push({ id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. The CLI asks the user to confirm with Touch ID / password on this Mac before anything starts`, needsUserApproval: true });
   }
 
   return {
@@ -259,6 +263,7 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
     association,
     runs,
     modes,
+    approval,
     problems,
     warnings,
     nextActions: next,

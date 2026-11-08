@@ -36,6 +36,8 @@ export const CAPABILITIES: Array<{ area: string; feature: string; status: "suppo
   { area: "intake", feature: "Issue ↔ repository association with evidence (never the key prefix alone)", status: "supported", note: "briefs, saved confirmations, project mapping, issue links" },
   { area: "intake", feature: "First-use repository proposal + explicit authorization, stored outside the repository", status: "supported", note: "orchestrator repo init / repo authorize" },
   { area: "intake", feature: "Stored Linear credentials per workspace", status: "supported", note: "orchestrator auth linear login (macOS Keychain; 0600 file elsewhere)" },
+  { area: "intake", feature: "Person-approved live runs (system prompt agents cannot answer), per run and per resume", status: "supported", note: "macOS LocalAuthentication; elsewhere a typed /dev/tty confirmation (weaker)" },
+  { area: "intake", feature: "Stable skill launcher with Node runtime selection", status: "supported", note: "~/.orchestrator/bin/orchestrator; refuses ephemeral install sources" },
   { area: "intake", feature: "Versioned JSON output for skills and scripts", status: "supported", note: "--json on context, run, status, resume, review, skill, auth" },
   { area: "intake", feature: "GitHub Issues / Jira as trackers", status: "planned", note: "issue references carry a tracker field" },
   { area: "t3", feature: "Detect T3 session origin, doctor checks T3 server", status: "supported", note: "T3CODE_CLI_PATH, t3 thread list" },

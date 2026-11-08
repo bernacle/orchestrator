@@ -1,10 +1,8 @@
 import type { Command } from "commander";
-import { RunError } from "../app.js";
-import { saveAssociation } from "../intake/association.js";
+import { authorizeRepository, confirmAssociation, RunError } from "../app.js";
 import { inspectRequest, publicContext, type RequestContext } from "../intake/context.js";
 import { proposeConfiguration } from "../intake/first-use.js";
 import { parseIssueRef } from "../intake/issue-ref.js";
-import { authorizeProposal } from "../intake/proposal.js";
 import { SnapshotTracker } from "../adapters/snapshot.js";
 import { configStatus } from "../intake/resolve.js";
 import { c } from "../report/render.js";
@@ -51,9 +49,9 @@ export function registerContextCommands(program: Command): void {
       withApp(async (app) => {
         output.json = Boolean(opts.json);
         const r = await proposeConfiguration(app, { ...(opts.repo ? { repo: opts.repo } : {}), ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.team ? { team: opts.team } : {}) });
-        const authorize = `orchestrator repo authorize ${r.proposal.repo} --yes`;
+        const authorize = `orchestrator repo authorize ${r.proposal.repo}`;
         if (opts.json) {
-          printJson("proposal", { repo: r.proposal.repo, file: r.proposal.file, sha256: r.proposal.sha256, inspected: r.inspected, existingConfig: r.existing, summary: r.proposal.summary, yaml: r.proposal.yaml, authorize: { command: authorize, readOnly: `${authorize} --read-only`, needsUserApproval: true } });
+          printJson("proposal", { repo: r.proposal.repo, file: r.proposal.file, sha256: r.proposal.sha256, inspected: r.inspected, existingConfig: r.existing, summary: r.proposal.summary, yaml: r.proposal.yaml, authorize: { command: authorize, readOnly: `${authorize} --read-only`, needsUserApproval: true, approvedBy: "a system prompt (Touch ID / password) the user confirms" } });
           return;
         }
         const s = r.proposal.summary;
@@ -83,17 +81,15 @@ export function registerContextCommands(program: Command): void {
     );
   repo
     .command("authorize")
-    .description("Authorize the pending proposal for a repository: writes ~/.orchestrator/repos/<owner>/<name>.yaml with an authorization record")
+    .description("Authorize the pending proposal for a repository after you confirm a system prompt (Touch ID / password on macOS): writes ~/.orchestrator/repos/<owner>/<name>.yaml with an authorization record")
     .argument("<owner/name>", "repository")
-    .option("--yes", "confirm (required: this grants the permissions listed in the proposal)")
     .option("--read-only", "grant no agent runs or remote writes (dry runs only)")
     .option("--replace", "replace an existing local config")
     .option("--json", "versioned JSON (schemaVersion 1)")
-    .action((repoName: string, opts: { yes?: boolean; readOnly?: boolean; replace?: boolean; json?: boolean }) =>
-      withApp((app) => {
+    .action((repoName: string, opts: { readOnly?: boolean; replace?: boolean; json?: boolean }) =>
+      withApp(async (app) => {
         output.json = Boolean(opts.json);
-        if (!opts.yes) throw new RunError(`authorizing ${repoName} grants the permissions in its proposal; re-run with --yes once the operator has reviewed it`);
-        const r = authorizeProposal(app.paths, repoName, { ...(opts.readOnly ? { readOnly: true } : {}), ...(opts.replace ? { replace: true } : {}) });
+        const r = await authorizeRepository(app, repoName, { ...(opts.readOnly ? { readOnly: true } : {}), ...(opts.replace ? { replace: true } : {}) });
         const st = configStatus(repoName, app.paths);
         if (opts.json) return printJson("authorized", { repo: repoName, file: r.file, scope: r.scope, proposalSha256: r.sha256, active: st.status === "authorized" ? st.loaded.source : null });
         console.log(`${c.green("Authorized")} ${repoName} (${r.scope}) → ${r.file}`);
@@ -103,19 +99,17 @@ export function registerContextCommands(program: Command): void {
 
   program
     .command("associate")
-    .description("Record that an issue belongs to a repository (operator confirmation, stored in ~/.orchestrator/associations.json)")
+    .description("Record that an issue belongs to a repository after you confirm a system prompt (stored in ~/.orchestrator/associations.json)")
     .argument("<issue>", "Linear issue key or URL")
     .requiredOption("--repo <owner/name>", "the repository the issue is for")
-    .option("--yes", "confirm (required)")
     .option("--json", "versioned JSON (schemaVersion 1)")
-    .action((issue: string, opts: { repo: string; yes?: boolean; json?: boolean }) =>
-      withApp((app) => {
+    .action((issue: string, opts: { repo: string; json?: boolean }) =>
+      withApp(async (app) => {
         output.json = Boolean(opts.json);
-        if (!opts.yes) throw new RunError(`re-run with --yes to confirm that ${issue} is ${opts.repo} work`);
         const ref = parseIssueRef(issue);
         const st = configStatus(opts.repo, app.paths);
         if (st.status !== "authorized") throw new RunError(`${opts.repo} is not configured; authorize it first (orchestrator repo init)`);
-        const saved = saveAssociation(app.paths, { tracker: "linear", issue: ref.key, repo: st.loaded.config.repo, workspace: ref.workspace ?? st.loaded.config.linear.workspace ?? null });
+        const saved = await confirmAssociation(app, { issue: ref.key, repo: st.loaded.config.repo, workspace: ref.workspace ?? st.loaded.config.linear.workspace ?? null });
         if (opts.json) return printJson("association", saved);
         console.log(`${c.green("Recorded")}: ${saved.issue} → ${saved.repo} (confirmed by ${saved.confirmedBy})`);
       }),
@@ -134,6 +128,7 @@ export function renderContext(ctx: RequestContext): string {
   if (ctx.association) lines.push(`${ok(ctx.association.verified)} association  ${ctx.association.verified ? ctx.association.evidence.map((e) => e.detail).join("; ") : ctx.association.remedy}`);
   if (ctx.runs.active.length) lines.push(`${c.yellow("●")} active runs  ${ctx.runs.active.map((x) => `${x.id} ${x.state}${x.driving ? " (running)" : ""}`).join(", ")}`);
   else if (ctx.runs.recent.length) lines.push(`  recent runs  ${ctx.runs.recent.map((x) => `${x.id} ${x.mode} ${x.state}`).join(", ")}`);
+  if (ctx.approval) lines.push(`${ok(ctx.approval.available)} approval     ${ctx.approval.detail}`);
   lines.push("", c.bold("Modes"));
   for (const m of ctx.modes) lines.push(`  ${ok(m.available)} ${m.id.padEnd(24)} ${m.available ? c.dim(m.command) : c.dim(`unavailable: ${m.missing.join("; ")}`)}`);
   for (const w of ctx.warnings) lines.push(c.yellow(`warning: ${w}`));

@@ -39,7 +39,9 @@ describe("canonical skill rendering", () => {
     expect(fmClaude).toMatchObject({ name: "orchestrate", "argument-hint": expect.any(String) });
     expect(fmClaude["disable-model-invocation"]).toBeUndefined();
     // Only read-only subcommands are pre-approved; run/resume/repo/associate always ask.
-    expect(fmClaude["allowed-tools"]).toEqual([`Bash(${CLI} context:*)`, `Bash(${CLI} status:*)`, `Bash(${CLI} review:*)`]);
+    // Pre-approved: preparation only. Live work is gated by the engine's own approval prompt, and
+    // resume / repo authorize / associate / auth still go through the host's permission prompt.
+    expect(fmClaude["allowed-tools"]).toEqual([`Bash(${CLI} context:*)`, `Bash(${CLI} status:*)`, `Bash(${CLI} review:*)`, `Bash(${CLI} run:*)`, `Bash(${CLI} repo init:*)`]);
     expect(fmClaude.when_to_use).toBeTruthy();
     expect(`${fmClaude.description} ${fmClaude.when_to_use}`.length).toBeLessThanOrEqual(CLAUDE_LISTING_CAP);
     // Codex reads only name + description: the examples are folded into the description.

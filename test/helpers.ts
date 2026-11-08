@@ -9,6 +9,7 @@ import { MockAgent, MockCodeHost, MockTracker, makeIssue, type AgentScript } fro
 import type { Adapters, Issue } from "../src/adapters/types.js";
 import { openApp, type App } from "../src/app.js";
 import type { AgentConfig } from "../src/config/schema.js";
+import type { ApprovalRequest, Approver } from "../src/core/approval.js";
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
@@ -35,6 +36,10 @@ export interface Harness {
   implementer: MockAgent;
   reviewer: MockAgent;
   writeConfig(patch?: Record<string, unknown>): void;
+  /** Every approval the engine asked for. */
+  approvals: ApprovalRequest[];
+  /** How the stand-in for the person answers (default: approve). */
+  answer: boolean | ((req: ApprovalRequest) => boolean);
   cleanup(): void;
 }
 
@@ -119,9 +124,20 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
 
   const env: NodeJS.ProcessEnv = { ...process.env, ORCHESTRATOR_HOME: join(root, "home"), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
   delete env.T3CODE_CLI_PATH;
+  const approvals: ApprovalRequest[] = [];
+  // Stands in for the person at the system prompt. Injected in code only, like in production.
+  const approver: Approver = {
+    channel: "test",
+    async request(req) {
+      approvals.push(req);
+      const ok = typeof harness.answer === "function" ? harness.answer(req) : harness.answer;
+      return { approved: ok, channel: "test", detail: ok ? "approved in test" : "refused in test", at: new Date().toISOString(), user: "tester" };
+    },
+  };
   const makeApp = (): App => {
     const app: App = openApp({
       env,
+      approver,
       tracker: () => tracker,
       adapters: (): Adapters => ({
         tracker,
@@ -154,6 +170,8 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
     implementer,
     reviewer,
     writeConfig,
+    approvals,
+    answer: true,
     cleanup: () => {
       try {
         harness.app.close();

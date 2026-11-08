@@ -100,7 +100,7 @@ program
   .option("--cwd <dir>", "directory to identify the repository from (default: the current directory)")
   .option("--linear-workspace <urlKey>", "Linear workspace whose stored key to use (default: from the URL or the repository config)")
   .option("--dry-run", "plan and simulate only; change nothing (default)")
-  .option("--execute", "start a supervised live run: agents edit code, branches are pushed, a draft PR is opened")
+  .option("--execute", "start a supervised live run (agents edit code, a branch is pushed, a draft PR is opened) after you confirm a system prompt: Touch ID / password on macOS")
   .option("--with-agent-plan", "in a dry run, also run the read-only planner agent (costs tokens, changes nothing)")
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; recorded in the audit trail)", (v: string, prev: string[]) => [...prev, v], [] as string[])
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt, 30)
@@ -229,7 +229,7 @@ program
 
 program
   .command("resume")
-  .description("Continue a run (re-enters the blocked step, re-checks CI or merge state). Accepts a run id or an issue key / URL.")
+  .description("Continue a run (re-enters the blocked step, re-checks CI or merge state). Accepts a run id or an issue key / URL. Live runs ask you to confirm a system prompt again.")
   .argument("<target>", "run id or unique prefix, or an issue key / Linear URL (resolved to its only resumable run)")
   .option("--repo <owner/name>", "with an issue: only runs on this repository")
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt)
