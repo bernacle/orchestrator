@@ -2,13 +2,19 @@
 
 A supervised engineering orchestrator. One command takes a Linear issue through planning, an isolated implementation, the repository's own checks, and an independent review by a different agent, ending in a draft pull request with the run's state, decisions and evidence recorded locally.
 
+**Install once, then use it from any project.** After `orchestrator skill install --all`, a Claude Code or Codex session in any repository (in T3 or not) understands requests like *"Use Orchestrator to implement BRU-488"*, *"Quero implementar a BRU-488 usando o Orchestrator"* or *"What's the status of the Orchestrator run for BRU-488?"*. The engine identifies the repository from the session's directory, checks that it is authorized and that the issue belongs to it, and prepares a dry run. A live run needs your explicit go-ahead. `/orchestrate BRU-488` (Claude Code) and `$orchestrate BRU-488` (Codex) always work too. See [docs/skills.md](docs/skills.md).
+
 ```bash
+orchestrator skill install --all                                  # once: Claude Code + Codex skills, user level
+orchestrator context BRU-488                                      # read-only: repo, config, credentials, association, runs, next steps
+orchestrator run BRU-488                                          # from the project's checkout: repository detected, dry run
 orchestrator preflight --repo bernacle/analyticool --agent-probe  # setup + checks + sandbox probe in a throwaway worktree
 orchestrator run BRU-488 --repo bernacle/analyticool --dry-run    # plan + simulated timeline, no side effects
 orchestrator run BRU-488 --repo bernacle/analyticool --execute    # supervised live run → draft PR
-orchestrator status
+orchestrator status [<run-id> | BRU-488]
+orchestrator review <run-id | BRU-488>                            # the independent reviewer's findings
 orchestrator logs <run-id> -f
-orchestrator resume <run-id>
+orchestrator resume <run-id | BRU-488>
 orchestrator cancel <run-id>
 ```
 
@@ -38,10 +44,13 @@ Requirements: Node ≥ 22.5 (24 recommended; the launcher enables `node:sqlite` 
 ```bash
 git clone https://github.com/bernacle/orchestrator && cd orchestrator
 corepack pnpm install
-corepack pnpm link --global        # puts `orchestrator` on PATH (or use: pnpm orchestrator …)
-export LINEAR_API_KEY=lin_api_…    # or LINEAR_API_KEY_FILE=/path/to/file
+corepack pnpm link --global        # optional: puts `orchestrator` on PATH (or use: pnpm orchestrator …)
+orchestrator auth linear login     # paste a Linear API key once (macOS Keychain); or set LINEAR_API_KEY / LINEAR_API_KEY_FILE
+orchestrator skill install --all   # Claude Code + Codex skills, user level; detects T3's Claude config dirs
 orchestrator doctor
 ```
+
+`orchestrator skill status` shows where the skill is installed, its version, and whether it's current. `orchestrator skill verify --all` checks discovery without a model call. Stored Linear keys are per workspace, shared by the CLI and both skills; `orchestrator auth status` shows which one a request would use.
 
 `orchestrator doctor` checks:
 - Node, the state directory, `gh` auth and identity
@@ -54,6 +63,8 @@ orchestrator doctor
 
 ## Configure a repository
 
+The first time you use Orchestrator in a repository, it proposes a configuration instead of guessing one. `orchestrator repo init` (the skill runs it for you) inspects the checkout read-only: scripts, lockfile, Node engine and CI steps. It writes a pending proposal that grants nothing. `orchestrator repo authorize owner/name --yes` turns it into an operator-owned config, with a record of who approved which proposal. Files inside the repository can never configure or authorize the orchestrator. Details are in [docs/skills.md](docs/skills.md#first-use-of-a-repository).
+
 There's one YAML file per repository, and it lives with the operator, never in the target repository:
 
 1. `~/.orchestrator/repos/<owner>/<name>.yaml` (local override), then
@@ -63,7 +74,7 @@ See [`config/repos/bernacle/analyticool.yaml`](config/repos/bernacle/analyticool
 
 ```yaml
 repo: bernacle/analyticool
-linear: { teams: [BRU] }            # issue keys this repo handles (lets you omit --repo)
+linear: { teams: [BRU] }            # issue keys this repo handles (a key prefix alone never proves an issue belongs here)
 toolchain: { node: "24" }           # resolved from PATH or nvm, prepended for checks and agents
 setup:  [{ name: install, run: pnpm install --frozen-lockfile }]
 checks: [{ name: lint, run: pnpm lint }, { name: test, run: pnpm test }]
@@ -139,15 +150,24 @@ Run `orchestrator capabilities` for the live list.
 | Agents | Claude Code (implementer/planner), Codex (reviewer), per-repo roles | security reviewer, test writer, docs |
 | T3 | `/orchestrate` skill, T3 origin detection, T3 server check in doctor | implementer inside a T3 thread (needs runtime-mode control in `t3 thread start`) |
 
-## T3 Code
+## T3 Code, Claude Code and Codex
 
-T3 has no plugin or slash-command API, but the Claude Code sessions it hosts load skills. Install the skill once:
+T3 has no plugin or slash-command API, but the Claude Code and Codex sessions it hosts load user-level skills. Install them once:
 
 ```bash
-orchestrator install-skill          # links integrations/claude-skill/orchestrate into ~/.claude/skills
+orchestrator skill install --all
 ```
 
-Then, in a T3 Claude Code thread, type `/orchestrate BRU-488`. The skill defaults to a dry run, never adds `--execute` on its own initiative, and reports the CLI's results verbatim. Why T3 threads aren't used as the executor yet is explained in [docs/research.md](docs/research.md#t3-code).
+Then open any project in T3, start a Claude Code or Codex thread, and describe what you want: *"Implement BRU-488 using Orchestrator"*, *"Can you work on https://linear.app/brunosimplicio/issue/BRU-488 using Orchestrator?"*, *"Resume the Orchestrator run for BRU-488"*.
+
+The skill takes it from there:
+
+1. It runs `orchestrator context` in the session's directory. Main checkouts, T3 worktrees and nested directories all work, and SSH aliases are resolved.
+2. It walks you through anything missing: first-use authorization, the issue ↔ repository association, Linear login.
+3. It prepares a dry run.
+4. It starts a live run only when you explicitly ask for one.
+
+Runs never execute in the session's worktree. The model chooses the skill from its description, which is likely but not guaranteed for any given sentence. `/orchestrate BRU-488` and `$orchestrate BRU-488` always work. Everything verified, plus the limitations, is in [docs/skills.md](docs/skills.md). Why T3 threads aren't used as the executor yet is explained in [docs/research.md](docs/research.md#t3-code).
 
 ## Dry run on Analyticool
 
@@ -170,9 +190,14 @@ corepack pnpm test               # unit + integration (real git, mocked Linear/G
 corepack pnpm smoke:agents       # real claude + codex against a throwaway repo (~$0.50)
 ```
 
+- [docs/skills.md](docs/skills.md): the install-once skills, natural-language use, repository detection, first-use authorization, credentials, troubleshooting
 - [docs/research.md](docs/research.md): what T3, Claude Code, Codex, GitHub and Linear support, as verified
 - [docs/architecture.md](docs/architecture.md): state machine, durability, trust boundaries, dependency model, merge policy
 - [docs/isolation.md](docs/isolation.md): what is sandboxed, how it was verified, and what is not covered
 - [docs/roadmap.md](docs/roadmap.md): PR watching, auto-merge, unattended runs, more roles
 
-Source map: `src/core` (engine, store, states, policy, workflow), `src/adapters` (Linear, GitHub, git, checks, Claude, Codex, T3, mocks), `src/planning` (issue analysis, plan, prompts, review contract), `src/cli`.
+Source map: `src/core` (engine, store, states, policy, workflow), `src/adapters` (Linear, GitHub, git, checks, Claude, Codex, T3, mocks), `src/planning` (issue analysis, plan, prompts, review contract), `src/intake` (issue references, repository discovery, association, first-use proposals, request context), `src/credentials`, `src/skills` (canonical skill rendering, install, verify), `src/cli`.
+
+```bash
+corepack pnpm eval:skills        # real Claude Code + Codex calls: does the model pick the skill (and leave it alone when it should)?
+```

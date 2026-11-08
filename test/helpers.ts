@@ -22,6 +22,8 @@ export const requestChanges = (title = "Missing greeting") => ({
 
 export interface Harness {
   root: string;
+  /** ORCHESTRATOR_HOME for this harness. */
+  home: string;
   origin: string;
   clone: string;
   configFile: string;
@@ -120,6 +122,7 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
   const makeApp = (): App => {
     const app: App = openApp({
       env,
+      tracker: () => tracker,
       adapters: (): Adapters => ({
         tracker,
         codeHost: host,
@@ -136,6 +139,7 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
 
   const harness: Harness = {
     root,
+    home: join(root, "home"),
     origin,
     clone,
     configFile,

@@ -47,6 +47,12 @@ The code path exists (`evaluateMerge`, the `READY_TO_MERGE` handler, `gh pr merg
 
 ## 6. T3 integration
 
+Done: user-level skills for Claude Code and Codex, natural-language activation, repository detection from the session's directory, first-use authorization (see [skills.md](skills.md)). Next:
+
+- Ask T3 to expose the current thread id and project id to sessions, so runs can link back to the exact thread instead of only `origin: t3`.
+- GitHub Issues and Jira as trackers (issue references already carry a `tracker` field; association evidence is tracker-agnostic).
+- A plan-approval handshake: `run --execute --from-dry-run <id>` that refuses to start when the live plan differs from the approved dry run.
+
 - When `t3 thread start` gains a runtime-mode flag, add a `t3-thread` implementer adapter, so implementation happens in a visible T3 thread and worktree. The `t3 thread start --worktree --branch --wait --json` surface is already sufficient for everything else.
 - Link runs to the originating T3 thread once T3 exposes the thread id to child processes.
 - Use `t3 thread list --json` (`linkedPullRequest`) to show T3 sessions working on the same branch.

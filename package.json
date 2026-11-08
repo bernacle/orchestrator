@@ -1,6 +1,6 @@
 {
   "name": "@bernacle/orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Supervised multi-repository engineering orchestrator for Linear, GitHub, Claude Code, Codex and T3 Code.",
   "type": "module",
   "license": "Apache-2.0",
@@ -26,7 +26,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "pnpm typecheck && pnpm test",
-    "smoke:agents": "tsx scripts/smoke-agents.ts"
+    "smoke:agents": "tsx scripts/smoke-agents.ts",
+    "eval:skills": "tsx scripts/eval-skill-activation.ts"
   },
   "dependencies": {
     "commander": "^14.0.3",

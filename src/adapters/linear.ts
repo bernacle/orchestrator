@@ -70,10 +70,12 @@ export class LinearTracker implements IssueTracker {
   constructor(
     private readonly apiKey: string | undefined,
     private readonly fetchImpl: FetchLike = fetch as unknown as FetchLike,
+    /** Shown instead of the generic message when no key was resolved (e.g. several stored workspaces). */
+    private readonly missingKeyMessage?: string,
   ) {}
 
   private async gql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
-    if (!this.apiKey) throw new LinearError("LINEAR_API_KEY is not set (create one at Linear → Settings → Security & access → API keys)");
+    if (!this.apiKey) throw new LinearError(this.missingKeyMessage ?? "LINEAR_API_KEY is not set (create one at Linear → Settings → Security & access → API keys)");
     const res = await this.fetchImpl(ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: this.apiKey },

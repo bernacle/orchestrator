@@ -63,6 +63,16 @@ export interface RunContext {
     acceptedDependencies?: string[];
     /** Dry-run replay of recorded Linear data. */
     issueSnapshot?: { file: string; takenAt: string };
+    /** How the request was resolved (src/intake): repository selection, issue association, origin. */
+    intake?: {
+      source: "explicit" | "config_file" | "cwd" | "team";
+      reason: string;
+      association: { verified: boolean; evidence: Array<{ kind: string; detail: string }> } | null;
+      cwd: string | null;
+      linkedWorktree: boolean;
+      /** Linear workspace the request named (issue URL), used to pick the stored credential. */
+      linearWorkspace: string | null;
+    };
   };
   configSource: string;
   /** Start of the current limit window (run creation, reset on operator resume). */

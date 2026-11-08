@@ -166,6 +166,19 @@ export const RepoConfigSchema = z
     forbidden_paths: z.array(z.string()).default([".env", ".env.*", "*.pem", "*.key", "id_rsa*", ".github/workflows/**", ".claude/**", ".codex/**", ".mcp.json", ".npmrc", ".git/**"]),
     permissions: PermissionsSchema,
     merge: MergeSchema.prefault({}),
+    /**
+     * Written by `orchestrator repo authorize` (first-use configuration): who approved this config,
+     * when, for which scope, and the sha256 of the proposal they reviewed. Audit only: permissions
+     * come from `permissions`, and configs written by hand need no such block.
+     */
+    authorization: z
+      .object({
+        authorized_by: z.string().min(1),
+        authorized_at: z.string().min(1),
+        scope: z.enum(["supervised", "read_only"]),
+        proposal_sha256: z.string().optional(),
+      })
+      .optional(),
   })
   .superRefine((c, ctx) => {
     if (c.merge.auto_authorization && c.merge.auto_authorization.repo !== c.repo) {
