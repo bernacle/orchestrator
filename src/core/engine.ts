@@ -72,9 +72,24 @@ export interface StepContext<C> {
 
 export type Handler<C> = (ctx: StepContext<C>) => Promise<Outcome<C>>;
 
+/**
+ * The run as the operator saw it when they approved a resume (state, and for a BLOCKED run the
+ * block itself). It authorizes leaving exactly that block, once, at the start of the drive.
+ */
+export interface ApprovedResume {
+  state: RunState;
+  blockedFrom: RunState | null;
+  reason: string | null;
+}
+
 export interface EngineOptions {
-  /** Re-enter the state a BLOCKED run was blocked from. */
-  resume?: boolean;
+  /**
+   * An operator-approved resume. If the run is BLOCKED when the drive starts, on the same block
+   * the operator approved, the drive re-enters the state it was blocked from (once). A run that
+   * was not BLOCKED when resumed gets no unblock at all, and any block reached later in the drive
+   * stops it: a new blocker always goes back to a person.
+   */
+  resume?: ApprovedResume;
   /** Progress lines for the terminal. */
   onEvent?: (line: { level: EventLevel; state: RunState; type: string; message: string }) => void;
   leaseTtlMs?: number;
@@ -88,6 +103,20 @@ export interface EngineOptions {
    * Defaults to the run as read when the drive starts.
    */
   expect?: { mode: RunMode; issueKey: string; repo: string };
+}
+
+/**
+ * A resume may leave a block only if the run was BLOCKED when the drive started, on the block the
+ * operator approved (same state it was blocked from, same reason). A run approved at PLANNING that
+ * another process has since blocked is not the run the operator approved.
+ */
+function mayLeaveBlock(run: { state: RunState; blockedFrom: RunState | null; reason: string | null }, approved: ApprovedResume | undefined): boolean {
+  if (!approved || approved.state !== "BLOCKED" || run.state !== "BLOCKED" || !run.blockedFrom) return false;
+  return approved.blockedFrom === run.blockedFrom && (approved.reason ?? null) === (run.reason ?? null);
+}
+
+function describeApproved(a: ApprovedResume): string {
+  return a.state === "BLOCKED" ? `a block from ${a.blockedFrom ?? "?"}${a.reason ? ` (${a.reason})` : ""}` : `a run at ${a.state} (not blocked)`;
 }
 
 const TRANSIENT = /(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up|\bHTTP 5\d\d\b|rate limit|\b50[234] (?:Bad Gateway|Service Unavailable|Gateway Timeout)\b)/i;
@@ -145,7 +174,16 @@ export class Engine<C extends object> {
 
     const initial = store.getRun<C>(runId)!;
     const pinned = opts.expect ?? { mode: initial.mode, issueKey: initial.issueKey, repo: initial.repo };
-    let resumed = false;
+    // Decided once, from the run as it is before any step runs; never re-armed during the drive.
+    let mayUnblock = mayLeaveBlock(initial, opts.resume);
+    if (opts.resume && initial.state === "BLOCKED" && !mayUnblock) {
+      emit(
+        initial,
+        "warn",
+        "run.resume_refused",
+        `Not unblocked: the approved resume was for ${describeApproved(opts.resume)}, but the run is BLOCKED${initial.blockedFrom ? ` from ${initial.blockedFrom}` : ""}${initial.reason ? `: ${initial.reason}` : ""}. Resume again to approve this block.`,
+      );
+    }
     try {
       for (;;) {
         let run = store.getRun<C>(runId)!;
@@ -165,11 +203,11 @@ export class Engine<C extends object> {
           return run;
         }
         if (run.state === "BLOCKED") {
-          if (opts.resume && !resumed && run.blockedFrom) {
-            resumed = true;
+          if (mayUnblock && run.blockedFrom) {
+            mayUnblock = false;
             run = store.transition<C>(run.id, run.version, {
               to: run.blockedFrom,
-              event: { type: "run.resumed", message: `Resumed: re-entering ${run.blockedFrom}` },
+              event: { type: "run.resumed", message: `Resumed: re-entering ${run.blockedFrom}${run.reason ? ` (operator approved leaving: ${run.reason})` : ""}` },
             });
             opts.onEvent?.({ level: "info", state: run.state, type: "run.resumed", message: `Resumed at ${run.state}` });
             continue;
@@ -177,6 +215,8 @@ export class Engine<C extends object> {
           return run;
         }
 
+        // Any block from here on was never shown to the operator: it ends the drive.
+        mayUnblock = false;
         const handler = this.deps.handlers[run.state];
         if (!handler) throw new Error(`no handler for state ${run.state}`);
         const before = run.state;

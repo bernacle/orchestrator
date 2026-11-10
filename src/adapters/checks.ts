@@ -2,7 +2,7 @@ import { createWriteStream, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { runProcess } from "../core/exec.js";
-import { sandboxedShell, type SandboxSpec } from "../core/isolation.js";
+import { childEnv, sandboxedShell, type IsolationDirs, type SandboxSpec } from "../core/isolation.js";
 import type { Redactor } from "../core/redact.js";
 import type { CheckResult, CheckRunner } from "./types.js";
 
@@ -45,46 +45,170 @@ export class ShellCheckRunner implements CheckRunner {
   }
 }
 
+/** A Node version file read from the repository at the base commit. */
+export interface NodeVersionFile {
+  file: string;
+  content: string;
+}
+
+export const NODE_VERSION_FILES = [".nvmrc", ".node-version"] as const;
+
+/** Where a Node requirement came from: `toolchain.node`, `.nvmrc`, `.node-version`. */
+export interface NodePin {
+  spec: string;
+  source: string;
+}
+
 export interface ResolvedToolchain {
   env: NodeJS.ProcessEnv;
-  node: { requested: string | null; binDir: string | null; version: string | null; source: "path" | "nvm" | "unresolved" | "not-required" };
+  node: {
+    /** The version prefix required: "24" (any 24.x.y), "24.21" or exactly "24.21.0". */
+    requested: string | null;
+    /** Where `requested` came from (e.g. ".nvmrc (refines toolchain.node 24)"). */
+    from?: string | null;
+    binDir: string | null;
+    /** What `node --version` reports with the exact environment and directory checks use. */
+    version: string | null;
+    source: "path" | "nvm" | "unresolved" | "not-required";
+    /** Why the requirement could not be met or was inconsistent. */
+    detail?: string | null;
+  };
 }
 
 /**
- * Build the environment for checks and agents. If the repository pins a
- * Node major version that differs from the one on PATH, look for it in nvm's
- * install directory and prepend its bin dir. Nothing is installed.
+ * A plain version pin: "24", "v24.21", "24.21.0", "24.x". Aliases (`lts/*`, `node`) and ranges
+ * (`>=24`) are not pins and return null. Comments and blank lines are ignored.
  */
-export async function resolveToolchain(requestedNode: string | undefined, extraEnv: Record<string, string>, baseEnv: NodeJS.ProcessEnv = process.env): Promise<ResolvedToolchain> {
-  const env: NodeJS.ProcessEnv = { ...baseEnv, ...extraEnv, COREPACK_ENABLE_DOWNLOAD_PROMPT: "0" };
-  if (!requestedNode) return { env, node: { requested: null, binDir: null, version: null, source: "not-required" } };
+export function parseNodePin(raw: string | null | undefined): string | null {
+  const line = raw
+    ?.split("\n")
+    .map((l) => l.replace(/#.*/, "").trim())
+    .find(Boolean);
+  const m = line?.match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.[x*])?$/i);
+  return m ? [m[1], m[2], m[3]].filter((x) => x !== undefined).join(".") : null;
+}
 
-  const major = requestedNode.replace(/^v/, "").split(".")[0]!;
-  const onPath = await nodeVersion("node", env);
-  if (onPath?.replace(/^v/, "").split(".")[0] === major) {
-    return { env, node: { requested: requestedNode, binDir: null, version: onPath, source: "path" } };
+/** True when `version` (e.g. "v24.21.0") has every component `spec` names ("24", "24.21", "24.21.0"). */
+export function nodeMatches(version: string | null | undefined, spec: string): boolean {
+  if (!version) return false;
+  const v = version.trim().replace(/^v/, "").split(".");
+  return spec.split(".").every((part, i) => v[i] === part);
+}
+
+/**
+ * The Node requirement for a run. The operator's `toolchain.node` and the repository's own version
+ * file (read at the base commit) are combined: the more precise one wins when they agree, so a
+ * config saying "24" with `.nvmrc` saying "24.21.0" requires exactly 24.21.0. A repository that
+ * pins only a major version ("24") keeps major matching. Disagreement is reported, never guessed.
+ * `useVersionFile: false` (toolchain.node_version_file) ignores the repository file.
+ */
+export function nodeRequirement(configured: string | undefined, file: NodeVersionFile | null | undefined, useVersionFile = true): { pin: NodePin | null; conflict: string | null } {
+  const cfg = configured ? parseNodePin(configured) : null;
+  if (configured && !cfg) return { pin: null, conflict: `toolchain.node "${configured}" is not a version (use e.g. "24" or "24.21.0")` };
+  const repo = useVersionFile && file ? parseNodePin(file.content) : null;
+  if (cfg && repo) {
+    if (nodeMatches(repo, cfg)) return { pin: { spec: repo, source: repo === cfg ? `toolchain.node and ${file!.file}` : `${file!.file} (refines toolchain.node ${cfg})` }, conflict: null };
+    if (nodeMatches(cfg, repo)) return { pin: { spec: cfg, source: `toolchain.node (refines ${file!.file} ${repo})` }, conflict: null };
+    return { pin: { spec: cfg, source: "toolchain.node" }, conflict: `toolchain.node ${cfg} conflicts with the repository's ${file!.file} (${repo}); make them agree, or set toolchain.node_version_file: false` };
   }
+  if (cfg) return { pin: { spec: cfg, source: "toolchain.node" }, conflict: null };
+  if (repo) return { pin: { spec: repo, source: file!.file }, conflict: null };
+  return { pin: null, conflict: null };
+}
+
+export interface ToolchainProbe {
+  /** Directory the probe runs in: version managers (asdf, mise) choose by directory. Nearest existing ancestor is used. */
+  cwd?: string;
+  /** Turn the toolchain environment into the one children actually get (e.g. childEnv). */
+  prepare?: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+}
+
+/**
+ * Build the environment for checks and agents. If the `node` that children would run does not
+ * match the requirement (every component it names), look for a matching install in nvm's
+ * directory and prepend its bin dir. Every probe runs `node` through PATH with the prepared
+ * environment, in the directory checks run in, so the reported version is the one checks use.
+ * Nothing is installed.
+ */
+export async function resolveToolchain(
+  requested: NodePin | string | null | undefined,
+  extraEnv: Record<string, string>,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  probe: ToolchainProbe = {},
+): Promise<ResolvedToolchain> {
+  const env: NodeJS.ProcessEnv = { ...baseEnv, ...extraEnv, COREPACK_ENABLE_DOWNLOAD_PROMPT: "0" };
+  const pin: NodePin | null = typeof requested === "string" ? { spec: parseNodePin(requested) ?? requested, source: "toolchain.node" } : (requested ?? null);
+  if (!pin) return { env, node: { requested: null, from: null, binDir: null, version: null, source: "not-required" } };
+  const prepare = probe.prepare ?? ((e: NodeJS.ProcessEnv) => e);
+  const cwd = probe.cwd ? existingDir(probe.cwd) : undefined;
+  const base = { requested: pin.spec, from: pin.source };
+
+  const onPath = await nodeVersion("node", prepare(env), cwd);
+  if (nodeMatches(onPath, pin.spec)) return { env, node: { ...base, binDir: null, version: onPath, source: "path" } };
 
   const nvmDir = join(baseEnv.NVM_DIR ?? join(homedir(), ".nvm"), "versions", "node");
   if (existsSync(nvmDir)) {
     const candidates = readdirSync(nvmDir)
-      .filter((v) => v.replace(/^v/, "").split(".")[0] === major)
+      .filter((v) => nodeMatches(v, pin.spec))
       .sort(compareVersionsDesc);
     for (const candidate of candidates) {
       const binDir = join(nvmDir, candidate, "bin");
-      const version = await nodeVersion(join(binDir, "node"), env);
-      if (version) {
-        env.PATH = [binDir, env.PATH ?? ""].filter(Boolean).join(delimiter);
-        return { env, node: { requested: requestedNode, binDir, version, source: "nvm" } };
+      const withBin = { ...env, PATH: [binDir, env.PATH ?? ""].filter(Boolean).join(delimiter) };
+      const version = await nodeVersion("node", prepare(withBin), cwd);
+      if (nodeMatches(version, pin.spec)) {
+        env.PATH = withBin.PATH;
+        return { env, node: { ...base, binDir, version, source: "nvm" } };
       }
     }
   }
-  return { env, node: { requested: requestedNode, binDir: null, version: onPath, source: "unresolved" } };
+  return {
+    env,
+    node: { ...base, binDir: null, version: onPath, source: "unresolved", detail: `children would run ${onPath ?? "no node"}, and nvm has no Node matching ${pin.spec}` },
+  };
 }
 
-async function nodeVersion(bin: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+/**
+ * The toolchain for repository commands and agents, exactly as the run uses it: requirement from
+ * config plus the repository's version file, probed with the scrubbed child environment in the
+ * directory the commands run in. Used by planning, live steps, preflight and doctor alike.
+ */
+export async function resolveRunToolchain(input: {
+  toolchain: { node?: string | undefined; node_version_file?: boolean | undefined; env: Record<string, string> };
+  versionFile: NodeVersionFile | null | undefined;
+  cwd: string;
+  dirs: IsolationDirs;
+  agent?: string;
+  baseEnv?: NodeJS.ProcessEnv;
+}): Promise<{ env: NodeJS.ProcessEnv; node: ResolvedToolchain["node"]; toolchainEnv: NodeJS.ProcessEnv }> {
+  const { pin, conflict } = nodeRequirement(input.toolchain.node, input.versionFile, input.toolchain.node_version_file ?? true);
+  const prepare = (e: NodeJS.ProcessEnv) => childEnv(e, { ...(input.agent ? { agent: input.agent } : {}), extra: input.toolchain.env, dirs: input.dirs });
+  const tc = await resolveToolchain(pin, {}, input.baseEnv ?? process.env, { cwd: input.cwd, prepare });
+  const node = conflict ? { ...tc.node, source: "unresolved" as const, detail: conflict } : tc.node;
+  // `env` is what children get; `toolchainEnv` is the unscrubbed base (PATH adjusted) for callers that scrub differently.
+  return { env: prepare(tc.env), node, toolchainEnv: tc.env };
+}
+
+/** Human-readable toolchain line for plans, doctor and blockers. */
+export function describeNode(node: ResolvedToolchain["node"]): string {
+  if (node.source === "not-required") return "no Node version required";
+  const want = `wants ${node.requested}${node.from ? ` (${node.from})` : ""}`;
+  if (node.source === "unresolved") return `${want}: ${node.detail ?? `found ${node.version ?? "none"}`}`;
+  return `${want}: ${node.version} via ${node.source}${node.binDir ? ` (${node.binDir})` : ""}`;
+}
+
+function existingDir(path: string): string | undefined {
+  let dir = path;
+  for (;;) {
+    if (existsSync(dir)) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+async function nodeVersion(bin: string, env: NodeJS.ProcessEnv, cwd?: string): Promise<string | null> {
   try {
-    const r = await runProcess(bin, ["--version"], { env, timeoutMs: 10_000 });
+    const r = await runProcess(bin, ["--version"], { env, timeoutMs: 10_000, ...(cwd ? { cwd } : {}) });
     return r.exitCode === 0 ? r.stdout.trim() : null;
   } catch {
     return null;

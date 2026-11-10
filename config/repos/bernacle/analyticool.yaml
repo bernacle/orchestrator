@@ -18,7 +18,9 @@ branch:
   template: "orch/{key}-{slug}"
 
 toolchain:
-  node: "24"            # CONTRIBUTING.md: Node 24 + pnpm 10.34.9 (via corepack / packageManager)
+  node: "24"            # CONTRIBUTING.md: Node 24 + pnpm 10.34.9 (via corepack / packageManager).
+                        # The repo's .nvmrc (24.21.0, required by verify-net-receipts) refines this to
+                        # an exact match; `orchestrator doctor --repo bernacle/analyticool` shows the result.
 
 # Mirrors .github/workflows/ci.yml (origin/main), in the same order. Analyticool has no aggregate
 # verify script, so these are the CI steps themselves (no duplication). `orchestrator run --dry-run`

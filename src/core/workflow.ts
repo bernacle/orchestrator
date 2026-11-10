@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { resolveToolchain } from "../adapters/checks.js";
+import { describeNode, resolveRunToolchain, type NodeVersionFile, type ResolvedToolchain } from "../adapters/checks.js";
 import type { AgentResult, AgentRunner, ChangedFile, CheckResult, Issue, IssueRef, PrEvidence, PullRequestStatus } from "../adapters/types.js";
 import { loadBrief, type Brief } from "../config/brief.js";
 import type { AgentConfig, CheckConfig } from "../config/schema.js";
@@ -25,10 +25,9 @@ import {
 } from "../planning/prompts.js";
 import { REVIEW_OUTPUT_SCHEMA, decideReview, parseReview, type Finding, type ReviewOutcome } from "../planning/review.js";
 import { renderPlanMarkdown } from "../report/render.js";
-import { BlockedError, FailedError, type Handler, type Outcome, type StepContext } from "./engine.js";
+import { BlockedError, FailedError, StopError, type Handler, type Outcome, type StepContext } from "./engine.js";
 import {
   ALWAYS_DENIED_ENV,
-  childEnv,
   compareTripwire,
   credentialPaths,
   defaultWritable,
@@ -96,11 +95,21 @@ export interface RunContext {
   baseBranch?: string;
   baseSha?: string;
   clonePath?: string;
+  /** The repository's Node version file at the base commit (null: none). Undefined on older runs. */
+  nodeVersionFile?: NodeVersionFile | null;
   branch?: string;
   worktreePath?: string;
   implementerSessionId?: string | null;
   rounds: Round[];
+  /**
+   * The accepted baseline: every required check green on the untouched base and the worktree left
+   * clean. Only an accepted baseline is ever reused; a red one is kept in `baselineFailure`.
+   */
   baseline?: Array<Omit<CheckResult, "outputTail">> | null;
+  /** Baseline attempts so far. Each attempt uses fresh effect keys, so a re-entry re-runs every check. */
+  baselineAttempts?: number;
+  /** The last baseline attempt that did not pass (audit and status only, never treated as done). */
+  baselineFailure?: { attempt: number; baseSha: string | null; reason: string; results: Array<Omit<CheckResult, "outputTail">> } | null;
   /** Feedback FIXING must address. */
   feedback?: { trigger: Round["trigger"]; prompt: string } | null;
   lastChecks?: CheckResult[];
@@ -130,10 +139,37 @@ function require<T>(value: T | null | undefined, what: string): T {
   return value;
 }
 
-/** Scrubbed environment for repository commands and agents (see isolation.ts). */
+/** The base commit's Node version file, read once (older runs did not record it during planning). */
+async function baseNodeVersionFile(ctx: Ctx): Promise<NodeVersionFile | null> {
+  const c = ctx.run.context;
+  if (c.nodeVersionFile !== undefined) return c.nodeVersionFile;
+  if (!c.clonePath || !c.baseSha) return null;
+  const file = (await ctx.adapters.workspace.inspect(c.clonePath, c.baseSha)).nodeVersionFile ?? null;
+  ctx.save({ nodeVersionFile: file });
+  return file;
+}
+
+/** The toolchain as repository commands and agents of this run get it, probed where they run. */
+async function runToolchain(ctx: Ctx, agent?: AgentConfig): Promise<{ env: NodeJS.ProcessEnv; node: ResolvedToolchain["node"]; toolchainEnv: NodeJS.ProcessEnv }> {
+  const c = ctx.run.context;
+  return resolveRunToolchain({
+    toolchain: ctx.config.toolchain,
+    versionFile: await baseNodeVersionFile(ctx),
+    cwd: c.worktreePath ?? c.clonePath ?? process.cwd(),
+    dirs: isolationDirs(ctx.paths.home),
+    ...(agent ? { agent: agent.adapter } : {}),
+  });
+}
+
+/**
+ * Scrubbed environment for repository commands and agents (see isolation.ts). A live run never
+ * runs them on a Node that does not satisfy the requirement: it blocks instead (the agent would
+ * otherwise chase failures the wrong Node causes).
+ */
 async function runEnv(ctx: Ctx, agent?: AgentConfig): Promise<NodeJS.ProcessEnv> {
-  const tc = await resolveToolchain(ctx.config.toolchain.node, {});
-  return childEnv(tc.env, { ...(agent ? { agent: agent.adapter } : {}), extra: ctx.config.toolchain.env, dirs: isolationDirs(ctx.paths.home) });
+  const tc = await runToolchain(ctx, agent);
+  if (!ctx.dryRun && tc.node.source === "unresolved") throw new BlockedError(`toolchain: ${describeNode(tc.node)}`);
+  return tc.env;
 }
 
 /** Sandbox for setup/check commands in a worktree. Fails closed when required and unavailable. */
@@ -311,7 +347,7 @@ const planning: Handler<RunContext> = async (ctx) => {
   else extraWarnings.push(`using operator clone ${clonePath}; worktrees will be registered in its .git`);
   const inspectedRef = managed ? `origin/${baseBranch}` : "HEAD";
   const inspection = await adapters.workspace.inspect(clonePath, managed ? inspectedRef : undefined);
-  ctx.save({ clonePath });
+  ctx.save({ clonePath, nodeVersionFile: inspection.nodeVersionFile ?? null });
 
   // ---- dependencies: relations, text, operator brief, and evidence
   const brief: Brief | null = loadBrief(ctx.paths, config.repo, issue.key);
@@ -349,7 +385,7 @@ const planning: Handler<RunContext> = async (ctx) => {
   const worktreePath = join(ctx.paths.worktrees, owner, name, run.id);
   const branchExists = await adapters.workspace.branchExists(clonePath, branch);
   const existingPr = await adapters.codeHost.findPullRequest(config.repo, branch);
-  const tc = await resolveToolchain(config.toolchain.node, config.toolchain.env);
+  const tc = await resolveRunToolchain({ toolchain: config.toolchain, versionFile: inspection.nodeVersionFile, cwd: worktreePath, dirs: isolationDirs(ctx.paths.home) });
 
   // ---- independence invariants
   const implementer = provider(ctx, config.agents.implementer);
@@ -617,6 +653,72 @@ function openQuestions(c: RunContext): string[] {
   return c.agentPlan?.open_questions ?? [];
 }
 
+// ---- baseline ----------------------------------------------------------------------
+
+type BaselineResult = Omit<CheckResult, "outputTail">;
+
+/**
+ * A baseline counts as done only if every required check passed. Optional checks may be red.
+ * Runs stored before this rule may hold a red baseline: that is never accepted either.
+ */
+export function baselineAccepted(baseline: BaselineResult[] | null | undefined, checks: CheckConfig[]): boolean {
+  if (!baseline) return false;
+  const byName = new Map(baseline.map((r) => [r.name, r]));
+  return checks.every((k) => k.optional || byName.get(k.name)?.ok === true) && baseline.every((r) => r.ok || r.optional);
+}
+
+/**
+ * Run the checks on the untouched base, or reuse an accepted (green) result. A red or dirty base
+ * throws BlockedError and is never saved as the accepted baseline, so re-entering IMPLEMENTING
+ * (after an approved resume) re-runs every check under fresh effect keys instead of trusting it.
+ */
+async function ensureGreenBaseline(ctx: Ctx, worktree: string): Promise<void> {
+  const { config, adapters } = ctx;
+  const c = ctx.run.context;
+  if (baselineAccepted(c.baseline, config.checks)) {
+    ctx.log("info", "baseline.reused", `Baseline already green on ${c.baseSha?.slice(0, 8)}; not re-running`);
+    return;
+  }
+  // An attempt that was interrupted (no outcome recorded) continues with its own completed checks;
+  // an attempt that ended red is finished, so the next one starts from scratch under new keys.
+  const last = c.baselineAttempts ?? 0;
+  const attempt = last === 0 || c.baselineFailure?.attempt === last ? last + 1 : last;
+  ctx.save({ baselineAttempts: attempt, baseline: null });
+  let results: CheckResult[];
+  try {
+    results = await runChecks(ctx, {
+      worktree,
+      checks: config.checks,
+      keyPrefix: `baseline.${attempt}`,
+      logPrefix: attempt === 1 ? "baseline" : `baseline-${attempt}`,
+      defaultNetwork: config.isolation.checks_network,
+      label: "baseline",
+    });
+  } catch (err) {
+    // Only an interruption continues this attempt; any other end (error, block) closes it, so the
+    // next entry re-runs every check instead of replaying a result from before the operator's fix.
+    if (!(err instanceof StopError) && !ctx.signal.aborted) {
+      ctx.save({ baselineFailure: { attempt, baseSha: c.baseSha ?? null, reason: `baseline did not finish: ${(err as Error).message}`, results: [] } });
+    }
+    throw err;
+  }
+  const recorded = results.map(({ outputTail: _t, ...rest }) => rest);
+  const red = results.filter((r) => !r.ok && !r.optional);
+  const fail = (reason: string): never => {
+    ctx.save({ baseline: null, baselineFailure: { attempt, baseSha: c.baseSha ?? null, reason, results: recorded } });
+    throw new BlockedError(reason);
+  };
+  if (red.length) {
+    fail(
+      `base ${c.baseSha?.slice(0, 8)} is red before any change: ${red.map((r) => r.name).join(", ")} (see ${red[0]!.logPath}). ` +
+        "Fix the environment or the check configuration and resume (the baseline runs again), or fix the base branch and start a new run.",
+    );
+  }
+  if (results.length !== config.checks.length) fail(`baseline incomplete: ${results.length} of ${config.checks.length} checks ran`);
+  if (await adapters.workspace.hasUncommittedChanges(worktree)) fail("baseline checks modified the worktree; the check configuration must not write tracked files");
+  ctx.save({ baseline: recorded, baselineFailure: null });
+}
+
 // ---- IMPLEMENTING ------------------------------------------------------------------
 
 const implementing: Handler<RunContext> = async (ctx) => {
@@ -643,15 +745,7 @@ const implementing: Handler<RunContext> = async (ctx) => {
   if (failedSetup) throw new BlockedError(`setup "${failedSetup.name}" failed (exit ${failedSetup.exitCode}); see ${failedSetup.logPath}`);
 
   // Baseline: the agent should not chase failures that already exist on the base branch.
-  let baseline = c.baseline ?? null;
-  if (config.baseline_checks && !baseline) {
-    const results = await runChecks(ctx, { worktree, checks: config.checks, keyPrefix: "baseline", logPrefix: "baseline", defaultNetwork: config.isolation.checks_network, label: "baseline" });
-    baseline = results.map(({ outputTail: _t, ...rest }) => rest);
-    ctx.save({ baseline });
-    const red = results.filter((r) => !r.ok && !r.optional);
-    if (red.length) throw new BlockedError(`base ${c.baseSha?.slice(0, 8)} is red before any change: ${red.map((r) => r.name).join(", ")} (see ${red[0]!.logPath}). Fix the base branch or the check configuration first.`);
-    if (await adapters.workspace.hasUncommittedChanges(worktree)) throw new BlockedError("baseline checks modified the worktree; the check configuration must not write tracked files");
-  }
+  if (config.baseline_checks) await ensureGreenBaseline(ctx, worktree);
 
   const prompt = implementerPrompt({
     issue: require(c.issue, "issue"),

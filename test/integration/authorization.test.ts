@@ -191,7 +191,7 @@ describe("repository authorization and associations also need a person", () => {
   function pending(): void {
     buildProposal({
       repo: "acme/fresh",
-      inspection: { root: "/r", headSha: "x", packageManager: "pnpm@10", scripts: { test: "vitest" }, workspaces: [], ciWorkflows: [], guidanceFiles: [], topLevel: ["package.json"], nodeEngine: null },
+      inspection: { root: "/r", headSha: "x", packageManager: "pnpm@10", scripts: { test: "vitest" }, workspaces: [], ciWorkflows: [], guidanceFiles: [], topLevel: ["package.json"], nodeEngine: null, nodeVersionFile: null },
       teams: ["ACM"],
       agentsAvailable: { claude: true, codex: true },
       paths: h.app.paths,

@@ -69,7 +69,7 @@ export function renderPlanMarkdown(p: ExecutionPlan): string {
     `- Protection: ${repo.protection.protected ? `protected; required checks: ${repo.protection.requiredChecks.join(", ") || "none"}; required approvals: ${repo.protection.requiredApprovals}` : "**none** (no branch protection, no rulesets)"}`,
     `- Inspected \`${repo.inspectedRef}\` @ \`${short(repo.inspectedSha)}\` in \`${repo.clonePath}\``,
     `- Package manager: ${repo.packageManager ?? "—"} · Node engine: ${repo.nodeEngine ?? "—"} · workspaces: ${repo.workspaces.join(", ") || "—"}`,
-    `- Toolchain: Node ${p.toolchain.requested ?? "(any)"} → ${p.toolchain.version ?? "?"} via ${p.toolchain.source}${p.toolchain.binDir ? ` (\`${p.toolchain.binDir}\`)` : ""}`,
+    `- Toolchain: Node ${p.toolchain.requested ?? "(any)"}${p.toolchain.from ? ` (${p.toolchain.from})` : ""} → ${p.toolchain.version ?? "?"} via ${p.toolchain.source}${p.toolchain.binDir ? ` (\`${p.toolchain.binDir}\`)` : ""}${p.toolchain.detail ? ` — ${p.toolchain.detail}` : ""}`,
     `- Guidance the agents are told to follow: ${repo.guidanceFiles.join(", ") || "none"}`,
     "",
   );

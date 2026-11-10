@@ -1,6 +1,7 @@
 import { accessSync, constants, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { resolveToolchain } from "../adapters/checks.js";
+import { describeNode, resolveRunToolchain, type NodeVersionFile } from "../adapters/checks.js";
+import { GitWorkspace } from "../adapters/git.js";
 import { ClaudeCodeAgent } from "../adapters/claude.js";
 import { CodexAgent } from "../adapters/codex.js";
 import { GitHubHost, ghAuthStatus } from "../adapters/github.js";
@@ -10,7 +11,7 @@ import { LinearTracker } from "../adapters/linear.js";
 import { T3Cli } from "../adapters/t3.js";
 import { listRepoConfigs, loadRepoConfig, type LoadedRepoConfig, type Paths } from "../config/load.js";
 import { probe, runProcess } from "../core/exec.js";
-import { compareVersions, MIN_CLAUDE_VERSION_FOR_ISOLATION, sandboxSupport } from "../core/isolation.js";
+import { compareVersions, isolationDirs, MIN_CLAUDE_VERSION_FOR_ISOLATION, sandboxSupport } from "../core/isolation.js";
 import { c } from "../report/render.js";
 
 export type Status = "ok" | "warn" | "fail" | "info";
@@ -139,10 +140,21 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
     const clone = config.local_path ?? join(paths.clones, owner, name);
     add(section, "clone", existsSync(join(clone, ".git")) ? "ok" : "info", existsSync(join(clone, ".git")) ? clone : `${clone} (created on first run)`);
 
-    const tc = await resolveToolchain(config.toolchain.node, config.toolchain.env, env);
-    if (tc.node.source === "not-required") add(section, "node", "info", "no toolchain.node pinned");
-    else add(section, "node", tc.node.source === "unresolved" ? "fail" : "ok", `wants ${tc.node.requested}: ${tc.node.version ?? "missing"} via ${tc.node.source}${tc.node.binDir ? ` (${tc.node.binDir})` : ""}`);
-    if (existsSync(join(clone, ".git"))) {
+    // Same resolution as a run: config plus the base commit's .nvmrc/.node-version, probed with the
+    // scrubbed child environment from the directory run worktrees live in (asdf/mise choose by directory).
+    const hasClone = existsSync(join(clone, ".git"));
+    let versionFile: NodeVersionFile | null = null;
+    if (hasClone) {
+      try {
+        versionFile = (await new GitWorkspace(env).inspect(clone, config.local_path ? undefined : `origin/${config.base_branch ?? "main"}`)).nodeVersionFile;
+      } catch (err) {
+        add(section, "node", "warn", `could not read the repository's Node version file: ${(err as Error).message.split("\n")[0]}`);
+      }
+    }
+    const tc = await resolveRunToolchain({ toolchain: config.toolchain, versionFile, cwd: join(paths.worktrees, owner, name), dirs: isolationDirs(paths.home), baseEnv: env });
+    if (tc.node.source === "not-required") add(section, "node", "info", `no Node version required (no toolchain.node${hasClone ? ", no .nvmrc/.node-version" : "; clone not created yet, so .nvmrc/.node-version not read"})`);
+    else add(section, "node", tc.node.source === "unresolved" ? "fail" : "ok", `${describeNode(tc.node)}${hasClone ? "" : " (clone not created yet: .nvmrc/.node-version not read)"}`);
+    if (hasClone) {
       const pm = config.setup[0]?.run.split(" ")[0] ?? config.checks[0]?.run.split(" ")[0];
       if (pm && /^(pnpm|npm|yarn|bun)$/.test(pm)) {
         const r = await runProcess(pm, ["--version"], { cwd: clone, env: tc.env, timeoutMs: 30_000 }).catch(() => null);

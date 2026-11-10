@@ -1,5 +1,5 @@
 import type { BranchProtection, Issue, PullRequestStatus, RepoInfo, RepoInspection } from "../adapters/types.js";
-import type { ResolvedToolchain } from "../adapters/checks.js";
+import { describeNode, type ResolvedToolchain } from "../adapters/checks.js";
 import type { AgentConfig, CheckConfig, RepoConfig } from "../config/schema.js";
 import { PermissionGate, type Permission } from "../core/policy.js";
 import type { RunState } from "../core/states.js";
@@ -239,7 +239,7 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
   for (const inv of input.invariants) if (!inv.ok) blockers.push(`${inv.rule}: ${inv.detail}`);
   for (const c of checks) if (c.verification === "script-missing") blockers.push(`check "${c.name}" runs \`${c.command}\` but package.json has no such script`);
   if (input.criteria.source === "none") warnings.push("issue has no explicit acceptance criteria; the reviewer will judge against the description");
-  if (input.toolchain.source === "unresolved") blockers.push(`repository needs Node ${input.toolchain.requested} but it is not on PATH or in nvm (found ${input.toolchain.version ?? "none"})`);
+  if (input.toolchain.source === "unresolved") blockers.push(`toolchain: ${describeNode(input.toolchain)}`);
   if (!input.protection.protected) warnings.push(`${input.baseBranch} has no branch protection or rulesets: GitHub will not enforce CI or reviews, so only manual merges are possible`);
   if (input.inspection.headSha !== input.repoInfo.baseSha) {
     warnings.push(`inspected ${input.inspectedRef} at ${input.inspection.headSha.slice(0, 8)}, but ${input.baseBranch} on GitHub is ${input.repoInfo.baseSha.slice(0, 8)}; a live run fetches first`);

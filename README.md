@@ -76,7 +76,7 @@ See [`config/repos/bernacle/analyticool.yaml`](config/repos/bernacle/analyticool
 ```yaml
 repo: bernacle/analyticool
 linear: { teams: [BRU] }            # issue keys this repo handles (a key prefix alone never proves an issue belongs here)
-toolchain: { node: "24" }           # resolved from PATH or nvm, prepended for checks and agents
+toolchain: { node: "24" }           # or exact "24.21.0"; a repo .nvmrc/.node-version refines it. Resolved from PATH or nvm
 setup:  [{ name: install, run: pnpm install --frozen-lockfile }]
 checks: [{ name: lint, run: pnpm lint }, { name: test, run: pnpm test }]
 agents:

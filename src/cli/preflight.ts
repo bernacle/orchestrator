@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resolveToolchain } from "../adapters/checks.js";
+import { describeNode, resolveRunToolchain } from "../adapters/checks.js";
 import { ClaudeCodeAgent } from "../adapters/claude.js";
 import type { Adapters, CheckResult } from "../adapters/types.js";
 import type { LoadedRepoConfig, Paths } from "../config/load.js";
@@ -30,7 +30,7 @@ import {
  */
 
 export interface PreflightStep {
-  kind: "setup" | "check" | "agent-probe" | "tripwire" | "isolation";
+  kind: "setup" | "check" | "agent-probe" | "tripwire" | "isolation" | "toolchain";
   name: string;
   ok: boolean;
   detail: string;
@@ -87,8 +87,14 @@ export async function runPreflight(input: {
   baseSha = inspection.headSha;
   await workspace.createDetachedWorktree(clone, worktree, baseSha);
 
-  const tc = await resolveToolchain(config.toolchain.node, {});
-  const env = childEnv(tc.env, { extra: config.toolchain.env, dirs: isolationDirs(input.paths.home) });
+  // Same resolution as a live run: config plus the base commit's version file, probed in the worktree.
+  const tc = await resolveRunToolchain({ toolchain: config.toolchain, versionFile: inspection.nodeVersionFile, cwd: worktree, dirs: isolationDirs(input.paths.home) });
+  const env = tc.env;
+  record({ kind: "toolchain", name: "node", ok: tc.node.source !== "unresolved", detail: describeNode(tc.node) });
+  if (tc.node.source === "unresolved") {
+    if (!input.keep && existsSync(worktree)) await workspace.removeWorktree(clone, worktree).catch(() => undefined);
+    return finish(false);
+  }
   const tripPaths = [...tripwirePaths(process.env, [join(clone, ".git")]), join(clone, ".git", "HEAD"), join(clone, ".git", "refs")];
   let allOk = true;
 
@@ -124,7 +130,7 @@ export async function runPreflight(input: {
     for (const c of config.checks) await run("check", c, c.network ?? config.isolation.checks_network);
 
     if (input.agentProbe && config.agents.implementer.adapter === "claude-code") {
-      record(await probeImplementerSandbox(config.agents.implementer, worktree, input.paths, tc.env, logs));
+      record(await probeImplementerSandbox(config.agents.implementer, worktree, input.paths, tc.toolchainEnv, logs));
       if (!steps.at(-1)!.ok) allOk = false;
     }
     if (await workspace.hasUncommittedChanges(worktree)) {
