@@ -60,6 +60,12 @@ describe("ClaudeCodeAgent auto memory and sandbox reads", () => {
       // The pinned Node and the isolation stubs become readable; nothing becomes writable.
       expect(settings.sandbox.filesystem.allowRead).toEqual(expect.arrayContaining(["/iso/gitconfig-empty", "/nvm/v24.21.0"]));
       expect(settings.sandbox.filesystem.allowWrite).toEqual([]);
+      // The worktree's gitfile is not writable from the shell, nor through the file tools.
+      expect((settings.sandbox.filesystem as unknown as { denyWrite: string[] }).denyWrite).toEqual([join(dir, ".git")]);
+      expect(args.join("\n")).toContain("Edit(/.git)");
+      expect(args.join("\n")).toContain(`Edit(/${join(dir, ".git")})`); // absolute form too: //<cwd>/.git
+      // Credential files inside the readable Node install stay denied (the narrower rule wins).
+      expect((settings.sandbox.filesystem as unknown as { denyRead: string[] }).denyRead).toEqual(expect.arrayContaining(["/nvm/v24.21.0/etc/npmrc", "/nvm/v24.21.0/.npmrc"]));
       // The audit copy shows the same settings the process ran under.
       expect(JSON.parse(readFileSync(join(dir, "t.claude-settings.json"), "utf8"))).toEqual(settings);
     } finally {

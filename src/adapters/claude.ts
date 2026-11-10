@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { probe, runProcess } from "../core/exec.js";
-import { claudeIsolationSettings, compareVersions, MIN_CLAUDE_VERSION_FOR_ISOLATION } from "../core/isolation.js";
+import { claudeIsolationSettings, compareVersions, MIN_CLAUDE_VERSION_FOR_ISOLATION, toolchainSecretPaths } from "../core/isolation.js";
 import type { AgentConfig } from "../config/schema.js";
 import type { AgentResult, AgentRunner, AgentTask } from "./types.js";
 
@@ -41,6 +41,9 @@ export const DEFAULT_DENIED = [
   "Bash(pnpm publish:*)",
   "WebFetch",
   "WebSearch",
+  // The worktree's gitfile (and a .git directory, if one is put in its place): see claudeIsolationSettings.
+  "Edit(/.git)",
+  "Edit(/.git/**)",
 ];
 
 export interface AgentIsolation {
@@ -89,23 +92,27 @@ export class ClaudeCodeAgent implements AgentRunner {
     private readonly bin = "claude",
   ) {}
 
-  settings(role: AgentTask["role"], readablePaths: string[] = []): object {
+  settings(role: AgentTask["role"], readablePaths: string[] = [], cwd?: string): object {
     return claudeIsolationSettings({
-      denyRead: this.isolation.denyRead,
+      ...(cwd ? { denyWrite: [join(cwd, ".git")] } : {}),
+      denyRead: [...this.isolation.denyRead, ...toolchainSecretPaths(readablePaths)],
       deniedEnv: this.isolation.deniedEnv,
       allowWrite: this.isolation.allowWrite ?? [],
       allowRead: [...(this.isolation.allowRead ?? []), ...readablePaths],
       allow: [],
-      deny: role === "implementer" ? [...new Set([...DEFAULT_DENIED, ...this.config.disallowed_tools])] : ["Bash", "Edit", "Write", "WebFetch", "WebSearch"],
+      deny:
+        role === "implementer"
+          ? [...new Set([...DEFAULT_DENIED, ...this.config.disallowed_tools, ...(cwd ? [`Edit(/${join(cwd, ".git")})`, `Edit(/${join(cwd, ".git")}/**)`] : [])])]
+          : ["Bash", "Edit", "Write", "WebFetch", "WebSearch"],
     });
   }
 
-  args(task: Pick<AgentTask, "role" | "resumeSessionId" | "sessionId" | "outputSchema" | "readablePaths"> & { maxBudgetUsd?: number }): string[] {
+  args(task: Pick<AgentTask, "role" | "resumeSessionId" | "sessionId" | "outputSchema" | "readablePaths"> & { maxBudgetUsd?: number; cwd?: string }): string[] {
     const a = ["-p", "--output-format", "json"];
     if (this.config.model) a.push("--model", this.config.model);
     // Only our settings apply: not the repository's .claude/settings*.json (hooks, allow rules), not the
     // operator's user settings, not project MCP servers.
-    a.push("--settings", JSON.stringify(this.settings(task.role, task.readablePaths)), "--setting-sources", "", "--strict-mcp-config");
+    a.push("--settings", JSON.stringify(this.settings(task.role, task.readablePaths, task.cwd)), "--setting-sources", "", "--strict-mcp-config");
     if (task.role === "implementer") {
       a.push("--tools", IMPLEMENTER_TOOLS.join(","));
       // Edits are auto-accepted; anything else not allow-listed is denied (no human to prompt).
@@ -136,7 +143,7 @@ export class ClaudeCodeAgent implements AgentRunner {
     const sessionId = task.resumeSessionId ?? task.sessionId ?? crypto.randomUUID();
     const args = this.args({ ...task, sessionId });
     // Audit: the exact isolation settings this agent ran under.
-    writeFileSync(join(task.artifactDir, `${task.artifactPrefix}.claude-settings.json`), JSON.stringify(this.settings(task.role, task.readablePaths), null, 2));
+    writeFileSync(join(task.artifactDir, `${task.artifactPrefix}.claude-settings.json`), JSON.stringify(this.settings(task.role, task.readablePaths, task.cwd), null, 2));
     const result = await runProcess(this.bin, args, {
       cwd: task.cwd,
       env: { ...task.env, ...CLAUDE_ENV },

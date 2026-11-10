@@ -1,6 +1,6 @@
 import { createWriteStream, existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { runProcess } from "../core/exec.js";
 import { childEnv, sandboxedShell, type IsolationDirs, type SandboxSpec } from "../core/isolation.js";
 import type { Redactor } from "../core/redact.js";
@@ -26,6 +26,7 @@ export class ShellCheckRunner implements CheckRunner {
       env: { ...input.env, CI: "1", FORCE_COLOR: "0" },
       timeoutMs: input.timeoutMs,
       signal: input.signal,
+      killGroupOnExit: true,
     });
     const header = `$ ${input.command}${input.sandbox ? `  [sandbox: seatbelt, network=${input.sandbox.network}]` : "  [UNSANDBOXED]"}`;
     const combined = this.redactor.redact(`${header}\n${result.stdout}${result.stderr ? `\n--- stderr ---\n${result.stderr}` : ""}`);
@@ -218,9 +219,27 @@ async function pinRealNode(env: NodeJS.ProcessEnv, spec: string, prepare: (e: No
   return nodeMatches(await nodeVersion("node", prepare(pinned), cwd), spec) ? { env: pinned, binDir } : null;
 }
 
-/** Paths outside the worktree an agent's sandboxed shell must read to run the resolved toolchain. */
-export function toolchainReadPaths(node: ResolvedToolchain["node"]): string[] {
-  return node.home ? [node.home] : node.binDir ? [node.binDir] : [];
+/**
+ * Paths outside the worktree an agent's sandboxed shell must read to run the resolved toolchain.
+ * A read allowance re-opens part of the home directory the agent sandbox otherwise hides, so it must
+ * be narrow: the Node installation itself (identified by its headers) when it sits at least two
+ * levels below $HOME (~/.nvm/versions/node/v24.21.0, ~/.asdf/installs/nodejs/24.21.0), otherwise
+ * just its bin directory, otherwise nothing (the agent probe then fails visibly instead of the
+ * sandbox being widened to e.g. ~/.local or ~).
+ */
+export function toolchainReadPaths(node: ResolvedToolchain["node"], home: string = homedir()): string[] {
+  const inside = (child: string, parent: string) => {
+    const r = relative(parent, child);
+    return r !== "" && !r.startsWith("..") && !isAbsolute(r);
+  };
+  const narrow = (p: string) => {
+    if (p === home || inside(home, p)) return false; // $HOME itself, or an ancestor of it
+    if (!inside(p, home)) return true; // outside $HOME: not hidden by the sandbox anyway
+    return relative(home, p).split(sep).length >= 2;
+  };
+  if (node.home && existsSync(join(node.home, "include", "node", "node.h")) && narrow(node.home)) return [node.home];
+  if (node.binDir && narrow(node.binDir)) return [node.binDir];
+  return [];
 }
 
 /** Human-readable toolchain line for plans, doctor and blockers. */

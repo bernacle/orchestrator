@@ -29,7 +29,7 @@ export type CheckConfig = z.infer<typeof CheckSchema>;
 export const ScreenshotsSchema = z.object({
   /** A command the repository already supports, e.g. its Playwright smoke tests against a local server. */
   run: z.string().min(1),
-  /** Worktree-relative globs of the image files `run` writes (PNG, JPEG or WebP). */
+  /** Worktree-relative globs of the PNG files `run` writes (plain PNGs only: no text, EXIF or ICC chunks). */
   outputs: z.array(z.string().min(1)).min(1),
   /** Screenshots are required only when the change touches one of these globs. Empty: every change. */
   when_changed: z.array(z.string().min(1)).default([]),
@@ -185,6 +185,12 @@ export const RepoConfigSchema = z
         require: z.boolean().default(true),
         setup_network: z.enum(["none", "outbound"]).default("outbound"),
         checks_network: z.enum(["none", "outbound"]).default("none"),
+        /**
+         * Extra paths under your home directory that setup, checks and screenshots may read (e.g. a
+         * toolchain outside the defaults). Everything else there is unreadable to repository code.
+         * Credential paths stay denied whatever is listed.
+         */
+        read_paths: z.array(z.string().min(1)).default([]),
       })
       .prefault({}),
     /** Hard limits for one run, across all agent calls and correction rounds. */

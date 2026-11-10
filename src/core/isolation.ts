@@ -161,8 +161,19 @@ export type NetworkPolicy = "none" | "outbound";
 export interface SandboxSpec {
   /** Directories the command may write to. */
   writable: string[];
+  /**
+   * Paths inside `writable` that stay unwritable: the worktree's `.git` gitfile, which points the
+   * orchestrator's own (unsandboxed) git at a git directory. Rewritten, it could redirect that git
+   * to a config with filters or an ssh command.
+   */
+  readOnly?: string[];
   /** Paths the command may not read. */
   denyRead: string[];
+  /**
+   * File contents under `home` are unreadable except in `readable` (and `writable`). Used where a
+   * command's output is published (screenshots): it then sees only what it needs, not your files.
+   */
+  privateHome?: { home: string; readable: string[] };
   network: NetworkPolicy;
 }
 
@@ -217,9 +228,26 @@ export function seatbeltProfile(spec: SandboxSpec): string {
     ...writable.map((p) => `  (subpath ${sbString(p)})`),
     '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (literal "/dev/dtracehelper")',
     '  (regex #"^/dev/fd/") (regex #"^/dev/ttys[0-9]+$"))',
+    ...(spec.readOnly?.length
+      ? ["", ";; Never writable, even inside the worktree (later rules win).", "(deny file-write*", ...[...new Set(spec.readOnly.flatMap((p) => [p, real(p)]))].map((p) => `  (literal ${sbString(p)}) (subpath ${sbString(p)})`), ")"]
+      : []),
+    ...(spec.privateHome
+      ? [
+          "",
+          ";; Home directory contents are unreadable except the listed paths (metadata stays visible).",
+          `(deny file-read-data (subpath ${sbString(real(spec.privateHome.home))}))`,
+          "(allow file-read-data",
+          ...[...new Set(spec.privateHome.readable.flatMap((p) => [p, real(p)]))].map((p) => `  (subpath ${sbString(p)})`),
+          ")",
+        ]
+      : []),
     "",
-    ";; Credentials are not readable.",
+    ";; Credentials are not readable. Denied for file-read-data as well: a rule naming that specific",
+    ";; operation (the private-home allow-list) would otherwise take precedence over file-read*.",
     "(deny file-read*",
+    ...denyRead.map((p) => `  (subpath ${sbString(p)})`),
+    ")",
+    "(deny file-read-data",
     ...denyRead.map((p) => `  (subpath ${sbString(p)})`),
     ")",
     "",
@@ -238,6 +266,30 @@ export function seatbeltProfile(spec: SandboxSpec): string {
 /** Wrap a shell command so it runs inside the sandbox. */
 export function sandboxedShell(command: string, spec: SandboxSpec): { command: string; args: string[] } {
   return { command: "/usr/bin/sandbox-exec", args: ["-p", seatbeltProfile(spec), "/bin/sh", "-c", command] };
+}
+
+/**
+ * What repository code (setup, checks, screenshots) may read under $HOME: the worktree, the clone's
+ * git directory (read-only: tests may run git), the pinned toolchain, the specific package-manager
+ * and browser caches it needs, and whatever the operator lists in `isolation.read_paths`. Everything
+ * else in your home directory (shell history, other repositories, tool configs holding tokens) is
+ * unreadable. Other caches stay writable but not readable.
+ */
+export function repositoryReadPaths(input: { worktree: string; gitDir?: string | null; toolchain: string[]; extra?: string[]; env: NodeJS.ProcessEnv }): string[] {
+  const h = input.env.HOME ?? homedir();
+  return [
+    input.worktree,
+    ...(input.gitDir ? [input.gitDir] : []),
+    ...input.toolchain,
+    ...toolchainCaches(input.env),
+    input.env.PLAYWRIGHT_BROWSERS_PATH ?? join(h, "Library", "Caches", "ms-playwright"),
+    join(h, "Library", "Caches", "pnpm"),
+    join(h, "Library", "pnpm"),
+    join(h, ".local", "share", "pnpm"),
+    join(h, ".pnpm-store"),
+    join(h, ".npm"),
+    ...(input.extra ?? []),
+  ];
 }
 
 /** Standard writable set for a worktree: the worktree itself, temp, and package-manager caches. */
@@ -267,7 +319,7 @@ export const MIN_CLAUDE_VERSION_FOR_ISOLATION = "2.1.314"; // permissions.blockW
  * repository's .claude/settings*.json and the operator's user settings do not
  * apply). Verified empirically on 2.1.318 (see docs/isolation.md).
  */
-export function claudeIsolationSettings(input: { denyRead: string[]; deniedEnv: string[]; allow: string[]; deny: string[]; allowWrite?: string[]; allowRead?: string[] }): object {
+export function claudeIsolationSettings(input: { denyRead: string[]; deniedEnv: string[]; allow: string[]; deny: string[]; allowWrite?: string[]; allowRead?: string[]; denyWrite?: string[] }): object {
   const toolCaches = input.allowWrite ?? [];
   return {
     disableAllHooks: true,
@@ -291,7 +343,14 @@ export function claudeIsolationSettings(input: { denyRead: string[]; deniedEnv: 
       // Outside the worktree the shell may read only: tool caches it must also update (corepack's
       // lastKnownGood.json), the pinned Node install it executes, and the orchestrator's empty
       // git/gh config stubs (GIT_CONFIG_GLOBAL points there, so git fails if it cannot read it).
-      filesystem: { denyRead: input.denyRead, allowRead: [...new Set([...toolCaches, ...(input.allowRead ?? [])])], allowWrite: toolCaches },
+      filesystem: {
+        denyRead: input.denyRead,
+        allowRead: [...new Set([...toolCaches, ...(input.allowRead ?? [])])],
+        allowWrite: toolCaches,
+        // The worktree's `.git` gitfile steers the orchestrator's own git; Claude Code protects only
+        // `.git/hooks` and `.git/config`, not the gitfile of a linked worktree.
+        ...(input.denyWrite?.length ? { denyWrite: input.denyWrite } : {}),
+      },
       network: { allowedDomains: [] },
       credentials: { envVars: input.deniedEnv.map((name) => ({ name, mode: "deny" })) },
     },
@@ -312,6 +371,15 @@ export function compareVersions(a: string, b: string): number {
 export function toolchainCaches(env: NodeJS.ProcessEnv): string[] {
   const h = env.HOME ?? homedir();
   return [env.COREPACK_HOME ?? join(h, ".cache", "node", "corepack")];
+}
+
+/**
+ * Files inside a readable toolchain installation that can hold credentials (npm's global config,
+ * `<prefix>/etc/npmrc`, may carry registry tokens). Denied even though the installation is readable:
+ * in Claude Code's sandbox the narrower rule wins, so these stay blocked.
+ */
+export function toolchainSecretPaths(readable: string[]): string[] {
+  return readable.flatMap((dir) => [join(dir, "etc", "npmrc"), join(dir, ".npmrc")]);
 }
 
 /** Read-only paths every agent shell needs outside the worktree: the isolation stubs childEnv points at. */

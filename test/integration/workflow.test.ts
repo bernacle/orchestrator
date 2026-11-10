@@ -198,6 +198,29 @@ describe("supervised run", () => {
     expect(JSON.stringify(evidence)).not.toContain("pwned");
   });
 
+  it("fails the run when the worktree's gitfile is repointed (it steers the orchestrator's own git)", async () => {
+    h = createHarness({
+      implement: (task) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        writeFileSync(join(task.cwd, ".git"), "gitdir: /tmp/attacker-git-dir\n");
+        return {};
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/unexpected change outside the worktree during implementer round 0: .*\/\.git\b/);
+    expect(h.host.prs).toHaveLength(0);
+  });
+
+  it("never reviews a worktree that differs from the commit (a check left a file behind)", async () => {
+    h = createHarness({ config: { checks: [{ name: "feature-exists", run: "test -f feature.txt && echo junk > stray.txt" }] } });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/uncommitted changes before review \(stray\.txt\)/);
+    expect(h.reviewer.calls).toHaveLength(0);
+    expect(h.host.prs).toHaveLength(0);
+  });
+
   it("refuses to push a diff that contains a secret", async () => {
     h = createHarness({
       implement: (task) => {

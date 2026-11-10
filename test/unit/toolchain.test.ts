@@ -141,6 +141,8 @@ describe("toolchain resolution", () => {
     const root = join(scratch, `m${n++}`);
     const real = join(root, "nvm", "versions", "node", "v24.21.0", "bin");
     fakeNode(real, "v24.21.0", undefined, join(real, "node"));
+    mkdirSync(join(real, "..", "include", "node"), { recursive: true });
+    writeFileSync(join(real, "..", "include", "node", "node.h"), "");
     const shims = fakeNode(join(root, "asdf", "shims"), "v24.21.0", undefined, join(real, "node"));
     const env = { PATH: `${shims}:/usr/bin:/bin`, HOME: root };
     const tc = await resolveRunToolchain({ toolchain: { node: "24.21.0", env: {} }, versionFile: null, cwd: root, dirs: isolationDirs(join(root, "orch-home")), baseEnv: env });
@@ -148,6 +150,23 @@ describe("toolchain resolution", () => {
     expect(tc.env.PATH!.split(":")[0]).toBe(real);
     expect(tc.env.PATH!.split(":")).toContain(shims); // other tools on PATH stay reachable
     expect(toolchainReadPaths(tc.node)).toEqual([join(root, "nvm", "versions", "node", "v24.21.0")]);
+  });
+
+  it("never widens the agent sandbox to $HOME, an ancestor of it, or a shared prefix like ~/.local", () => {
+    const home = "/Users/me";
+    const install = join(scratch, "ro-install");
+    mkdirSync(join(install, "include", "node"), { recursive: true });
+    writeFileSync(join(install, "include", "node", "node.h"), "");
+    const node = (h: string | null, bin: string | null) => ({ requested: "24", binDir: bin, home: h, version: "v24.21.0", source: "path" as const });
+    // A real install outside $HOME (Homebrew Cellar, /usr/local) is not hidden by the sandbox anyway.
+    expect(toolchainReadPaths(node(install, join(install, "bin")), home)).toEqual([install]);
+    // ~/bin/node: its "home" would be $HOME itself, and its bin dir is only one level deep.
+    expect(toolchainReadPaths(node(home, `${home}/bin`), home)).toEqual([]);
+    // ~/.local/bin/node: ~/.local is shared with other tools; only the bin dir becomes readable.
+    expect(toolchainReadPaths(node(`${home}/.local`, `${home}/.local/bin`), home)).toEqual([`${home}/.local/bin`]);
+    // A filesystem root or an ancestor of $HOME is never allowed.
+    expect(toolchainReadPaths(node("/", "/bin"), home)).toEqual(["/bin"]);
+    expect(toolchainReadPaths(node("/Users", "/Users/me"), "/Users/me")).toEqual([]);
   });
 
   it("keeps the shim's PATH when the real binary it names reports another version", async () => {

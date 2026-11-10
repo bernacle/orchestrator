@@ -67,6 +67,7 @@ export function loadRepoConfigFile(file: string): LoadedRepoConfig {
   }
   const config = parsed.data;
   if (config.local_path) config.local_path = expandHome(expandEnv(config.local_path));
+  config.isolation.read_paths = config.isolation.read_paths.map((p) => expandHome(expandEnv(p)));
   for (const [k, v] of Object.entries(config.toolchain.env)) config.toolchain.env[k] = expandEnv(expandHome(v));
   return { config, source: file };
 }

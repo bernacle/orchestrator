@@ -107,10 +107,10 @@ screenshots:
   when_changed: ["apps/**", "packages/react/**"]   # required only for changes touching these (empty: always)
 ```
 
-- **When it runs:** after the checks pass, in the check sandbox (scrubbed env, credentials unreadable, no network except localhost).
-- **What is kept:** only regular PNG/JPEG/WebP files the command wrote that match `outputs`, within `max_files` and `max_file_mb`. They're committed to the branch in a commit of their own.
+- **When it runs:** after the checks pass, in the check sandbox (scrubbed env, credentials unreadable, no network except localhost). Like every repository command, it can't read your home directory beyond the worktree, the pinned Node and specific caches.
+- **What is kept:** only plain PNG files this run of the command wrote (new or rewritten, by inode/mtime/size) that match `outputs`, within `max_files` and `max_file_mb`. "Plain" means image chunks only, valid checksums, nothing after the end, and safe file names. Their bytes are scanned for secrets, because the pre-push diff scan can't see inside binaries. They're committed to the branch in a commit of their own.
 - **Who sees them:** they're attached to the reviewer's prompt (`codex exec --image`) and embedded in the PR body, pinned to the reviewed commit.
-- **When it fails:** a failing command, no images, or an unusable file goes back to the implementer like a failing check. The implementer can't run the command and must never make images by hand.
+- **When it fails:** a failing command, no images, an unusable file, stray writes, or an image under `outputs` the command didn't produce (hand-made or stale) goes back to the implementer like a failing check, and the step's leftovers are discarded. The implementer can't run the command and must never make images by hand.
 - **Environment check:** the baseline and `orchestrator preflight` also run the command on the untouched base. A machine that can't take screenshots (no browser, server won't start) blocks before any agent works.
 
 ### Operator briefs

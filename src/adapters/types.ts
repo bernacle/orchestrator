@@ -145,8 +145,11 @@ export interface Workspace {
   uncommittedPaths(worktreePath: string): Promise<string[]>;
   /** Undo uncommitted changes to `paths`: tracked files go back to HEAD, untracked files are deleted. */
   discardPaths(worktreePath: string, paths: string[]): Promise<void>;
-  /** Stage only `paths` (worktree-relative; never ignored files) and commit. Null when they are unchanged. */
-  commitPaths(worktreePath: string, paths: string[], message: string): Promise<string | null>;
+  /**
+   * Commit exactly these bytes at these worktree-relative paths, whatever is on disk now: files that
+   * were validated in memory cannot be swapped before they are committed. Null when HEAD already has them.
+   */
+  commitBlobs(worktreePath: string, files: Array<{ path: string; data: Buffer }>, message: string): Promise<string | null>;
   push(worktreePath: string, branch: string): Promise<void>;
   /** Which of `paths` exist at `ref` (read-only, from git objects). */
   filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>>;

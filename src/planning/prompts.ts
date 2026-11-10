@@ -169,7 +169,7 @@ export function reviewerPrompt(input: {
       ? [
           "",
           "## Orchestrator-generated screenshots",
-          `The orchestrator ran \`${shots.command}\` against this implementation${shots.commitSha ? ` and committed the result as ${shots.commitSha.slice(0, 12)}` : ""}. These files were produced by that command, not by the implementer, and are attached to this prompt as images:`,
+          `The orchestrator ran \`${shots.command}\` against this implementation${shots.commitSha ? ` and committed the result as ${shots.commitSha.slice(0, 12)}` : ""}. These files were written by that run, and only by it. The command is repository code that the implementer may have changed, so judge the tests that take the screenshots as part of the change. The images are attached to this prompt:`,
           ...shots.files.map((f) => `- ${f}`),
           "Inspect them. Judge whether they show what the acceptance criteria ask for (states, themes, viewports) and whether the UI in them looks correct; report problems you can see as findings against the code that renders them.",
         ].join("\n")

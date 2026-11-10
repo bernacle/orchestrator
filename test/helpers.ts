@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { crc32, deflateSync } from "node:zlib";
 import { stringify } from "yaml";
 import { ShellCheckRunner } from "../src/adapters/checks.js";
 import { GitWorkspace } from "../src/adapters/git.js";
@@ -13,6 +14,27 @@ import type { ApprovalRequest, Approver } from "../src/core/approval.js";
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
+
+/** A valid 1×1 PNG laid out like Chromium's (IHDR, IDAT, IEND), with optional extra chunks before IEND. */
+export function makePng(opts: { extra?: Array<{ type: string; data: Buffer }>; idat?: Buffer; trailing?: Buffer; badCrc?: boolean } = {}): Buffer {
+  const chunk = (type: string, data: Buffer, bad = false) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE((crc32(body) + (bad ? 1 : 0)) >>> 0);
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.from([0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]); // 1×1, 8-bit RGB
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", opts.idat ?? deflateSync(Buffer.from([0, 255, 0, 0])), opts.badCrc),
+    ...(opts.extra ?? []).map((c) => chunk(c.type, c.data)),
+    chunk("IEND", Buffer.alloc(0)),
+    opts.trailing ?? Buffer.alloc(0),
+  ]);
+}
 
 export const approve = { verdict: "approve", summary: "Looks good.", findings: [] };
 export const requestChanges = (title = "Missing greeting") => ({
