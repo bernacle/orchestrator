@@ -11,7 +11,7 @@ import { resolveLinearKey, type ResolvedLinearKey } from "./credentials/linear.j
 import { inspectRequest, type Problem } from "./intake/context.js";
 import { defaultDiscoveryDeps, type DiscoveryDeps } from "./intake/repo-discovery.js";
 import { Engine, type ApprovedResume, type EngineOptions } from "./core/engine.js";
-import { ALWAYS_DENIED_ENV, credentialPaths, toolchainCaches } from "./core/isolation.js";
+import { ALWAYS_DENIED_ENV, credentialPaths, isolationDirs, isolationReadPaths, toolchainCaches } from "./core/isolation.js";
 import { Redactor } from "./core/redact.js";
 import { TERMINAL_STATES } from "./core/states.js";
 import { Store, type RunRecord } from "./core/store.js";
@@ -73,7 +73,7 @@ export function openApp(
         // pre-push secret scan recognise it.
         redactor.add(ghTokenFromKeyring(env));
         const credential = linearKey(hints?.linearWorkspace ?? loaded.config.linear.workspace);
-        return createRealAdapters(redactor, env, { denyRead: credentialPaths(env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(env) }, credential);
+        return createRealAdapters(redactor, env, { denyRead: credentialPaths(env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(env), allowRead: isolationReadPaths(isolationDirs(paths.home)) }, credential);
       }),
     trackerFor: (workspace) => {
       if (opts.tracker) return { tracker: opts.tracker(workspace), credential: { key: undefined, source: "test tracker", workspace, problem: null } };

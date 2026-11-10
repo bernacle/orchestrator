@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -11,7 +11,10 @@ import {
   compareVersions,
   credentialPaths,
   defaultWritable,
+  describeTripwireChanges,
   isolationDirs,
+  isolationReadPaths,
+  repositoryReadPaths,
   sandboxSupport,
   seatbeltProfile,
   takeTripwire,
@@ -102,6 +105,54 @@ describe("Claude Code isolation settings", () => {
   });
 });
 
+describe("global git config", () => {
+  it("is unreadable to sandboxed children, who get an empty one instead (it can hold tokens)", () => {
+    const paths = credentialPaths({ HOME: "/Users/me" }, "/Users/me/.orchestrator");
+    expect(paths).toEqual(expect.arrayContaining(["/Users/me/.gitconfig", "/Users/me/.config/git/config"]));
+    expect(childEnv({ HOME: "/Users/me" }, { dirs }).GIT_CONFIG_GLOBAL).toBe(dirs.emptyGitConfig);
+    // The agent shell must still be able to read the empty stand-in, or every git command fails.
+    expect(isolationReadPaths(dirs)).toEqual([dirs.emptyGitConfig, dirs.emptyGhConfig]);
+  });
+});
+
+describe("what repository code may read under $HOME", () => {
+  it("is the worktree, the clone's git dir, the toolchain, specific caches and operator extras only", () => {
+    const env = { HOME: "/Users/me" };
+    const paths = repositoryReadPaths({ worktree: "/Users/me/.orchestrator/worktrees/a/b/r1", gitDir: "/Users/me/.orchestrator/clones/a/b/.git", toolchain: ["/Users/me/.nvm/versions/node/v24.21.0"], extra: ["/Users/me/opt/tool"], env });
+    expect(paths).toEqual(
+      expect.arrayContaining(["/Users/me/.orchestrator/worktrees/a/b/r1", "/Users/me/.orchestrator/clones/a/b/.git", "/Users/me/.nvm/versions/node/v24.21.0", "/Users/me/.cache/node/corepack", "/Users/me/Library/Caches/ms-playwright", "/Users/me/opt/tool"]),
+    );
+    // Never the home directory or a whole cache root: those hold other tools' tokens and browser data.
+    for (const broad of ["/Users/me", "/Users/me/Library", "/Users/me/Library/Caches", "/Users/me/.cache", "/Users/me/.config"]) expect(paths).not.toContain(broad);
+  });
+});
+
+describe("Claude Code auto memory", () => {
+  it("is off in the isolation settings", () => {
+    expect(claudeIsolationSettings({ denyRead: [], deniedEnv: [], allow: [], deny: [] })).toMatchObject({ autoMemoryEnabled: false });
+  });
+});
+
+describe("tripwire evidence", () => {
+  it("records hashes and metadata, never contents, and shows a file replaced by rename (how git config writes)", () => {
+    const dir = join(scratch, "trip-evidence");
+    mkdirSync(dir, { recursive: true });
+    const f = join(dir, ".gitconfig");
+    writeFileSync(f, "[user]\n\tname = me\n");
+    const before = takeTripwire([f]);
+    const inode = statSync(f).ino;
+    writeFileSync(`${f}.lock`, "[url \"https://x-access-token:SECRET@github.com/\"]\n");
+    renameSync(`${f}.lock`, f);
+    const details = describeTripwireChanges(before, takeTripwire([f]));
+    expect(details).toHaveLength(1);
+    expect(details[0]!.path).toBe(f);
+    expect(details[0]!.before).not.toBe(details[0]!.after);
+    expect(details[0]!.now).toMatchObject({ exists: true, kind: "file" });
+    expect(details[0]!.now.inode).not.toBe(inode);
+    expect(JSON.stringify(details)).not.toContain("SECRET");
+  });
+});
+
 describe("tripwires", () => {
   it("detect created, modified and deleted files and changed directories", () => {
     const dir = join(scratch, "tw");
@@ -161,5 +212,55 @@ describe.runIf(sandboxSupport().available)("Seatbelt sandbox, for real (macOS)",
   it("hides tokens and blocks network", async () => {
     expect((await run('test -z "$GH_TOKEN"')).ok).toBe(true);
     expect((await run("node -e \"require('https').get('https://example.com',()=>process.exit(0)).on('error',()=>process.exit(1))\"")).ok).toBe(false);
+  });
+
+  // A private "home" inside the scratch dir: readable/unreadable rules are the same as for $HOME.
+  const home = join(scratch, "private-home");
+  const wt2 = join(home, "wt");
+  const cache = join(home, "cache");
+  const creds = join(cache, "creds");
+  for (const d of [wt2, creds]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(wt2, ".git"), "gitdir: /somewhere\n");
+  writeFileSync(join(home, "notes.txt"), "personal");
+  writeFileSync(join(cache, "tool.txt"), "cache");
+  writeFileSync(join(creds, "key"), "secret");
+  const strict = (command: string) =>
+    runner.run({
+      name: "probe",
+      command,
+      cwd: wt2,
+      env,
+      timeoutMs: 20_000,
+      optional: false,
+      logPath: join(scratch, "logs", `${Math.random()}.log`),
+      signal: new AbortController().signal,
+      sandbox: { writable: [wt2], readOnly: [join(wt2, ".git")], denyRead: [creds], privateHome: { home, readable: [wt2, cache] }, network: "none" },
+    });
+
+  it("never lets repository code rewrite, replace or delete the worktree's gitfile", async () => {
+    expect((await strict("echo 'gitdir: /attacker' > .git")).ok).toBe(false);
+    expect((await strict("echo x > g && mv g .git")).ok).toBe(false);
+    expect((await strict("rm .git")).ok).toBe(false);
+    expect(readFileSync(join(wt2, ".git"), "utf8")).toBe("gitdir: /somewhere\n");
+    expect((await strict("echo ok > other.txt")).ok).toBe(true);
+  });
+
+  it("private home: only the worktree and allowed paths are readable, and credentials stay denied inside an allowed path", async () => {
+    expect((await strict(`cat "${join(home, "notes.txt")}"`)).ok).toBe(false);
+    expect((await strict(`ls "${home}"`)).ok).toBe(false);
+    expect((await strict(`cat "${join(cache, "tool.txt")}"`)).ok).toBe(true);
+    expect((await strict("cat other.txt || true; ls .")).ok).toBe(true);
+    // Regression: a file-read-data allow outranked the file-read* credential deny until both were denied.
+    expect((await strict(`cat "${join(creds, "key")}"`)).ok).toBe(false);
+  });
+
+  it("kills what a check leaves running in the background once it exits", async () => {
+    const marker = join(wt, `late-${process.pid}.txt`);
+    // Both kinds: one that keeps the output pipe open, one that detaches from it.
+    expect((await run(`(sleep 1; touch "${marker}") & exit 0`)).ok).toBe(true);
+    expect((await run(`(sleep 1; touch "${marker}.2") >/dev/null 2>&1 </dev/null & exit 0`)).ok).toBe(true);
+    await new Promise((r) => setTimeout(r, 2_000));
+    expect(existsSync(marker)).toBe(false);
+    expect(existsSync(`${marker}.2`)).toBe(false);
   });
 });

@@ -4,13 +4,20 @@ export interface ExecOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   /** Written to stdin, then stdin is closed. */
-  input?: string;
+  input?: string | Buffer;
   timeoutMs?: number;
   signal?: AbortSignal;
   /** Called with each stdout chunk (e.g. to stream JSONL events). */
   onStdout?: (chunk: string) => void;
   /** Cap on retained output per stream; older output is dropped. */
   maxBufferBytes?: number;
+  /**
+   * When the command exits, SIGKILL whatever is left of its process group. Repository code (checks,
+   * screenshots) must not leave a background process writing to the worktree after the orchestrator
+   * has validated it. A process that starts its own session escapes this, but the tripwire and the
+   * commit-from-validated-bytes logic do not rely on it.
+   */
+  killGroupOnExit?: boolean;
 }
 
 export interface ExecResult {
@@ -114,9 +121,21 @@ export function runProcess(command: string, args: string[], opts: ExecOptions = 
       reject(err);
     });
 
+    // On "exit", not "close": a background process that inherited stdout would hold "close" back
+    // until it finished on its own.
+    child.on("exit", () => {
+      if (!opts.killGroupOnExit || !child.pid || process.platform === "win32") return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        /* no process left in the group */
+      }
+    });
+
     child.on("close", (exitCode, signal) => {
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+
       opts.signal?.removeEventListener("abort", onAbort);
       resolve({ command, args, exitCode, signal, stdout, stderr, durationMs: Date.now() - started, timedOut, aborted });
     });

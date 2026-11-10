@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { makeIssue } from "../../src/adapters/mock/index.js";
@@ -187,6 +187,36 @@ describe("supervised run", () => {
     const run = await start();
     expect(run.state).toBe("FAILED");
     expect(run.reason).toMatch(/unexpected change outside the worktree during implementer round 0: .*\.git\/hooks/);
+    expect(h.reviewer.calls).toHaveLength(0);
+    expect(h.host.prs).toHaveLength(0);
+    // Evidence for the operator: the window and fingerprints, no file contents.
+    const file = run.reason!.match(/see (tripwire-\d+\.json)/)![1]!;
+    const evidence = JSON.parse(readFileSync(join(h.home, "runs", run.id, file), "utf8")) as { window: { from: string; to: string }; details: Array<{ path: string; before: string; after: string }> };
+    expect(evidence.window.from <= evidence.window.to).toBe(true);
+    expect(evidence.details[0]!.path).toMatch(/\.git\/hooks$/);
+    expect(evidence.details[0]!.before).not.toBe(evidence.details[0]!.after);
+    expect(JSON.stringify(evidence)).not.toContain("pwned");
+  });
+
+  it("fails the run when the worktree's gitfile is repointed (it steers the orchestrator's own git)", async () => {
+    h = createHarness({
+      implement: (task) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        writeFileSync(join(task.cwd, ".git"), "gitdir: /tmp/attacker-git-dir\n");
+        return {};
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/unexpected change outside the worktree during implementer round 0: .*\/\.git\b/);
+    expect(h.host.prs).toHaveLength(0);
+  });
+
+  it("never reviews a worktree that differs from the commit (a check left a file behind)", async () => {
+    h = createHarness({ config: { checks: [{ name: "feature-exists", run: "test -f feature.txt && echo junk > stray.txt" }] } });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/uncommitted changes before review \(stray\.txt\)/);
     expect(h.reviewer.calls).toHaveLength(0);
     expect(h.host.prs).toHaveLength(0);
   });

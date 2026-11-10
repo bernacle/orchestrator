@@ -1,20 +1,22 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { describeNode, nodeMatches, nodeRequirement, parseNodePin, resolveRunToolchain, resolveToolchain } from "../../src/adapters/checks.js";
+import { describeNode, nodeMatches, nodeRequirement, parseNodePin, resolveRunToolchain, resolveToolchain, toolchainReadPaths } from "../../src/adapters/checks.js";
 import { RepoConfigSchema } from "../../src/config/schema.js";
 import { isolationDirs } from "../../src/core/isolation.js";
 import { baselineAccepted } from "../../src/core/workflow.js";
 
-const scratch = mkdtempSync(join(tmpdir(), "orch-toolchain-"));
+const scratch = realpathSync(mkdtempSync(join(tmpdir(), "orch-toolchain-")));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 /** A fake `node` that prints a version (or, with `byDir`, one chosen by the directory it runs in, like asdf). */
-function fakeNode(dir: string, version: string, byDir?: { marker: string; version: string }): string {
+function fakeNode(dir: string, version: string, byDir?: { marker: string; version: string }, execPath?: string): string {
   mkdirSync(dir, { recursive: true });
   const body = byDir ? `if [ -f "$PWD/${byDir.marker}" ]; then echo ${byDir.version}; else echo ${version}; fi` : `echo ${version}`;
-  writeFileSync(join(dir, "node"), `#!/bin/sh\n${body}\n`);
+  // `node -p process.execPath` names the real binary (a shim answers with the one it execs).
+  const exec = execPath ? `if [ "$1" = "-p" ]; then echo ${execPath}; exit 0; fi\n` : "";
+  writeFileSync(join(dir, "node"), `#!/bin/sh\n${exec}${body}\n`);
   chmodSync(join(dir, "node"), 0o755);
   return dir;
 }
@@ -131,6 +133,50 @@ describe("toolchain resolution", () => {
     expect(tc.env.GITHUB_TOKEN).toBeUndefined();
     expect(tc.env.LINEAR_API_KEY).toBeUndefined();
     expect(tc.env.GIT_CONFIG_GLOBAL).toBe(m.dirs.emptyGitConfig);
+  });
+
+  it("pins the real Node behind a version-manager shim, so sandboxed agents never execute the shim (BRU-485)", async () => {
+    // Like asdf with `nodejs path:~/.nvm/versions/node/v24.21.0`: the shim on PATH reports the right
+    // version, but the agent's sandbox cannot read ~/.asdf, so `node` must not resolve to it there.
+    const root = join(scratch, `m${n++}`);
+    const real = join(root, "nvm", "versions", "node", "v24.21.0", "bin");
+    fakeNode(real, "v24.21.0", undefined, join(real, "node"));
+    mkdirSync(join(real, "..", "include", "node"), { recursive: true });
+    writeFileSync(join(real, "..", "include", "node", "node.h"), "");
+    const shims = fakeNode(join(root, "asdf", "shims"), "v24.21.0", undefined, join(real, "node"));
+    const env = { PATH: `${shims}:/usr/bin:/bin`, HOME: root };
+    const tc = await resolveRunToolchain({ toolchain: { node: "24.21.0", env: {} }, versionFile: null, cwd: root, dirs: isolationDirs(join(root, "orch-home")), baseEnv: env });
+    expect(tc.node).toMatchObject({ source: "path", version: "v24.21.0", binDir: real, home: join(root, "nvm", "versions", "node", "v24.21.0") });
+    expect(tc.env.PATH!.split(":")[0]).toBe(real);
+    expect(tc.env.PATH!.split(":")).toContain(shims); // other tools on PATH stay reachable
+    expect(toolchainReadPaths(tc.node)).toEqual([join(root, "nvm", "versions", "node", "v24.21.0")]);
+  });
+
+  it("never widens the agent sandbox to $HOME, an ancestor of it, or a shared prefix like ~/.local", () => {
+    const home = "/Users/me";
+    const install = join(scratch, "ro-install");
+    mkdirSync(join(install, "include", "node"), { recursive: true });
+    writeFileSync(join(install, "include", "node", "node.h"), "");
+    const node = (h: string | null, bin: string | null) => ({ requested: "24", binDir: bin, home: h, version: "v24.21.0", source: "path" as const });
+    // A real install outside $HOME (Homebrew Cellar, /usr/local) is not hidden by the sandbox anyway.
+    expect(toolchainReadPaths(node(install, join(install, "bin")), home)).toEqual([install]);
+    // ~/bin/node: its "home" would be $HOME itself, and its bin dir is only one level deep.
+    expect(toolchainReadPaths(node(home, `${home}/bin`), home)).toEqual([]);
+    // ~/.local/bin/node: ~/.local is shared with other tools; only the bin dir becomes readable.
+    expect(toolchainReadPaths(node(`${home}/.local`, `${home}/.local/bin`), home)).toEqual([`${home}/.local/bin`]);
+    // A filesystem root or an ancestor of $HOME is never allowed.
+    expect(toolchainReadPaths(node("/", "/bin"), home)).toEqual(["/bin"]);
+    expect(toolchainReadPaths(node("/Users", "/Users/me"), "/Users/me")).toEqual([]);
+  });
+
+  it("keeps the shim's PATH when the real binary it names reports another version", async () => {
+    const root = join(scratch, `m${n++}`);
+    const wrong = fakeNode(join(root, "other", "bin"), "v22.0.0", undefined, join(root, "other", "bin", "node"));
+    const shims = fakeNode(join(root, "shims"), "v24.21.0", undefined, join(wrong, "node"));
+    const tc = await resolveToolchain("24.21.0", {}, { PATH: `${shims}:/usr/bin:/bin`, HOME: root });
+    expect(tc.node).toMatchObject({ source: "path", version: "v24.21.0", binDir: null });
+    expect(tc.env.PATH!.split(":")[0]).toBe(shims);
+    expect(toolchainReadPaths(tc.node)).toEqual([]);
   });
 
   it("a conflict between config and version file is unresolved", async () => {

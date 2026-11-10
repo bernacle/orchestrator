@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { runChecked, runProcess } from "../core/exec.js";
 import { NODE_VERSION_FILES, parseNodePin } from "./checks.js";
@@ -145,6 +145,63 @@ export class GitWorkspace implements Workspace {
     return this.headSha(worktreePath);
   }
 
+  async uncommittedPaths(worktreePath: string): Promise<string[]> {
+    const r = await runProcess("git", [...SAFE_GIT, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], { cwd: worktreePath, env: { ...this.env, GIT_TERMINAL_PROMPT: "0" } });
+    if (r.exitCode !== 0) throw new Error(`git status failed: ${r.stderr.trim()}`);
+    return r.stdout
+      .split("\0")
+      .filter((e) => e.length > 3)
+      .map((e) => e.slice(3));
+  }
+
+  async discardPaths(worktreePath: string, paths: string[]): Promise<void> {
+    const root = resolve(worktreePath);
+    const realRoot = realpathSync(root);
+    for (const path of paths) {
+      const abs = resolve(root, path.replace(/\/$/, ""));
+      if (!abs.startsWith(root + sep)) continue; // never outside the worktree
+      // A parent directory swapped for a symlink would make the path resolve elsewhere.
+      let parent: string;
+      try {
+        parent = realpathSync(dirname(abs));
+      } catch {
+        continue;
+      }
+      if (parent !== realRoot && !parent.startsWith(realRoot + sep)) continue;
+      const tracked = (await runProcess("git", [...SAFE_GIT, "cat-file", "-e", `HEAD:${path}`], { cwd: worktreePath })).exitCode === 0;
+      // Literal pathspecs: a file name is never read as pathspec magic (":(glob)…", ":!…").
+      if (tracked) await this.git(worktreePath, ["--literal-pathspecs", "checkout", "HEAD", "--", path]);
+      // Untracked output, including a nested repository (which `add --all` would commit as a gitlink).
+      // rmSync never follows symlinks, so a link is removed, not its target.
+      else if (isLink(abs) || existsSync(abs)) rmSync(abs, { force: true, recursive: true });
+    }
+  }
+
+  async commitBlobs(worktreePath: string, files: Array<{ path: string; data: Buffer }>, message: string): Promise<string | null> {
+    if (files.length === 0) return null;
+    // The index must match HEAD (nothing else staged), so the commit holds only these files.
+    const staged = await runProcess("git", [...SAFE_GIT, "diff", "--cached", "--quiet"], { cwd: worktreePath });
+    if (staged.exitCode !== 0) throw new Error("the index has staged changes; refusing to commit screenshots on top of them");
+    // Raw bytes bypass clean filters: a path the repository routes through one (e.g. Git LFS) would
+    // be committed in the wrong form. Refuse it instead.
+    const attrs = await runProcess("git", [...SAFE_GIT, "--literal-pathspecs", "check-attr", "filter", "--", ...files.map((f) => f.path)], { cwd: worktreePath });
+    const filtered = attrs.stdout
+      .split("\n")
+      .filter((l) => l && !/: filter: (unspecified|unset)$/.test(l))
+      .map((l) => l.split(": filter: ")[0]);
+    if (attrs.exitCode !== 0 || filtered.length) throw new Error(`these outputs use a git filter (e.g. Git LFS), which screenshots do not support: ${filtered.join(", ") || attrs.stderr.trim()}`);
+    for (const f of files) {
+      const blob = await runProcess("git", [...SAFE_GIT, "hash-object", "-w", "--stdin"], { cwd: worktreePath, input: f.data });
+      const sha = blob.stdout.trim();
+      if (blob.exitCode !== 0 || !/^[0-9a-f]{40,64}$/.test(sha)) throw new Error(`git hash-object failed for ${f.path}: ${blob.stderr.trim()}`);
+      await this.git(worktreePath, ["--literal-pathspecs", "update-index", "--add", "--cacheinfo", `100644,${sha},${f.path}`]);
+    }
+    const changed = await runProcess("git", [...SAFE_GIT, "diff", "--cached", "--quiet"], { cwd: worktreePath });
+    if (changed.exitCode === 0) return null;
+    await this.git(worktreePath, ["commit", "--quiet", "-m", message]);
+    return this.headSha(worktreePath);
+  }
+
   async filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>> {
     const out: Array<{ path: string; exists: boolean }> = [];
     for (const path of paths) {
@@ -167,6 +224,14 @@ export class GitWorkspace implements Workspace {
   async push(worktreePath: string, branch: string): Promise<void> {
     // Plain push: never --force. A rejected push surfaces as an error for a human.
     await this.git(worktreePath, ["push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000);
+  }
+}
+
+function isLink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 

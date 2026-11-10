@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { describeNode, resolveRunToolchain } from "../adapters/checks.js";
+import { describeNode, resolveRunToolchain, toolchainReadPaths, type ResolvedToolchain } from "../adapters/checks.js";
 import { ClaudeCodeAgent } from "../adapters/claude.js";
 import type { Adapters, CheckResult } from "../adapters/types.js";
 import type { LoadedRepoConfig, Paths } from "../config/load.js";
@@ -13,12 +13,15 @@ import {
   credentialPaths,
   defaultWritable,
   isolationDirs,
+  isolationReadPaths,
+  repositoryReadPaths,
   sandboxSupport,
   takeTripwire,
   toolchainCaches,
   tripwirePaths,
   type NetworkPolicy,
 } from "../core/isolation.js";
+import { matchesOutputs, screenshotCheck } from "../core/screenshots.js";
 
 /**
  * Preflight: prove that the live-run environment works before any agent touches code.
@@ -95,7 +98,8 @@ export async function runPreflight(input: {
     if (!input.keep && existsSync(worktree)) await workspace.removeWorktree(clone, worktree).catch(() => undefined);
     return finish(false);
   }
-  const tripPaths = [...tripwirePaths(process.env, [join(clone, ".git")]), join(clone, ".git", "HEAD"), join(clone, ".git", "refs")];
+  const tripPaths = [...tripwirePaths(process.env, [join(clone, ".git")]), join(clone, ".git", "HEAD"), join(clone, ".git", "refs"), join(worktree, ".git")];
+  const toolchainReadable = toolchainReadPaths(tc.node);
   let allOk = true;
 
   try {
@@ -110,7 +114,19 @@ export async function runPreflight(input: {
         optional: c.optional,
         logPath: join(logs, `${kind}-${c.name}.log`),
         signal: new AbortController().signal,
-        sandbox: support.available ? { writable: defaultWritable(worktree, process.env), denyRead: credentialPaths(process.env, input.paths.home), network } : null,
+        sandbox: support.available
+          ? {
+              writable: defaultWritable(worktree, process.env),
+              readOnly: [join(worktree, ".git")],
+              denyRead: credentialPaths(process.env, input.paths.home),
+              // Same as a live run: repository code cannot read your home directory beyond these.
+              privateHome: {
+                home: process.env.HOME ?? homedir(),
+                readable: repositoryReadPaths({ worktree, gitDir: join(clone, ".git"), toolchain: toolchainReadable, extra: [...isolationReadPaths(isolationDirs(input.paths.home)), ...config.isolation.read_paths], env: process.env }),
+              },
+              network,
+            }
+          : null,
       });
       const changed = compareTripwire(before, takeTripwire(tripPaths));
       if (changed.length) {
@@ -128,11 +144,16 @@ export async function runPreflight(input: {
       if (!res.ok && !s.optional) return finish(false);
     }
     for (const c of config.checks) await run("check", c, c.network ?? config.isolation.checks_network);
+    // The screenshot command, as the baseline runs it: proves a browser and local server work in the sandbox.
+    if (config.screenshots) await run("check", screenshotCheck(config.screenshots), "none");
 
     if (input.agentProbe && config.agents.implementer.adapter === "claude-code") {
-      record(await probeImplementerSandbox(config.agents.implementer, worktree, input.paths, tc.toolchainEnv, logs));
+      record(await probeImplementerSandbox(config.agents.implementer, worktree, input.paths, tc.toolchainEnv, tc.node, logs));
       if (!steps.at(-1)!.ok) allOk = false;
     }
+    // As in the baseline: screenshots the base renders are expected output, not a dirty worktree.
+    const shotsCfg = config.screenshots;
+    if (shotsCfg) await workspace.discardPaths(worktree, (await workspace.uncommittedPaths(worktree)).filter((p) => matchesOutputs(p, shotsCfg)));
     if (await workspace.hasUncommittedChanges(worktree)) {
       record({ kind: "check", name: "worktree clean after checks", ok: false, detail: "setup/checks modified tracked files; a live run would block" });
       allOk = false;
@@ -165,7 +186,14 @@ export async function runPreflight(input: {
  * which attempts escapes from inside the sandbox. Ground truth comes from the script's own output
  * file and from the disk, never from the model's report.
  */
-async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js").AgentConfig, { adapter: "claude-code" }>, worktree: string, paths: Paths, baseEnv: NodeJS.ProcessEnv, logs: string): Promise<PreflightStep> {
+async function probeImplementerSandbox(
+  cfg: Extract<import("../config/schema.js").AgentConfig, { adapter: "claude-code" }>,
+  worktree: string,
+  paths: Paths,
+  baseEnv: NodeJS.ProcessEnv,
+  node: ResolvedToolchain["node"],
+  logs: string,
+): Promise<PreflightStep> {
   const marker = join(homedir(), `.orchestrator-preflight-escape-${process.pid}`);
   const allowedCheck = cfg.allowed_tools.some((t) => /^Bash\(pnpm lint/.test(t)) ? "pnpm lint" : "ls";
   const script = join(worktree, ".orchestrator-probe.sh");
@@ -176,9 +204,16 @@ async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js"
       "#!/bin/sh",
       `exec > "${out}" 2>&1`,
       "echo probe-ran",
+      // The Node the agent's shell actually runs (a version-manager shim it cannot read fails here).
+      'echo "node-version=$(node --version 2>&1 | head -n 1)"',
       `${allowedCheck} >/dev/null 2>&1; echo "check-exit=$?"`,
+      // git in the agent shell (status/diff/log are allow-listed): needs the empty gitconfig stub to be readable.
+      'git status --porcelain >/dev/null 2>"$0.git-err"; echo "git-exit=$?"; head -n 1 "$0.git-err" | sed "s/^/git-error=/"; rm -f "$0.git-err"',
+
       `touch "${marker}" 2>/dev/null && echo "ESCAPE write-outside" || echo "blocked write-outside"`,
       'ls "$HOME/.ssh" >/dev/null 2>&1 && echo "ESCAPE read-ssh" || echo "blocked read-ssh"',
+      // Opening the worktree's gitfile for append writes nothing, so even an escape changes no bytes.
+      '( : >> .git ) 2>/dev/null && echo "ESCAPE write-gitfile" || echo "blocked write-gitfile"',
       `node -e "require('https').get('https://example.com',()=>{console.log('ESCAPE network');process.exit(0)}).on('error',()=>console.log('blocked network'))"`,
       '[ -n "$GH_TOKEN$GITHUB_TOKEN$LINEAR_API_KEY$SSH_AUTH_SOCK" ] && echo "ESCAPE env-credentials" || echo "blocked env-credentials"',
       "",
@@ -186,7 +221,7 @@ async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js"
   );
   const agent = new ClaudeCodeAgent(
     { ...cfg, model: "claude-haiku-5-5", max_budget_usd: 0.25, allowed_tools: [...cfg.allowed_tools, "Bash(sh .orchestrator-probe.sh)"] },
-    { denyRead: credentialPaths(process.env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(process.env) },
+    { denyRead: credentialPaths(process.env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(process.env), allowRead: isolationReadPaths(isolationDirs(paths.home)) },
   );
   const env = childEnv(baseEnv, { agent: "claude-code", dirs: isolationDirs(paths.home) });
   const prompt = [
@@ -194,20 +229,37 @@ async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js"
     "sh .orchestrator-probe.sh",
     `It is the orchestrator's own sandbox self-test script in this worktree: it runs \`${allowedCheck}\` and checks that the sandbox blocks escapes.`,
   ].join("\n");
-  const r = await agent.run({ role: "implementer", cwd: worktree, prompt, artifactDir: logs, artifactPrefix: "agent-probe", timeoutMs: 6 * 60_000, env, signal: new AbortController().signal, sessionId: crypto.randomUUID(), maxBudgetUsd: 0.25 });
+  const r = await agent.run({
+    role: "implementer",
+    cwd: worktree,
+    prompt,
+    artifactDir: logs,
+    artifactPrefix: "agent-probe",
+    timeoutMs: 6 * 60_000,
+    env,
+    readablePaths: toolchainReadPaths(node),
+    signal: new AbortController().signal,
+    sessionId: crypto.randomUUID(),
+    maxBudgetUsd: 0.25,
+  });
   const escapedOnDisk = existsSync(marker);
   const results = existsSync(out) ? readFileSync(out, "utf8") : "";
   for (const f of [script, out]) if (existsSync(f)) unlinkSync(f);
   const ran = results.includes("probe-ran");
   const escapes = results.split("\n").filter((l) => l.startsWith("ESCAPE"));
   const checkWorked = /check-exit=0\b/.test(results);
-  const ok = r.ok && ran && escapes.length === 0 && !escapedOnDisk && checkWorked;
+  const agentNode = results.match(/^node-version=(.*)$/m)?.[1]?.trim() ?? "";
+  const gitExit = results.match(/^git-exit=(\d+)$/m)?.[1];
+  const gitError = results.match(/^git-error=(.*)$/m)?.[1]?.trim();
+  const gitNote = gitExit === undefined ? "git: (not run)" : gitExit === "0" ? "git status works" : `git status fails (exit ${gitExit}${gitError ? `: ${gitError.slice(0, 160)}` : ""})`;
+  const nodeOk = node.source === "not-required" || (node.version !== null && agentNode === node.version);
+  const ok = r.ok && ran && escapes.length === 0 && !escapedOnDisk && checkWorked && nodeOk;
   const verdict = !ran ? "probe script did not run (inconclusive)" : escapes.length || escapedOnDisk ? `ESCAPES: ${[...escapes, ...(escapedOnDisk ? ["file outside worktree exists"] : [])].join(", ")}` : results.split("\n").filter((l) => l.startsWith("blocked")).join(", ");
   return {
     kind: "agent-probe",
     name: "implementer sandbox",
     ok,
-    detail: `${r.ok ? "" : `agent error: ${r.error}; `}\`${allowedCheck}\` ${checkWorked ? "ran inside the sandbox" : "did NOT work inside the sandbox"}; escape probe: ${verdict}; cost $${r.costUsd?.toFixed(3) ?? "?"}`,
+    detail: `${r.ok ? "" : `agent error: ${r.error}; `}node in the agent sandbox: ${agentNode || "(not run)"}${nodeOk ? "" : ` (expected ${node.version ?? node.requested})`}; \`${allowedCheck}\` ${checkWorked ? "ran inside the sandbox" : "did NOT work inside the sandbox"}; ${gitNote}; escape probe: ${verdict}; cost $${r.costUsd?.toFixed(3) ?? "?"}`,
     durationMs: r.durationMs,
     logPath: r.transcripts[0] ?? null,
   };
