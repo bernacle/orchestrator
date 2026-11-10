@@ -1,26 +1,25 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { cancelRun, findRunOrThrow, openApp, resumeRun, RunError, startRun, type App } from "../app.js";
-import { ConfigError, listRepoConfigs, PACKAGE_ROOT } from "../config/load.js";
+import { cancelRun, findRunOrThrow, IntakeError, openApp, resumeRun, RunError, startRun, type App } from "../app.js";
+import { ConfigError, listRepoConfigs, loadRepoConfig, PACKAGE_ROOT } from "../config/load.js";
+import { CredentialError } from "../credentials/linear.js";
 import { LeaseError, type RunRecord } from "../core/store.js";
 import { TERMINAL_STATES } from "../core/states.js";
 import type { RunContext } from "../core/workflow.js";
+import { IssueRefError } from "../intake/issue-ref.js";
+import { resumableRun, reviewedRun, runsForTarget } from "../intake/targets.js";
 import { c, nextStep, renderEvent, renderPlanMarkdown, renderRunDetail, renderStatusTable, stateColor } from "../report/render.js";
+import { reviewFindings, summarizeRun } from "../report/summary.js";
+import { output, printJson, withApp } from "./common.js";
+import { registerAuthCommands } from "./auth.js";
 import { renderCapabilities } from "./capabilities.js";
+import { registerContextCommands } from "./context.js";
 import { renderDoctor, runDoctor } from "./doctor.js";
 import { runPreflight } from "./preflight.js";
-import { loadRepoConfig } from "../config/load.js";
+import { registerSkillCommands } from "./skill.js";
 
 const pkg = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")) as { version: string };
-
-function withApp<T>(fn: (app: App) => Promise<T> | T): Promise<T> {
-  const app = openApp();
-  return Promise.resolve()
-    .then(() => fn(app))
-    .finally(() => app.close());
-}
 
 const positiveInt = (v: string) => {
   const n = Number(v);
@@ -57,6 +56,11 @@ function exitCodeFor(run: RunRecord): number {
 
 function summarize(app: App, run: RunRecord<RunContext>): string {
   const lines = ["", `${c.bold("Run")} ${run.id}: ${stateColor(run.state)(run.state)}${run.reason ? ` — ${run.reason}` : ""}`];
+  const intake = run.context.options.intake;
+  if (intake) {
+    lines.push(`Repository: ${run.repo} (${intake.reason})`);
+    if (intake.association) lines.push(`Issue ↔ repository: ${intake.association.evidence.map((e) => e.detail).join("; ")}`);
+  }
   const planMd = app.store.artifacts(run.id).find((a) => a.label === "execution plan");
   if (planMd) lines.push(`Plan: ${planMd.path}`);
   lines.push(nextStep(run));
@@ -85,20 +89,25 @@ program
     }
   });
 
+registerContextCommands(program);
+
 program
   .command("run")
-  .description("Start a run for a Linear issue (dry run unless --execute)")
-  .argument("<issue>", "Linear issue key, e.g. BRU-488")
-  .option("--repo <owner/name>", "target repository (default: inferred from the issue's team)")
+  .description("Start a run for a Linear issue (dry run unless --execute). The repository is identified from the working directory unless --repo is given.")
+  .argument("<issue>", "Linear issue key or URL, e.g. BRU-488 or https://linear.app/<workspace>/issue/BRU-488")
+  .option("--repo <owner/name>", "target repository (default: the GitHub repository of the working directory)")
   .option("--config <file>", "explicit repository config file")
+  .option("--cwd <dir>", "directory to identify the repository from (default: the current directory)")
+  .option("--linear-workspace <urlKey>", "Linear workspace whose stored key to use (default: from the URL or the repository config)")
   .option("--dry-run", "plan and simulate only; change nothing (default)")
-  .option("--execute", "start a supervised live run: agents edit code, branches are pushed, a draft PR is opened")
+  .option("--execute", "start a supervised live run (agents edit code, a branch is pushed, a draft PR is opened) after you confirm a system prompt: Touch ID / password on macOS")
   .option("--with-agent-plan", "in a dry run, also run the read-only planner agent (costs tokens, changes nothing)")
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; recorded in the audit trail)", (v: string, prev: string[]) => [...prev, v], [] as string[])
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt, 30)
   .option("--issue-snapshot <issue.json>", "dry run only: replay Linear data recorded by an earlier run (runs/<id>/issue.json)")
-  .option("--json", "print the final run record as JSON")
-  .action(async (issue: string, opts: { repo?: string; config?: string; dryRun?: boolean; execute?: boolean; withAgentPlan?: boolean; acceptDependency: string[]; ciWait: number; issueSnapshot?: string; json?: boolean }) => {
+  .option("--json", "print a versioned JSON summary (schemaVersion 1) instead of the plan")
+  .action(async (issue: string, opts: { repo?: string; config?: string; cwd?: string; linearWorkspace?: string; dryRun?: boolean; execute?: boolean; withAgentPlan?: boolean; acceptDependency: string[]; ciWait: number; issueSnapshot?: string; json?: boolean }) => {
+    output.json = Boolean(opts.json);
     if (opts.dryRun && opts.execute) throw new RunError("--dry-run and --execute are mutually exclusive");
     const dryRun = !opts.execute;
     if (!opts.dryRun && !opts.execute) console.error(c.dim("No --execute given: running as a dry run."));
@@ -108,6 +117,8 @@ program
         issueKey: issue,
         ...(opts.repo ? { repo: opts.repo } : {}),
         ...(opts.config ? { configFile: opts.config } : {}),
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts.linearWorkspace ? { linearWorkspace: opts.linearWorkspace } : {}),
         dryRun,
         withAgentPlan: Boolean(opts.withAgentPlan),
         acceptDependencies: opts.acceptDependency,
@@ -117,7 +128,7 @@ program
         interrupt: interruptSignal(),
       });
       if (opts.json) {
-        console.log(JSON.stringify(run, null, 2));
+        printJson("run", summarizeRun(app.store, run));
       } else {
         if (run.context.plan) console.log(`\n${renderPlanMarkdown(run.context.plan)}`);
         console.log(summarize(app, run));
@@ -128,20 +139,50 @@ program
 
 program
   .command("status")
-  .description("List recent runs, or show one run in detail")
-  .argument("[run-id]", "run id or unique prefix")
+  .description("List recent runs, or show a run (by id) or an issue's runs (by key or Linear URL)")
+  .argument("[target]", "run id or unique prefix, or an issue key / Linear URL")
+  .option("--repo <owner/name>", "with an issue: only runs on this repository (default: the working directory's repository)")
   .option("--limit <n>", "number of runs to list", positiveInt, 20)
-  .option("--json", "machine-readable output")
-  .action((id: string | undefined, opts: { limit: number; json?: boolean }) =>
-    withApp((app) => {
-      if (id) {
-        const run = findRunOrThrow(app, id);
-        if (opts.json) console.log(JSON.stringify({ run, artifacts: app.store.artifacts(run.id), effects: app.store.effects(run.id) }, null, 2));
-        else console.log(renderRunDetail(run, app.store.artifacts(run.id), app.store.effects(run.id), app.store.leaseHolder(run.id)));
+  .option("--json", "versioned JSON (schemaVersion 1)")
+  .action((target: string | undefined, opts: { repo?: string; limit: number; json?: boolean }) =>
+    withApp(async (app) => {
+      output.json = Boolean(opts.json);
+      if (target) {
+        const found = await runsForTarget(app, target, opts.repo ? { repo: opts.repo } : {});
+        if (found.byId) {
+          const run = found.byId;
+          if (opts.json) printJson("run_detail", { run: summarizeRun(app.store, run), artifacts: app.store.artifacts(run.id), effects: app.store.effects(run.id) });
+          else console.log(renderRunDetail(run, app.store.artifacts(run.id), app.store.effects(run.id), app.store.leaseHolder(run.id)));
+          return;
+        }
+        const runs = found.runs.slice(0, opts.limit);
+        if (opts.json) printJson("issue_runs", { issue: found.issueKey, repo: found.repo, runs: runs.map((r) => summarizeRun(app.store, r)) });
+        else console.log(runs.length ? renderStatusTable(runs, (rid) => app.store.leaseHolder(rid)) : `No runs for ${found.issueKey}${found.repo ? ` on ${found.repo}` : ""}.`);
         return;
       }
-      const runs = app.store.listRuns(opts.limit);
-      console.log(opts.json ? JSON.stringify(runs, null, 2) : renderStatusTable(runs, (rid) => app.store.leaseHolder(rid)));
+      const runs = app.store.listRuns(opts.limit) as Array<RunRecord<RunContext>>;
+      if (opts.json) printJson("runs", runs.map((r) => summarizeRun(app.store, r)));
+      else console.log(renderStatusTable(runs, (rid) => app.store.leaseHolder(rid)));
+    }),
+  );
+
+program
+  .command("review")
+  .description("Show the independent review findings the engine recorded for a run (by id, or the newest reviewed run for an issue)")
+  .argument("<target>", "run id or prefix, or an issue key / Linear URL")
+  .option("--repo <owner/name>", "with an issue: only runs on this repository")
+  .option("--json", "versioned JSON (schemaVersion 1)")
+  .action((target: string, opts: { repo?: string; json?: boolean }) =>
+    withApp(async (app) => {
+      output.json = Boolean(opts.json);
+      const run = await reviewedRun(app, target, opts.repo ? { repo: opts.repo } : {});
+      const findings = reviewFindings(run);
+      if (opts.json) return printJson("review", { ...findings, summary: summarizeRun(app.store, run) });
+      if (findings.rounds.length === 0) return console.log(`${run.id} (${run.state}) has no review results yet.`);
+      for (const r of findings.rounds) {
+        console.log(`${c.bold(`Round ${r.attempt}`)} (${r.trigger}) on ${r.reviewedSha.slice(0, 8)}: ${r.approved ? c.green("approved") : c.yellow(r.verdict)} — ${r.summary}`);
+        for (const f of r.findings) console.log(`  [${f.severity}] ${f.file ?? "-"}${f.line ? `:${f.line}` : ""} ${f.title}\n      ${f.detail}${f.suggestion ? `\n      → ${f.suggestion}` : ""}`);
+      }
     }),
   );
 
@@ -188,20 +229,24 @@ program
 
 program
   .command("resume")
-  .description("Continue a run (re-enters the blocked step, re-checks CI or merge state)")
-  .argument("<run-id>", "run id or unique prefix")
+  .description("Continue a run (re-enters the blocked step, re-checks CI or merge state). Accepts a run id or an issue key / URL. Live runs ask you to confirm a system prompt again.")
+  .argument("<target>", "run id or unique prefix, or an issue key / Linear URL (resolved to its only resumable run)")
+  .option("--repo <owner/name>", "with an issue: only runs on this repository")
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt)
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; audited)", (v: string, prev: string[]) => [...prev, v], [] as string[])
-  .option("--json", "print the final run record as JSON")
-  .action((id: string, opts: { ciWait?: number; acceptDependency: string[]; json?: boolean }) =>
+  .option("--json", "print a versioned JSON summary (schemaVersion 1)")
+  .action((target: string, opts: { repo?: string; ciWait?: number; acceptDependency: string[]; json?: boolean }) =>
     withApp(async (app) => {
-      const run = await resumeRun(app, id, {
+      output.json = Boolean(opts.json);
+      const found = await resumableRun(app, target, opts.repo ? { repo: opts.repo } : {});
+      const run = await resumeRun(app, found.id, {
         ...(opts.ciWait !== undefined ? { ciWaitMinutes: opts.ciWait } : {}),
         acceptDependencies: opts.acceptDependency,
         ...(opts.json ? {} : { onEvent: progress(false)! }),
         interrupt: interruptSignal(),
       });
-      console.log(opts.json ? JSON.stringify(run, null, 2) : summarize(app, run));
+      if (opts.json) printJson("run", summarizeRun(app.store, run));
+      else console.log(summarize(app, run));
       process.exitCode = exitCodeFor(run);
     }),
   );
@@ -245,7 +290,7 @@ program
   .action(() =>
     withApp((app) => {
       for (const { config, source } of listRepoConfigs(app.paths)) {
-        console.log(`${c.bold(config.repo)}  teams ${config.linear.teams.join(",")}  merge ${config.merge.mode}  ${c.dim(source)}`);
+        console.log(`${c.bold(config.repo)}  teams ${config.linear.teams.join(",")}  merge ${config.merge.mode}${config.authorization ? `  authorized ${config.authorization.scope} by ${config.authorization.authorized_by}` : ""}  ${c.dim(source)}`);
       }
     }),
   );
@@ -255,34 +300,21 @@ program
   .description("What is supported today versus planned")
   .action(() => console.log(renderCapabilities()));
 
-program
-  .command("install-skill")
-  .description("Link the /orchestrate skill into Claude Code (used by T3-hosted Claude sessions)")
-  .option("--dir <skills-dir>", "skills directory (default: $CLAUDE_CONFIG_DIR/skills or ~/.claude/skills)")
-  .action((opts: { dir?: string }) => {
-    const dir = opts.dir ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "skills");
-    const target = join(dir, "orchestrate");
-    const source = join(PACKAGE_ROOT, "integrations", "claude-skill", "orchestrate");
-    mkdirSync(dir, { recursive: true });
-    if (existsSync(target) || isSymlink(target)) {
-      console.log(`${target} already exists; leaving it unchanged.`);
-      return;
-    }
-    symlinkSync(source, target, "dir");
-    console.log(`Linked ${target} → ${source}\nIn a T3 Claude Code thread, type: /orchestrate BRU-488`);
-  });
-
-function isSymlink(p: string): boolean {
-  try {
-    return lstatSync(p).isSymbolicLink();
-  } catch {
-    return false;
-  }
-}
+registerAuthCommands(program);
+registerSkillCommands(program, pkg.version);
 
 program.parseAsync(process.argv).catch((err: unknown) => {
-  const known = err instanceof RunError || err instanceof ConfigError || err instanceof LeaseError;
-  console.error(c.red(`error: ${(err as Error).message}`));
+  const known = err instanceof RunError || err instanceof ConfigError || err instanceof LeaseError || err instanceof IssueRefError || err instanceof CredentialError;
+  if (output.json) {
+    const e = err as Error;
+    printJson("error", {
+      code: err instanceof IntakeError ? err.code : err instanceof ConfigError ? "configuration" : err instanceof IssueRefError ? "invalid_issue_ref" : known ? "error" : "internal",
+      message: e.message,
+      ...(err instanceof IntakeError && err.details ? { details: err.details } : {}),
+    });
+  } else {
+    console.error(c.red(`error: ${(err as Error).message}`));
+  }
   if (!known && process.env.ORCHESTRATOR_DEBUG) console.error((err as Error).stack);
   process.exitCode = 1;
 });

@@ -141,6 +141,7 @@ export function credentialPaths(env: NodeJS.ProcessEnv, orchestratorHome: string
     ...(env.CLAUDE_CONFIG_DIR ? [env.CLAUDE_CONFIG_DIR] : []),
     ...(env.CODEX_HOME ? [env.CODEX_HOME] : []),
     ...(env.LINEAR_API_KEY_FILE ? [env.LINEAR_API_KEY_FILE] : []),
+    join(orchestratorHome, "credentials"),
     join(orchestratorHome, "orchestrator.db"),
     join(orchestratorHome, "orchestrator.db-wal"),
     join(orchestratorHome, "orchestrator.db-shm"),

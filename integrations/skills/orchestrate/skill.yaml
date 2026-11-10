@@ -1,0 +1,26 @@
+# Canonical metadata for the Orchestrator skill. `orchestrator skill install` renders it, with
+# SKILL.body.md, into each provider's format (Claude Code: SKILL.md frontmatter; Codex: SKILL.md
+# frontmatter + agents/openai.yaml). Edit here, never in an installed copy.
+#
+# Discovery: both providers show `name` + `description` to the model and let it choose the skill
+# when a request matches. Put the trigger first; keep exclusions that prevent likely misrouting.
+name: orchestrate
+description: >-
+  Hand a Linear issue to the local Orchestrator engine and manage its runs: prepare a dry-run
+  plan, start a supervised implementation (isolated worktree, independent review, draft PR),
+  or report status, resume, or show review findings of an Orchestrator run. Use when the user
+  asks to use, run or delegate to Orchestrator for a Linear issue (a key like BRU-488 or a
+  linear.app/.../issue/... URL), in any language, or asks about an existing Orchestrator run.
+  Not for explaining, summarizing or listing Linear issues, or for implementing an issue
+  without Orchestrator.
+when_to_use: >-
+  Examples: "Implement BRU-488 using Orchestrator", "Can you work on
+  https://linear.app/acme/issue/BRU-488 using Orchestrator?", "Let's use Orchestrator to handle
+  BRU-488", "Quero implementar a task BRU-488 do Linear usando o Orchestrator", "What's the
+  status of the Orchestrator run for BRU-488?", "Resume the Orchestrator run for BRU-488",
+  "Show the review findings from the BRU-488 Orchestrator run".
+argument_hint: "[issue key or Linear URL] [prepare|execute|status|resume|review]"
+codex:
+  display_name: Orchestrator
+  short_description: Run Linear issues through the Orchestrator engine
+  default_prompt: Use $orchestrate to prepare a dry run for BRU-488.

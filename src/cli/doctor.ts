@@ -4,7 +4,8 @@ import { resolveToolchain } from "../adapters/checks.js";
 import { ClaudeCodeAgent } from "../adapters/claude.js";
 import { CodexAgent } from "../adapters/codex.js";
 import { GitHubHost, ghAuthStatus } from "../adapters/github.js";
-import { linearApiKey } from "../adapters/index.js";
+import { LinearCredentialStore, resolveLinearKey } from "../credentials/linear.js";
+import { approvalChannelStatus } from "../core/approval.js";
 import { LinearTracker } from "../adapters/linear.js";
 import { T3Cli } from "../adapters/t3.js";
 import { listRepoConfigs, loadRepoConfig, type LoadedRepoConfig, type Paths } from "../config/load.js";
@@ -65,19 +66,25 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
     }
   }
 
-  const key = linearApiKey(env);
+  const stored = new LinearCredentialStore(paths, env).list();
+  if (stored.length) add("linear", "stored accounts", "info", stored.map((a) => `${a.workspace} (${a.user}, ${a.backend})`).join("; "));
+  const resolved = resolveLinearKey({ env, paths });
+  const key = resolved.key;
   let linearUrlKey: string | null = null;
   if (!key) {
-    add("linear", "api key", "fail", "LINEAR_API_KEY (or LINEAR_API_KEY_FILE) not set; needed to read issues");
+    add("linear", "api key", stored.length > 1 ? "warn" : "fail", resolved.problem ?? "no Linear key");
   } else {
     try {
       const who = await new LinearTracker(key).whoami();
-      add("linear", "api key", "ok", `${who.user} @ ${who.workspace}`);
+      add("linear", "api key", "ok", `${who.user} @ ${who.workspace} (from ${resolved.source})`);
       linearUrlKey = who.urlKey;
     } catch (err) {
       add("linear", "api key", "fail", (err as Error).message);
     }
   }
+
+  const approval = await approvalChannelStatus();
+  add("approval", approval.channel, approval.available ? "ok" : "warn", approval.detail);
 
   const claude = await new ClaudeCodeAgent({ adapter: "claude-code", permission_mode: "acceptEdits", allowed_tools: [], disallowed_tools: [], timeout_minutes: 1 }).probe();
   add("agents", "claude", claude.ok ? "ok" : "fail", claude.detail);

@@ -227,6 +227,16 @@ export class Store {
     return rows.map((r) => toRecord(r));
   }
 
+  /** Runs for an issue (optionally one repository), newest first. */
+  runsFor(issueKey: string, repo?: string, limit = 20): RunRecord[] {
+    const rows = (
+      repo
+        ? this.db.prepare("SELECT * FROM runs WHERE issue_key = ? AND lower(repo) = lower(?) ORDER BY created_at DESC, id DESC LIMIT ?").all(issueKey, repo, limit)
+        : this.db.prepare("SELECT * FROM runs WHERE issue_key = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(issueKey, limit)
+    ) as unknown as RunRow[];
+    return rows.map((r) => toRecord(r));
+  }
+
   /** Active (non-terminal) runs for the same issue and repo, to prevent duplicate work. */
   activeRunsFor(issueKey: string, repo: string): RunRecord[] {
     const rows = this.db

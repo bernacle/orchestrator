@@ -39,6 +39,19 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
 - **Retries.** Transient network errors retry a step twice with backoff. Anything else parks the run in BLOCKED with the error message.
 - **Cancellation.** `orchestrator cancel` sets a flag. The driving process notices within a second and aborts the running agent or check (SIGTERM, then SIGKILL, to the whole process group), then moves to CANCELLED. Ctrl-C *interrupts*: the run keeps its state and can be resumed. Worktrees are always kept for inspection.
 
+## Intake (before a run exists)
+
+`src/intake` turns a request into a run, or into a precise reason why not. `orchestrator context` prints its result, and `startRun` goes through the same function, so a skill's preparation and the engine's own gate can't disagree. It resolves, in order:
+
+1. the issue reference (a key or a Linear URL; the URL's workspace is kept);
+2. the repository (`--repo`, `--config`, the working directory's GitHub remotes, or the team mapping outside a repository; ambiguity is reported, never guessed);
+3. operator-owned configuration (missing → first-use proposal);
+4. the Linear credential for the request's workspace;
+5. the issue ↔ repository association (evidence required unless `--repo` was explicit);
+6. existing runs (a second live run is refused).
+
+Only then is a run created. The resolution is stored on the run (`context.options.intake`). See [skills.md](skills.md).
+
 ## Trust boundaries
 
 | Claim | Who decides | How |
@@ -50,6 +63,10 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
 | "Safe to commit" | orchestrator | `forbidden_paths` (`.env*`, keys, CI workflows, agent config by default) block the run; the diff and PR text are scanned for secrets before push |
 | "Nothing escaped the worktree" | orchestrator | tripwire fingerprints of shell rc files, git config/hooks/refs and agent settings, compared around every agent and check step |
 | "Allowed to push / PR / comment / merge" | operator config | `permissions.*`, default all false; dry runs deny everything |
+| "This repository may be used" | operator | an operator-owned config (`config/repos/` or `~/.orchestrator/repos/`, written by `repo authorize` on first use); files in the repository are ignored |
+| "This issue belongs to this repository" | operator / evidence | explicit `--repo`, a brief, a saved confirmation, a mapped Linear project, or the issue linking to the repository; never the key prefix |
+| "Start (or resume) a live run" | a person, at a system prompt | `--execute` stops for macOS LocalAuthentication (Touch ID / password) naming the run's scope; the answer is used in-process and never stored as authority, so nothing an agent writes can stand in for it (`core/approval.ts`); each drive pins the run's mode, issue and repository and stops if the store disagrees, so a dry run can't be rewritten into a live one (`core/engine.ts`); `ORCHESTRATOR_NO_EXECUTE=1` refuses first |
+| "Authorize this repository / confirm this association" | a person, at a system prompt | same prompt before `repo authorize` writes config or `associate` saves a mapping |
 
 The implementer can't approve its own work, because the reviewer is a different adapter and the config can require a different provider (`review.require_distinct_provider`, on by default). Invariants are checked at PLANNING, and a violation blocks the run.
 
