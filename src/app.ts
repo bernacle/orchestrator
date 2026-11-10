@@ -10,7 +10,7 @@ import { ConfigError, loadRepoConfig, loadRepoConfigFile, resolvePaths, type Loa
 import { resolveLinearKey, type ResolvedLinearKey } from "./credentials/linear.js";
 import { inspectRequest, type Problem } from "./intake/context.js";
 import { defaultDiscoveryDeps, type DiscoveryDeps } from "./intake/repo-discovery.js";
-import { Engine, type EngineOptions } from "./core/engine.js";
+import { Engine, type ApprovedResume, type EngineOptions } from "./core/engine.js";
 import { ALWAYS_DENIED_ENV, credentialPaths, toolchainCaches } from "./core/isolation.js";
 import { Redactor } from "./core/redact.js";
 import { TERMINAL_STATES } from "./core/states.js";
@@ -246,6 +246,9 @@ export async function resumeRun(
 ): Promise<RunRecord<RunContext>> {
   let run = findRunOrThrow(app, id);
   if (TERMINAL_STATES.has(run.state)) throw new RunError(`run ${run.id} is ${run.state}; start a new run instead`);
+  // What the operator is shown and approves. The engine leaves a block only if the run is still on
+  // exactly this block when the drive starts; a run resumed while not BLOCKED gets no unblock at all.
+  const approvedResume: ApprovedResume = { state: run.state, blockedFrom: run.blockedFrom, reason: run.reason };
   if (run.mode === "supervised" && app.env.ORCHESTRATOR_NO_EXECUTE) throw new IntakeError("execution_disabled", "live runs are disabled in this environment (ORCHESTRATOR_NO_EXECUTE is set)");
   const source = run.context.configSource;
   const loaded = source && existsSync(source) ? loadRepoConfigFile(source) : loadRepoConfig(run.repo, app.paths);
@@ -267,7 +270,11 @@ export async function resumeRun(
       repo: run.repo,
       scopeHash: hash,
       reason: `resume live Orchestrator run ${run.id} at ${run.state}${changed}: ${d.reason.replace(/^start a live Orchestrator run of /, "")}`,
-      details: [`Run:         ${run.id} (${run.state}${run.reason ? `: ${run.reason}` : ""})`, ...d.details],
+      details: [
+        `Run:         ${run.id} (${run.state}${run.reason ? `: ${run.reason}` : ""})`,
+        run.state === "BLOCKED" ? "Approves:    leaving this block once; any later block stops the run again" : "Approves:    continuing from this state; any block reached stops the run (no unblock)",
+        ...d.details,
+      ],
     });
     app.store.appendEvent(run.id, run.state, "info", "run.authorized", `Resume approved by ${authorization.user} via ${authorization.channel}${changed}`, authorization);
   }
@@ -279,7 +286,7 @@ export async function resumeRun(
   });
   app.store.appendEvent(run.id, run.state, "info", "run.resume", `Resume requested at ${run.state}`);
   const snap = run.context.options.issueSnapshot;
-  return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: true, expect, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: approvedResume, expect, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
 /**

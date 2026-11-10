@@ -26,7 +26,8 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
 
 - The transition table in `src/core/states.ts` is the single source of truth. `Store.transition` rejects anything not listed. Every state change is one SQLite transaction (state, context patch, version bump, timeline event) with an optimistic version check.
 - **FIXING never goes straight to PR_OPEN.** Every fix is re-tested and re-reviewed.
-- **BLOCKED** means a human must act: an unresolved dependency, a missing permission, an agent failure, malformed reviewer output, or an unexpected error. It records `blocked_from`, and `resume` re-enters that state after reloading the config (so granting a permission and resuming works).
+- **BLOCKED** means a human must act: an unresolved dependency, a missing permission, an agent failure, malformed reviewer output, or an unexpected error. It records `blocked_from`, and `resume` re-enters that state after reloading the config (so granting a permission and resuming works). The unblock is narrow: the drive leaves a block only if the run was BLOCKED when the drive started, on the same block (state and reason) the person approved in the resume prompt, and only once. A run resumed while not BLOCKED (interrupted, killed CLI) gets no unblock, and any block reached later in a drive ends it: a new blocker always goes back to a person.
+- **Baseline.** With `baseline_checks`, IMPLEMENTING runs every check on the untouched base before the agent starts. Only a green, clean baseline is saved as the accepted `baseline` and reused when the step is re-entered. A red one is kept in `baselineFailure` for audit and blocks the run; each attempt uses fresh effect keys (`baseline.<n>.<check>`), so an approved resume re-runs every check instead of replaying the red result. Only an interrupted attempt continues with its own completed checks.
 - **FAILED** is definitive: the correction budget ran out, or an invariant was violated (for example, the worktree changed during review).
 - **Resting states** (`BLOCKED`, `WAITING_FOR_CI`, `READY_TO_MERGE`) hand control back. A state that transitions to itself ("CI still pending") ends the drive loop, and `resume` checks again.
 
@@ -101,7 +102,7 @@ See [isolation.md](isolation.md). In short:
 - **Config never comes from the target repository.** A repository can't grant itself permissions or turn on auto-merge. Repository *guidance* (`AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`) is passed to agents as input. It is not policy.
 - `--repo` is optional. Without it, the issue's team key (`BRU`) is matched against `linear.teams`, and an ambiguous match is an error.
 - By default the orchestrator keeps its own clone under `ORCHESTRATOR_HOME/clones`, and worktrees live under `ORCHESTRATOR_HOME/worktrees/<owner>/<repo>/<run-id>`. The operator's checkout is never touched. `local_path` opts into using an existing clone.
-- `toolchain.node` pins the Node major version. It is resolved from PATH or nvm and prepended to PATH for checks and agents.
+- `toolchain.node` pins the Node version: `"24"` accepts any 24.x.y, `"24.21.0"` requires exactly that. The repository's `.nvmrc` / `.node-version` at the base commit refines it (config `"24"` with `.nvmrc` `24.21.0` requires 24.21.0) unless `toolchain.node_version_file: false`; a disagreement blocks. The `node` children would run is probed with the scrubbed child environment, in the directory checks run in (asdf/mise choose by directory). If it does not match, a matching nvm install is prepended to PATH. Planning, every live step, `preflight` and `doctor` use the same resolution (`resolveRunToolchain`), and a live step blocks instead of running checks or agents on a non-matching Node.
 
 ## Dry runs
 

@@ -124,6 +124,8 @@ export interface RepoInspection {
   guidanceFiles: string[];
   topLevel: string[];
   nodeEngine: string | null;
+  /** The first `.nvmrc` / `.node-version` at the inspected commit that holds a version pin. */
+  nodeVersionFile: { file: string; content: string } | null;
 }
 
 export interface Workspace {

@@ -23,6 +23,7 @@ const inspection = (over: Partial<RepoInspection> = {}): RepoInspection => ({
   guidanceFiles: ["README.md"],
   topLevel: ["package.json", "pnpm-lock.yaml", "src"],
   nodeEngine: ">=24",
+  nodeVersionFile: null,
   ...over,
 });
 

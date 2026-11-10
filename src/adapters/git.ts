@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { runChecked, runProcess } from "../core/exec.js";
+import { NODE_VERSION_FILES, parseNodePin } from "./checks.js";
 import type { ChangedFile, RepoInspection, Workspace } from "./types.js";
 
 /**
@@ -86,6 +87,7 @@ export class GitWorkspace implements Workspace {
       guidanceFiles,
       topLevel: (await list(".")).filter((f) => f !== ".git").sort(),
       nodeEngine: pkg?.engines?.node ?? null,
+      nodeVersionFile: await firstNodeVersionFile(read),
     };
   }
 
@@ -166,4 +168,13 @@ export class GitWorkspace implements Workspace {
     // Plain push: never --force. A rejected push surfaces as an error for a human.
     await this.git(worktreePath, ["push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000);
   }
+}
+
+/** The first Node version file holding a version pin (an alias like `lts/*` is skipped). */
+async function firstNodeVersionFile(read: (file: string) => Promise<string | null>): Promise<{ file: string; content: string } | null> {
+  for (const file of NODE_VERSION_FILES) {
+    const text = await read(file);
+    if (text !== null && parseNodePin(text)) return { file, content: text.trim().slice(0, 200) };
+  }
+  return null;
 }

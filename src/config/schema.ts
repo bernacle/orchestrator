@@ -121,8 +121,21 @@ export const RepoConfigSchema = z
     branch: z.object({ template: z.string().default("orch/{key}-{slug}") }).prefault({}),
     toolchain: z
       .object({
-        /** Major Node version the repository needs, e.g. "24". Resolved from nvm if PATH has a different one. */
-        node: z.string().optional(),
+        /**
+         * Node version the repository needs: "24" (any 24.x.y), "24.21" or an exact "24.21.0". Every
+         * component given must match. Resolved from nvm if the `node` on PATH does not match.
+         */
+        node: z
+          .string()
+          .regex(/^v?\d+(\.\d+){0,2}$/, 'toolchain.node must be a version such as "24" or "24.21.0"')
+          .optional(),
+        /**
+         * Also honour the repository's `.nvmrc` / `.node-version` (read at the base commit). When it is
+         * more precise than `node` (e.g. "24.21.0" vs "24"), the exact version is required; when they
+         * disagree, the run is blocked. Set false for a repository that intentionally wants any
+         * release of the configured major whatever its version file says.
+         */
+        node_version_file: z.boolean().default(true),
         env: z.record(z.string(), z.string()).default({}),
       })
       .prefault({}),
