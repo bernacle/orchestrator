@@ -141,6 +141,12 @@ export interface Workspace {
   diff(worktreePath: string, baseSha: string): Promise<string>;
   /** Stage everything and commit. Returns null when there is nothing to commit. */
   commitAll(worktreePath: string, message: string): Promise<string | null>;
+  /** Worktree-relative paths with uncommitted changes, untracked files included (ignored files excluded). */
+  uncommittedPaths(worktreePath: string): Promise<string[]>;
+  /** Undo uncommitted changes to `paths`: tracked files go back to HEAD, untracked files are deleted. */
+  discardPaths(worktreePath: string, paths: string[]): Promise<void>;
+  /** Stage only `paths` (worktree-relative; never ignored files) and commit. Null when they are unchanged. */
+  commitPaths(worktreePath: string, paths: string[], message: string): Promise<string | null>;
   push(worktreePath: string, branch: string): Promise<void>;
   /** Which of `paths` exist at `ref` (read-only, from git objects). */
   filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>>;
@@ -172,6 +178,13 @@ export interface AgentTask {
   timeoutMs: number;
   env: NodeJS.ProcessEnv;
   signal: AbortSignal;
+  /**
+   * Read-only paths outside the worktree the agent's sandboxed shell needs for this run (the pinned
+   * Node installation). Nothing else outside the worktree becomes readable.
+   */
+  readablePaths?: string[];
+  /** Absolute paths of images to show the agent (orchestrator-generated screenshots for the reviewer). */
+  images?: string[];
 }
 
 export interface AgentResult {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -133,6 +133,10 @@ export function credentialPaths(env: NodeJS.ProcessEnv, orchestratorHome: string
     join(h, ".config", "gcloud"),
     join(h, ".config", "git", "credentials"),
     join(h, ".git-credentials"),
+    // Global git config can hold credentials (e.g. a token inside a url.<base>.insteadOf). Children
+    // never need it: they run with GIT_CONFIG_GLOBAL pointing at an empty file (childEnv).
+    join(h, ".gitconfig"),
+    join(h, ".config", "git", "config"),
     join(h, ".t3", "userdata"),
     join(h, ".codex"),
     join(h, ".claude"),
@@ -263,12 +267,16 @@ export const MIN_CLAUDE_VERSION_FOR_ISOLATION = "2.1.314"; // permissions.blockW
  * repository's .claude/settings*.json and the operator's user settings do not
  * apply). Verified empirically on 2.1.318 (see docs/isolation.md).
  */
-export function claudeIsolationSettings(input: { denyRead: string[]; deniedEnv: string[]; allow: string[]; deny: string[]; allowWrite?: string[] }): object {
+export function claudeIsolationSettings(input: { denyRead: string[]; deniedEnv: string[]; allow: string[]; deny: string[]; allowWrite?: string[]; allowRead?: string[] }): object {
   const toolCaches = input.allowWrite ?? [];
   return {
     disableAllHooks: true,
     disableClaudeAiConnectors: true,
     enableAllProjectMcpServers: false,
+    // Auto memory lives outside the worktree (<config>/projects/<repo>/memory, shared by every
+    // worktree of the clone) and is loaded into later sessions: an isolated run must neither read a
+    // previous run's notes nor leave its own. The adapter also sets CLAUDE_CODE_DISABLE_AUTO_MEMORY=1.
+    autoMemoryEnabled: false,
     permissions: {
       blockReadsOutsideWorkingDirectories: true,
       blockWritesOutsideWorkingDirectories: true,
@@ -280,8 +288,10 @@ export function claudeIsolationSettings(input: { denyRead: string[]; deniedEnv: 
       failIfUnavailable: true,
       allowUnsandboxedCommands: false,
       autoAllowBashIfSandboxed: false,
-      // Tool caches the toolchain must read and update (corepack's lastKnownGood.json); nothing else outside the worktree.
-      filesystem: { denyRead: input.denyRead, allowRead: toolCaches, allowWrite: toolCaches },
+      // Outside the worktree the shell may read only: tool caches it must also update (corepack's
+      // lastKnownGood.json), the pinned Node install it executes, and the orchestrator's empty
+      // git/gh config stubs (GIT_CONFIG_GLOBAL points there, so git fails if it cannot read it).
+      filesystem: { denyRead: input.denyRead, allowRead: [...new Set([...toolCaches, ...(input.allowRead ?? [])])], allowWrite: toolCaches },
       network: { allowedDomains: [] },
       credentials: { envVars: input.deniedEnv.map((name) => ({ name, mode: "deny" })) },
     },
@@ -302,6 +312,11 @@ export function compareVersions(a: string, b: string): number {
 export function toolchainCaches(env: NodeJS.ProcessEnv): string[] {
   const h = env.HOME ?? homedir();
   return [env.COREPACK_HOME ?? join(h, ".cache", "node", "corepack")];
+}
+
+/** Read-only paths every agent shell needs outside the worktree: the isolation stubs childEnv points at. */
+export function isolationReadPaths(dirs: IsolationDirs): string[] {
+  return [dirs.emptyGitConfig, dirs.emptyGhConfig];
 }
 
 // ---- 3. tripwires ------------------------------------------------------------------
@@ -347,6 +362,41 @@ function fingerprint(path: string): string {
 
 export function takeTripwire(paths: string[], now = new Date()): TripwireSnapshot {
   return { takenAt: now.toISOString(), entries: Object.fromEntries(paths.map((p) => [p, fingerprint(p)])) };
+}
+
+/**
+ * What the operator needs to investigate a tripwire hit, without file contents (a changed file may
+ * hold a credential): both fingerprints and the file's current metadata. A new inode or a birth time
+ * after the snapshot means the file was replaced (git, editors and most tools write a temp file and
+ * rename it). The tripwire cannot tell which process wrote it: any process running as the operator,
+ * including unrelated sessions outside the orchestrator, can change these files.
+ */
+export interface TripwireChange {
+  path: string;
+  before: string;
+  after: string;
+  now: { exists: boolean; size?: number; mtime?: string; ctime?: string; birthtime?: string; inode?: number; kind?: "file" | "dir" | "symlink" | "other" };
+}
+
+export function describeTripwireChanges(before: TripwireSnapshot, after: TripwireSnapshot): TripwireChange[] {
+  return compareTripwire(before, after).map((path) => {
+    let now: TripwireChange["now"] = { exists: false };
+    try {
+      const st = lstatSync(path);
+      now = {
+        exists: true,
+        size: st.size,
+        mtime: st.mtime.toISOString(),
+        ctime: st.ctime.toISOString(),
+        birthtime: st.birthtime.toISOString(),
+        inode: st.ino,
+        kind: st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other",
+      };
+    } catch {
+      /* removed */
+    }
+    return { path, before: before.entries[path] ?? "absent", after: after.entries[path] ?? "absent", now };
+  });
 }
 
 export function compareTripwire(before: TripwireSnapshot, after: TripwireSnapshot): string[] {

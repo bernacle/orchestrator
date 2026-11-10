@@ -279,7 +279,9 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
         act("git.fetch", "local.worktree", `Fetch origin in ${input.clonePath}`),
         act("git.worktree", "local.worktree", `Create worktree ${input.worktreePath} on new branch ${input.branch} from origin/${input.baseBranch}`, `git worktree add --no-track -b ${input.branch} ${input.worktreePath} origin/${input.baseBranch}`),
         ...setupChecks.map((c) => act(`setup.${c.name}`, "local.checks", `Setup: ${c.name} (sandboxed, network=${config.isolation.setup_network}, scrubbed env)`, c.command)),
-        ...(config.baseline_checks ? [act("baseline", "local.checks", `Baseline: run all ${runChecks.length} checks on the untouched base (sandboxed); a red base blocks the run`)] : []),
+        ...(config.baseline_checks
+          ? [act("baseline", "local.checks", `Baseline: run all ${runChecks.length} checks${config.screenshots ? " and the screenshot command" : ""} on the untouched base (sandboxed); a red base blocks the run`)]
+          : []),
         act("agent.implement", "agents.run", `Start ${impl.adapter} (${impl.model}) as implementer: ${impl.access}`, impl.command),
         act("verify.tripwire", "read", `Compare ${input.isolation.tripwires} tripwire fingerprints outside the worktree (shell rc files, git config/hooks/refs, agent settings); any change fails the run`),
         act("verify.diff", "read", "Compute changed files with git (agent self-report is not trusted); refuse forbidden paths"),
@@ -290,8 +292,20 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
     {
       state: "TESTING",
       summary: "Run repository checks in the worktree.",
-      actions: runChecks.map((c) => act(`check.${c.name}`, "local.checks", `${c.name}${c.optional ? " (optional)" : ""}, timeout ${c.timeoutMinutes}m, sandboxed (network=${config.checks.find((k) => k.name === c.name)?.network ?? config.isolation.checks_network})`, c.command)),
-      exits: [`FIXING if a required check fails (max ${max} correction rounds)`, "FAILED when rounds are exhausted", "otherwise REVIEWING"],
+      actions: [
+        ...runChecks.map((c) => act(`check.${c.name}`, "local.checks", `${c.name}${c.optional ? " (optional)" : ""}, timeout ${c.timeoutMinutes}m, sandboxed (network=${config.checks.find((k) => k.name === c.name)?.network ?? config.isolation.checks_network})`, c.command)),
+        ...(config.screenshots
+          ? [
+              act(
+                "screenshots",
+                "local.checks",
+                `After green checks${config.screenshots.when_changed.length ? `, if the change touches ${config.screenshots.when_changed.join(", ")}` : ""}: generate screenshots (sandboxed, network=none except localhost), validate images matching ${config.screenshots.outputs.join(", ")}, commit them, and show them to the reviewer`,
+                config.screenshots.run,
+              ),
+            ]
+          : []),
+      ],
+      exits: [`FIXING if a required check fails${config.screenshots ? " or screenshots cannot be produced" : ""} (max ${max} correction rounds)`, "FAILED when rounds are exhausted", "otherwise REVIEWING"],
     },
     {
       state: "REVIEWING",

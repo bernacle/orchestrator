@@ -29,7 +29,7 @@ export class CodexAgent implements AgentRunner {
     };
   }
 
-  args(task: Pick<AgentTask, "role" | "cwd" | "resumeSessionId" | "outputSchema" | "artifactDir" | "artifactPrefix">): string[] {
+  args(task: Pick<AgentTask, "role" | "cwd" | "resumeSessionId" | "outputSchema" | "artifactDir" | "artifactPrefix" | "images">): string[] {
     const p = this.paths(task);
     const sandbox = task.role === "implementer" ? this.config.sandbox : "read-only";
     const a = ["exec"];
@@ -38,6 +38,8 @@ export class CodexAgent implements AgentRunner {
     if (!task.resumeSessionId) a.push("--sandbox", sandbox, "-C", task.cwd);
     if (this.config.model) a.push("-m", this.config.model);
     if (task.outputSchema) a.push("--output-schema", p.schema);
+    // Codex skips a missing image silently; the orchestrator only passes files it has verified.
+    for (const image of task.images ?? []) a.push("--image", image);
     a.push("-"); // prompt from stdin
     return a;
   }

@@ -1,3 +1,6 @@
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ClaudeCodeAgent, stripParentSession } from "../../src/adapters/claude.js";
 import { CodexAgent } from "../../src/adapters/codex.js";
@@ -39,6 +42,38 @@ describe("ClaudeCodeAgent", () => {
   });
 });
 
+describe("ClaudeCodeAgent auto memory and sandbox reads", () => {
+  it("turns auto memory off in the settings and the environment of every Claude process", async () => {
+    // A stand-in `claude` that records its environment and arguments, then answers like `claude -p`.
+    const dir = mkdtempSync(join(tmpdir(), "orch-claude-"));
+    try {
+      const bin = join(dir, "claude");
+      writeFileSync(bin, `#!/bin/sh\nenv > "${dir}/env.txt"\nprintf '%s\\n' "$@" > "${dir}/args.txt"\ncat > /dev/null\necho '{"result":"ok","session_id":"s","is_error":false}'\n`);
+      chmodSync(bin, 0o755);
+      const a = new ClaudeCodeAgent(cfg.agents.implementer as never, { denyRead: [], deniedEnv: [], allowRead: ["/iso/gitconfig-empty"] }, bin);
+      const r = await a.run({ role: "implementer", cwd: dir, prompt: "x", artifactDir: dir, artifactPrefix: "t", timeoutMs: 30_000, env: { PATH: "/usr/bin:/bin" }, signal: new AbortController().signal, readablePaths: ["/nvm/v24.21.0"] });
+      expect(r.ok).toBe(true);
+      expect(readFileSync(join(dir, "env.txt"), "utf8")).toMatch(/^CLAUDE_CODE_DISABLE_AUTO_MEMORY=1$/m);
+      const args = readFileSync(join(dir, "args.txt"), "utf8").split("\n");
+      const settings = JSON.parse(args[args.indexOf("--settings") + 1]!) as { autoMemoryEnabled: boolean; sandbox: { filesystem: { allowRead: string[]; allowWrite: string[] } } };
+      expect(settings.autoMemoryEnabled).toBe(false);
+      // The pinned Node and the isolation stubs become readable; nothing becomes writable.
+      expect(settings.sandbox.filesystem.allowRead).toEqual(expect.arrayContaining(["/iso/gitconfig-empty", "/nvm/v24.21.0"]));
+      expect(settings.sandbox.filesystem.allowWrite).toEqual([]);
+      // The audit copy shows the same settings the process ran under.
+      expect(JSON.parse(readFileSync(join(dir, "t.claude-settings.json"), "utf8"))).toEqual(settings);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("planner and reviewer settings also disable auto memory", () => {
+    const a = new ClaudeCodeAgent(cfg.agents.implementer as never);
+    expect((a.settings("planner") as { autoMemoryEnabled: boolean }).autoMemoryEnabled).toBe(false);
+    expect((a.settings("reviewer") as { autoMemoryEnabled: boolean }).autoMemoryEnabled).toBe(false);
+  });
+});
+
 describe("CodexAgent", () => {
   const agent = new CodexAgent(cfg.agents.reviewer as never);
   it("reviews in the read-only sandbox with approvals off and a schema", () => {
@@ -48,6 +83,12 @@ describe("CodexAgent", () => {
     expect(args).toEqual(expect.arrayContaining(["--json", "-C", "/wt", "--output-schema", "/a/review-0.schema.json", "-m", "gpt-x", "-"]));
     expect(args.join(" ")).toContain('approval_policy="never"');
     expect(args.join(" ")).not.toMatch(/dangerously|danger-full-access/);
+  });
+
+  it("attaches screenshots as images, one flag per file, before the stdin prompt marker", () => {
+    const args = agent.args({ role: "reviewer", cwd: "/wt", artifactDir: "/a", artifactPrefix: "review-0", images: ["/wt/a.png", "/wt/b c.png"] });
+    expect(args.slice(-5)).toEqual(["--image", "/wt/a.png", "--image", "/wt/b c.png", "-"]);
+    expect(agent.args({ role: "reviewer", cwd: "/wt", artifactDir: "/a", artifactPrefix: "review-0" })).not.toContain("--image");
   });
 });
 

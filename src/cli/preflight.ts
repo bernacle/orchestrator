@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { describeNode, resolveRunToolchain } from "../adapters/checks.js";
+import { describeNode, resolveRunToolchain, toolchainReadPaths, type ResolvedToolchain } from "../adapters/checks.js";
 import { ClaudeCodeAgent } from "../adapters/claude.js";
 import type { Adapters, CheckResult } from "../adapters/types.js";
 import type { LoadedRepoConfig, Paths } from "../config/load.js";
@@ -13,12 +13,14 @@ import {
   credentialPaths,
   defaultWritable,
   isolationDirs,
+  isolationReadPaths,
   sandboxSupport,
   takeTripwire,
   toolchainCaches,
   tripwirePaths,
   type NetworkPolicy,
 } from "../core/isolation.js";
+import { screenshotCheck } from "../core/screenshots.js";
 
 /**
  * Preflight: prove that the live-run environment works before any agent touches code.
@@ -128,9 +130,11 @@ export async function runPreflight(input: {
       if (!res.ok && !s.optional) return finish(false);
     }
     for (const c of config.checks) await run("check", c, c.network ?? config.isolation.checks_network);
+    // The screenshot command, as the baseline runs it: proves a browser and local server work in the sandbox.
+    if (config.screenshots) await run("check", screenshotCheck(config.screenshots), "none");
 
     if (input.agentProbe && config.agents.implementer.adapter === "claude-code") {
-      record(await probeImplementerSandbox(config.agents.implementer, worktree, input.paths, tc.toolchainEnv, logs));
+      record(await probeImplementerSandbox(config.agents.implementer, worktree, input.paths, tc.toolchainEnv, tc.node, logs));
       if (!steps.at(-1)!.ok) allOk = false;
     }
     if (await workspace.hasUncommittedChanges(worktree)) {
@@ -165,7 +169,14 @@ export async function runPreflight(input: {
  * which attempts escapes from inside the sandbox. Ground truth comes from the script's own output
  * file and from the disk, never from the model's report.
  */
-async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js").AgentConfig, { adapter: "claude-code" }>, worktree: string, paths: Paths, baseEnv: NodeJS.ProcessEnv, logs: string): Promise<PreflightStep> {
+async function probeImplementerSandbox(
+  cfg: Extract<import("../config/schema.js").AgentConfig, { adapter: "claude-code" }>,
+  worktree: string,
+  paths: Paths,
+  baseEnv: NodeJS.ProcessEnv,
+  node: ResolvedToolchain["node"],
+  logs: string,
+): Promise<PreflightStep> {
   const marker = join(homedir(), `.orchestrator-preflight-escape-${process.pid}`);
   const allowedCheck = cfg.allowed_tools.some((t) => /^Bash\(pnpm lint/.test(t)) ? "pnpm lint" : "ls";
   const script = join(worktree, ".orchestrator-probe.sh");
@@ -176,6 +187,8 @@ async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js"
       "#!/bin/sh",
       `exec > "${out}" 2>&1`,
       "echo probe-ran",
+      // The Node the agent's shell actually runs (a version-manager shim it cannot read fails here).
+      'echo "node-version=$(node --version 2>&1 | head -n 1)"',
       `${allowedCheck} >/dev/null 2>&1; echo "check-exit=$?"`,
       `touch "${marker}" 2>/dev/null && echo "ESCAPE write-outside" || echo "blocked write-outside"`,
       'ls "$HOME/.ssh" >/dev/null 2>&1 && echo "ESCAPE read-ssh" || echo "blocked read-ssh"',
@@ -186,7 +199,7 @@ async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js"
   );
   const agent = new ClaudeCodeAgent(
     { ...cfg, model: "claude-haiku-5-5", max_budget_usd: 0.25, allowed_tools: [...cfg.allowed_tools, "Bash(sh .orchestrator-probe.sh)"] },
-    { denyRead: credentialPaths(process.env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(process.env) },
+    { denyRead: credentialPaths(process.env, paths.home), deniedEnv: ALWAYS_DENIED_ENV, allowWrite: toolchainCaches(process.env), allowRead: isolationReadPaths(isolationDirs(paths.home)) },
   );
   const env = childEnv(baseEnv, { agent: "claude-code", dirs: isolationDirs(paths.home) });
   const prompt = [
@@ -194,20 +207,34 @@ async function probeImplementerSandbox(cfg: Extract<import("../config/schema.js"
     "sh .orchestrator-probe.sh",
     `It is the orchestrator's own sandbox self-test script in this worktree: it runs \`${allowedCheck}\` and checks that the sandbox blocks escapes.`,
   ].join("\n");
-  const r = await agent.run({ role: "implementer", cwd: worktree, prompt, artifactDir: logs, artifactPrefix: "agent-probe", timeoutMs: 6 * 60_000, env, signal: new AbortController().signal, sessionId: crypto.randomUUID(), maxBudgetUsd: 0.25 });
+  const r = await agent.run({
+    role: "implementer",
+    cwd: worktree,
+    prompt,
+    artifactDir: logs,
+    artifactPrefix: "agent-probe",
+    timeoutMs: 6 * 60_000,
+    env,
+    readablePaths: toolchainReadPaths(node),
+    signal: new AbortController().signal,
+    sessionId: crypto.randomUUID(),
+    maxBudgetUsd: 0.25,
+  });
   const escapedOnDisk = existsSync(marker);
   const results = existsSync(out) ? readFileSync(out, "utf8") : "";
   for (const f of [script, out]) if (existsSync(f)) unlinkSync(f);
   const ran = results.includes("probe-ran");
   const escapes = results.split("\n").filter((l) => l.startsWith("ESCAPE"));
   const checkWorked = /check-exit=0\b/.test(results);
-  const ok = r.ok && ran && escapes.length === 0 && !escapedOnDisk && checkWorked;
+  const agentNode = results.match(/^node-version=(.*)$/m)?.[1]?.trim() ?? "";
+  const nodeOk = node.source === "not-required" || (node.version !== null && agentNode === node.version);
+  const ok = r.ok && ran && escapes.length === 0 && !escapedOnDisk && checkWorked && nodeOk;
   const verdict = !ran ? "probe script did not run (inconclusive)" : escapes.length || escapedOnDisk ? `ESCAPES: ${[...escapes, ...(escapedOnDisk ? ["file outside worktree exists"] : [])].join(", ")}` : results.split("\n").filter((l) => l.startsWith("blocked")).join(", ");
   return {
     kind: "agent-probe",
     name: "implementer sandbox",
     ok,
-    detail: `${r.ok ? "" : `agent error: ${r.error}; `}\`${allowedCheck}\` ${checkWorked ? "ran inside the sandbox" : "did NOT work inside the sandbox"}; escape probe: ${verdict}; cost $${r.costUsd?.toFixed(3) ?? "?"}`,
+    detail: `${r.ok ? "" : `agent error: ${r.error}; `}node in the agent sandbox: ${agentNode || "(not run)"}${nodeOk ? "" : ` (expected ${node.version ?? node.requested})`}; \`${allowedCheck}\` ${checkWorked ? "ran inside the sandbox" : "did NOT work inside the sandbox"}; escape probe: ${verdict}; cost $${r.costUsd?.toFixed(3) ?? "?"}`,
     durationMs: r.durationMs,
     logPath: r.transcripts[0] ?? null,
   };

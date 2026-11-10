@@ -1,8 +1,8 @@
 import { join } from "node:path";
-import { describeNode, resolveRunToolchain, type NodeVersionFile, type ResolvedToolchain } from "../adapters/checks.js";
+import { describeNode, resolveRunToolchain, toolchainReadPaths, type NodeVersionFile, type ResolvedToolchain } from "../adapters/checks.js";
 import type { AgentResult, AgentRunner, ChangedFile, CheckResult, Issue, IssueRef, PrEvidence, PullRequestStatus } from "../adapters/types.js";
 import { loadBrief, type Brief } from "../config/brief.js";
-import type { AgentConfig, CheckConfig } from "../config/schema.js";
+import type { AgentConfig, CheckConfig, RepoConfig } from "../config/schema.js";
 import { classifyDependencies, extractIssueMentions, keysNeedingEvidence } from "../planning/dependencies.js";
 import { analyzeReadiness, branchNameFor, extractAcceptanceCriteria } from "../planning/issue.js";
 import {
@@ -18,10 +18,12 @@ import {
   fixPromptForChecks,
   fixPromptForCi,
   fixPromptForReview,
+  fixPromptForScreenshots,
   implementerPrompt,
   plannerPrompt,
   pullRequestBody,
   reviewerPrompt,
+  type ScreenshotBrief,
 } from "../planning/prompts.js";
 import { REVIEW_OUTPUT_SCHEMA, decideReview, parseReview, type Finding, type ReviewOutcome } from "../planning/review.js";
 import { renderPlanMarkdown } from "../report/render.js";
@@ -30,6 +32,7 @@ import {
   ALWAYS_DENIED_ENV,
   compareTripwire,
   credentialPaths,
+  describeTripwireChanges,
   defaultWritable,
   isolationDirs,
   sandboxSupport,
@@ -38,7 +41,9 @@ import {
   type NetworkPolicy,
   type SandboxSpec,
 } from "./isolation.js";
+import { matchGlob } from "./glob.js";
 import { ciState, evaluateMerge, type MergeEligibility } from "./policy.js";
+import { collectScreenshots, screenshotCheck, screenshotsRequired, SCREENSHOT_CHECK_NAME, type Screenshot } from "./screenshots.js";
 import type { RunState } from "./states.js";
 
 // ---- persisted run context ---------------------------------------------------------
@@ -51,6 +56,8 @@ export interface Round {
   changedFiles?: ChangedFile[];
   checks?: Array<Omit<CheckResult, "outputTail">>;
   review?: { verdict: ReviewOutcome["verdict"]; summary: string; findings: Finding[]; approved: boolean; blocking: number; reviewedSha: string; sessionId: string | null };
+  /** Screenshots the orchestrator generated from this round's code, and the commit holding them. */
+  screenshots?: { command: string; files: Screenshot[]; commitSha: string | null } | null;
 }
 
 export interface RunContext {
@@ -167,9 +174,14 @@ async function runToolchain(ctx: Ctx, agent?: AgentConfig): Promise<{ env: NodeJ
  * otherwise chase failures the wrong Node causes).
  */
 async function runEnv(ctx: Ctx, agent?: AgentConfig): Promise<NodeJS.ProcessEnv> {
+  return (await agentRunEnv(ctx, agent)).env;
+}
+
+/** runEnv plus what an agent's sandboxed shell must read to run that toolchain (the Node install). */
+async function agentRunEnv(ctx: Ctx, agent?: AgentConfig): Promise<{ env: NodeJS.ProcessEnv; readablePaths: string[] }> {
   const tc = await runToolchain(ctx, agent);
   if (!ctx.dryRun && tc.node.source === "unresolved") throw new BlockedError(`toolchain: ${describeNode(tc.node)}`);
-  return tc.env;
+  return { env: tc.env, readablePaths: toolchainReadPaths(tc.node) };
 }
 
 /** Sandbox for setup/check commands in a worktree. Fails closed when required and unavailable. */
@@ -199,10 +211,19 @@ async function guarded<T>(ctx: Ctx, label: string, fn: () => Promise<T>): Promis
   const paths = tripwireSet(ctx);
   const before = takeTripwire(paths);
   const result = await fn();
-  const changed = compareTripwire(before, takeTripwire(paths));
+  const after = takeTripwire(paths);
+  const changed = compareTripwire(before, after);
   if (changed.length > 0) {
-    ctx.writeArtifact("tripwire", `tripwire hit during ${label}`, `tripwire-${Date.now()}.json`, JSON.stringify({ label, changed }, null, 2));
-    throw new FailedError(`unexpected change outside the worktree during ${label}: ${changed.join(", ")}. Inspect these files before doing anything else.`);
+    // Fail closed: a change is never attributed or excused. The artifact records evidence (hashes and
+    // metadata, never contents) so the operator can tell an escape from a concurrent writer.
+    const details = describeTripwireChanges(before, after);
+    const file = `tripwire-${Date.now()}.json`;
+    ctx.writeArtifact("tripwire", `tripwire hit during ${label}`, file, JSON.stringify({ label, window: { from: before.takenAt, to: after.takenAt }, changed, details }, null, 2));
+    throw new FailedError(
+      `unexpected change outside the worktree during ${label}: ${changed.join(", ")}. ` +
+        `Inspect these files before doing anything else. Any process running as you can change them, including sessions outside the orchestrator; ` +
+        `see ${file} for the evidence (window ${before.takenAt} – ${after.takenAt}).`,
+    );
   }
   return result;
 }
@@ -238,17 +259,6 @@ function assertNoSecrets(ctx: Ctx, text: string, where: string): void {
   if (hits.length > 0) {
     throw new FailedError(`possible secret in ${where} (${hits.join(", ")}); nothing was pushed. Inspect the worktree before continuing.`);
   }
-}
-
-function matchGlob(path: string, pattern: string): boolean {
-  const re = new RegExp(
-    `^${pattern
-      .split("**")
-      .map((part) => part.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]"))
-      .join(".*")}$`,
-  );
-  const base = path.split("/").pop() ?? path;
-  return re.test(path) || (!pattern.includes("/") && re.test(base));
 }
 
 export function forbiddenFiles(files: ChangedFile[], patterns: string[]): string[] {
@@ -430,7 +440,7 @@ const planning: Handler<RunContext> = async (ctx) => {
     const prompt = plannerPrompt(issue, criteria.criteria, inspection.guidanceFiles, brief?.body);
     ctx.writeArtifact("prompt", "planner prompt", "plan.prompt.md", prompt);
     const remaining = enforceLimits(ctx, "planning");
-    const env = await runEnv(ctx, plannerCfg);
+    const { env, readablePaths } = await agentRunEnv(ctx, plannerCfg);
     const result = await ctx.effect({
       key: "agent.plan",
       permission: "agents.run",
@@ -448,6 +458,7 @@ const planning: Handler<RunContext> = async (ctx) => {
             artifactPrefix: "plan",
             timeoutMs: plannerCfg.timeout_minutes * 60_000,
             env,
+            readablePaths,
             signal: ctx.signal,
             ...(claudeBudget(plannerCfg, remaining) !== undefined ? { maxBudgetUsd: claudeBudget(plannerCfg, remaining)! } : {}),
           }),
@@ -558,7 +569,7 @@ async function implementerRound(ctx: Ctx, attempt: number, trigger: Round["trigg
   const worktree = require(c.worktreePath, "worktreePath");
   const baseSha = require(c.baseSha, "baseSha");
   const agent = provider(ctx, config.agents.implementer);
-  const env = await runEnv(ctx, config.agents.implementer);
+  const { env, readablePaths } = await agentRunEnv(ctx, config.agents.implementer);
   const remaining = enforceLimits(ctx, `implementer round ${attempt}`);
   const prefix = `implement-${attempt}`;
   ctx.writeArtifact("prompt", `implementer prompt (round ${attempt})`, `${prefix}.prompt.md`, prompt);
@@ -585,6 +596,7 @@ async function implementerRound(ctx: Ctx, attempt: number, trigger: Round["trigg
           artifactPrefix: prefix,
           timeoutMs: config.agents.implementer.timeout_minutes * 60_000,
           env,
+          readablePaths,
           signal: ctx.signal,
           ...(budget !== undefined ? { maxBudgetUsd: budget } : {}),
         }),
@@ -623,7 +635,8 @@ async function implementerRound(ctx: Ctx, attempt: number, trigger: Round["trigg
   const bad = forbiddenFiles(changedFiles, config.forbidden_paths);
   if (bad.length) throw new BlockedError(`branch contains forbidden paths: ${bad.join(", ")}`);
   assertNoSecrets(ctx, await adapters.workspace.diff(worktree, baseSha), `the diff after round ${attempt}`);
-  if (trigger !== "initial" && !commitSha && headSha === c.rounds.at(-1)?.commitSha) {
+  const previousHead = c.rounds.at(-1)?.screenshots?.commitSha ?? c.rounds.at(-1)?.commitSha;
+  if (trigger !== "initial" && !commitSha && headSha === previousHead) {
     throw new BlockedError(`implementer made no changes in response to ${trigger} feedback (round ${attempt})`);
   }
   ctx.log("info", "verify.changes", `${changedFiles.length} file(s) changed vs base; HEAD ${headSha.slice(0, 8)}`, { files: changedFiles });
@@ -657,6 +670,11 @@ function openQuestions(c: RunContext): string[] {
 
 type BaselineResult = Omit<CheckResult, "outputTail">;
 
+/** What the baseline runs: every check, plus the screenshot command (it must work before the agent starts). */
+export function baselineChecks(config: Pick<RepoConfig, "checks" | "screenshots">): CheckConfig[] {
+  return [...config.checks, ...(config.screenshots ? [screenshotCheck(config.screenshots)] : [])];
+}
+
 /**
  * A baseline counts as done only if every required check passed. Optional checks may be red.
  * Runs stored before this rule may hold a red baseline: that is never accepted either.
@@ -675,7 +693,8 @@ export function baselineAccepted(baseline: BaselineResult[] | null | undefined, 
 async function ensureGreenBaseline(ctx: Ctx, worktree: string): Promise<void> {
   const { config, adapters } = ctx;
   const c = ctx.run.context;
-  if (baselineAccepted(c.baseline, config.checks)) {
+  const checks = baselineChecks(config);
+  if (baselineAccepted(c.baseline, checks)) {
     ctx.log("info", "baseline.reused", `Baseline already green on ${c.baseSha?.slice(0, 8)}; not re-running`);
     return;
   }
@@ -688,7 +707,7 @@ async function ensureGreenBaseline(ctx: Ctx, worktree: string): Promise<void> {
   try {
     results = await runChecks(ctx, {
       worktree,
-      checks: config.checks,
+      checks,
       keyPrefix: `baseline.${attempt}`,
       logPrefix: attempt === 1 ? "baseline" : `baseline-${attempt}`,
       defaultNetwork: config.isolation.checks_network,
@@ -709,12 +728,14 @@ async function ensureGreenBaseline(ctx: Ctx, worktree: string): Promise<void> {
     throw new BlockedError(reason);
   };
   if (red.length) {
+    const shots = red.find((r) => r.name === SCREENSHOT_CHECK_NAME);
     fail(
       `base ${c.baseSha?.slice(0, 8)} is red before any change: ${red.map((r) => r.name).join(", ")} (see ${red[0]!.logPath}). ` +
+        (shots ? `Screenshots cannot be generated in this environment (\`${shots.command}\` failed on the untouched base; see ${shots.logPath}). ` : "") +
         "Fix the environment or the check configuration and resume (the baseline runs again), or fix the base branch and start a new run.",
     );
   }
-  if (results.length !== config.checks.length) fail(`baseline incomplete: ${results.length} of ${config.checks.length} checks ran`);
+  if (results.length !== checks.length) fail(`baseline incomplete: ${results.length} of ${checks.length} checks ran`);
   if (await adapters.workspace.hasUncommittedChanges(worktree)) fail("baseline checks modified the worktree; the check configuration must not write tracked files");
   ctx.save({ baseline: recorded, baselineFailure: null });
 }
@@ -755,10 +776,103 @@ const implementing: Handler<RunContext> = async (ctx) => {
     guidanceFiles: c.plan?.repository.guidanceFiles ?? [],
     brief: c.brief?.body ?? null,
     openQuestions: openQuestions(c),
+    screenshots: screenshotBrief(config),
   });
   const { round, sessionId } = await implementerRound(ctx, 0, "initial", prompt);
   return { to: "TESTING", patch: { rounds: [...c.rounds, round], implementerSessionId: sessionId } };
 };
+
+// ---- screenshots -------------------------------------------------------------------
+
+function screenshotBrief(config: RepoConfig): ScreenshotBrief | null {
+  const s = config.screenshots;
+  return s ? { run: s.run, outputs: s.outputs, whenChanged: s.when_changed } : null;
+}
+
+type ScreenshotOutcome =
+  | { kind: "skipped" }
+  | { kind: "ok"; record: NonNullable<Round["screenshots"]> }
+  | { kind: "problem"; reason: string; result?: CheckResult };
+
+/**
+ * Generate screenshots from the checked commit: run the configured command in the check sandbox
+ * (network none, localhost allowed), take only the image files it wrote that match the outputs,
+ * and commit exactly those. Problems the implementer can fix (the command fails, writes nothing,
+ * writes something that is not a usable image) go back to it as feedback. The environment was
+ * proven able to run the command by the baseline, when baseline checks are on.
+ */
+async function takeScreenshots(ctx: Ctx, worktree: string, commit: string): Promise<ScreenshotOutcome> {
+  const { config, adapters, run } = ctx;
+  const cfg = config.screenshots;
+  if (!cfg) return { kind: "skipped" };
+  const baseSha = require(run.context.baseSha, "baseSha");
+  if (!screenshotsRequired(cfg, await adapters.workspace.changedFiles(worktree, baseSha))) {
+    ctx.log("info", "screenshots.skipped", `No screenshots: the change touches none of ${cfg.when_changed.join(", ")}`);
+    return { kind: "skipped" };
+  }
+  const check = screenshotCheck(cfg);
+  const env = await runEnv(ctx);
+  const sandbox = checkSandbox(ctx, worktree, "none");
+  // Anything the command leaves uncommitted that was not there before is its output. On a problem it
+  // is discarded, so no rejected or unreviewed file reaches the implementer's next commit.
+  const dirtyBefore = new Set(await adapters.workspace.uncommittedPaths(worktree));
+  const leftovers = async () => (await adapters.workspace.uncommittedPaths(worktree)).filter((p) => !dirtyBefore.has(p));
+  const problem = async (reason: string, result?: CheckResult): Promise<ScreenshotOutcome> => {
+    await adapters.workspace.discardPaths(worktree, await leftovers());
+    return { kind: "problem", reason, ...(result ? { result } : {}) };
+  };
+  const out = await ctx.effect({
+    key: `screenshots.${run.attempt}.${commit}`,
+    permission: "local.checks",
+    description: `generate screenshots: ${cfg.run}`,
+    simulate: () => null,
+    run: () =>
+      guarded(ctx, "screenshots", async () => {
+        const since = Date.now() - 1_000;
+        const result = await adapters.checks.run({
+          name: check.name,
+          command: check.run,
+          cwd: worktree,
+          env,
+          timeoutMs: check.timeout_minutes * 60_000,
+          optional: false,
+          logPath: join(ctx.artifactDir, `screenshots-${run.attempt}.log`),
+          signal: ctx.signal,
+          sandbox,
+        });
+        return { result, ...(result.ok ? collectScreenshots(worktree, cfg, since) : { files: [], problems: [] }) };
+      }),
+  });
+  ctx.throwIfStopped();
+  const { result, files, problems } = require(out, "screenshot result");
+  ctx.log(result.ok ? "info" : "warn", "check.result", `${result.ok ? "✓" : "✗"} screenshots (${Math.round(result.durationMs / 1000)}s)${result.ok ? `: ${files.length} file(s)` : ` exit ${result.exitCode}${result.timedOut ? " (timeout)" : ""}`}`);
+  if (!result.ok) return problem(`the command failed (exit ${result.exitCode ?? "timeout"})`, result);
+  if (problems.length) return problem(`unusable screenshot files: ${problems.join("; ")}`, result);
+  if (files.length === 0) return problem(`the command succeeded but wrote no image matching ${cfg.outputs.join(", ")}`, result);
+  const forbidden = forbiddenFiles(files.map((f) => ({ status: "A", path: f.path })), config.forbidden_paths);
+  if (forbidden.length) throw new BlockedError(`screenshot outputs match forbidden_paths (${forbidden.join(", ")}); fix screenshots.outputs`);
+
+  const message = ctx.redactor.redact(`${run.issueKey}: screenshots\n\nGenerated by orchestrator run ${run.id} from ${commit.slice(0, 12)} with: ${cfg.run}`);
+  const commitSha = await ctx.effect({
+    key: `git.commit.screenshots.${run.attempt}.${commit}`,
+    permission: "local.worktree",
+    description: `commit ${files.length} screenshot(s) in ${worktree}`,
+    simulate: () => null,
+    run: async () => {
+      try {
+        return await adapters.workspace.commitPaths(worktree, files.map((f) => f.path), message);
+      } catch (err) {
+        throw new BlockedError(`could not commit the screenshots (${(err as Error).message.split("\n")[0]}); screenshots.outputs must not be gitignored`);
+      }
+    },
+  });
+  const stray = await leftovers();
+  if (stray.length) {
+    return problem(`the command also changed files outside screenshots.outputs (${stray.slice(0, 5).join(", ")}${stray.length > 5 ? ", …" : ""}); it may only write screenshots and ignored build output`, result);
+  }
+  ctx.log("info", "screenshots.result", `${files.length} screenshot(s) ${commitSha ? `committed as ${commitSha.slice(0, 8)}` : "unchanged since the last commit"}: ${files.map((f) => f.path).join(", ")}`);
+  return { kind: "ok", record: { command: cfg.run, files, commitSha: commitSha ?? null } };
+}
 
 // ---- TESTING -----------------------------------------------------------------------
 
@@ -785,9 +899,20 @@ const testing: Handler<RunContext> = async (ctx) => {
   const last = rounds.at(-1);
   if (last) last.checks = results.map(({ outputTail: _t, ...rest }) => rest);
   const failed = results.filter((r) => !r.ok && !r.optional);
-  if (failed.length === 0) return { to: "REVIEWING", patch: { rounds, lastChecks: results } };
-
   const max = config.merge.max_fix_attempts;
+  if (failed.length === 0) {
+    const shots = await takeScreenshots(ctx, worktree, commit);
+    if (shots.kind === "ok" && last) last.screenshots = shots.record;
+    if (shots.kind !== "problem") return { to: "REVIEWING", patch: { rounds, lastChecks: results } };
+    ctx.log("warn", "screenshots.result", `✗ screenshots: ${shots.reason}`);
+    if (run.attempt >= max) return { to: "FAILED", reason: `screenshots still missing after ${max} correction round(s): ${shots.reason}`, patch: { rounds, lastChecks: results } };
+    return {
+      to: "FIXING",
+      reason: `screenshots: ${shots.reason}`,
+      patch: { rounds, lastChecks: results, feedback: { trigger: "checks", prompt: fixPromptForScreenshots({ reason: shots.reason, result: shots.result ?? null, brief: screenshotBrief(config)! }, run.attempt + 1, max) } },
+    };
+  }
+
   if (run.attempt >= max) {
     return { to: "FAILED", reason: `checks still failing after ${max} correction round(s): ${failed.map((f) => f.name).join(", ")}`, patch: { rounds, lastChecks: results } };
   }
@@ -813,7 +938,17 @@ const reviewing: Handler<RunContext> = async (ctx) => {
   const prefix = `review-${run.attempt}`;
 
   const previous = c.lastReview ? decideReview(c.lastReview, config.review.blocking_severities).blocking : [];
-  const prompt = reviewerPrompt({ issue: require(c.issue, "issue"), criteria: c.plan?.acceptanceCriteria.criteria ?? [], baseSha, headSha, checks: c.lastChecks ?? [], previous, brief: c.brief?.body ?? null });
+  const shots = c.rounds.at(-1)?.screenshots ?? null;
+  const prompt = reviewerPrompt({
+    issue: require(c.issue, "issue"),
+    criteria: c.plan?.acceptanceCriteria.criteria ?? [],
+    baseSha,
+    headSha,
+    checks: c.lastChecks ?? [],
+    previous,
+    brief: c.brief?.body ?? null,
+    screenshots: shots ? { command: shots.command, files: shots.files.map((f) => f.path), commitSha: shots.commitSha } : null,
+  });
   ctx.writeArtifact("prompt", `review prompt (round ${run.attempt})`, `${prefix}.prompt.md`, prompt);
 
   const result = await ctx.effect({
@@ -833,6 +968,7 @@ const reviewing: Handler<RunContext> = async (ctx) => {
           timeoutMs: config.agents.reviewer.timeout_minutes * 60_000,
           env,
           signal: ctx.signal,
+          ...(shots?.files.length ? { images: shots.files.map((f) => join(worktree, f.path)) } : {}),
         }),
       ),
   });
@@ -920,6 +1056,7 @@ const prOpen: Handler<RunContext> = async (ctx) => {
       reviewedSha,
       openQuestions: openQuestions(c),
       briefSource: c.brief?.source.split("/").slice(-4).join("/") ?? null,
+      screenshots: (last?.screenshots?.files ?? []).map((f) => ({ path: f.path, url: `https://github.com/${config.repo}/blob/${reviewedSha}/${f.path.split("/").map(encodeURIComponent).join("/")}?raw=true` })),
     }),
   );
   // Last line of defence before anything leaves the machine.

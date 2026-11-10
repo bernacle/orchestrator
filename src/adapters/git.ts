@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { runChecked, runProcess } from "../core/exec.js";
 import { NODE_VERSION_FILES, parseNodePin } from "./checks.js";
@@ -145,6 +145,36 @@ export class GitWorkspace implements Workspace {
     return this.headSha(worktreePath);
   }
 
+  async uncommittedPaths(worktreePath: string): Promise<string[]> {
+    const r = await runProcess("git", [...SAFE_GIT, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], { cwd: worktreePath, env: { ...this.env, GIT_TERMINAL_PROMPT: "0" } });
+    if (r.exitCode !== 0) throw new Error(`git status failed: ${r.stderr.trim()}`);
+    return r.stdout
+      .split("\0")
+      .filter((e) => e.length > 3)
+      .map((e) => e.slice(3));
+  }
+
+  async discardPaths(worktreePath: string, paths: string[]): Promise<void> {
+    const root = resolve(worktreePath);
+    for (const path of paths) {
+      const abs = resolve(root, path);
+      if (!abs.startsWith(root + sep)) continue; // never outside the worktree
+      const tracked = (await runProcess("git", [...SAFE_GIT, "cat-file", "-e", `HEAD:${path}`], { cwd: worktreePath })).exitCode === 0;
+      if (tracked) await this.git(worktreePath, ["checkout", "HEAD", "--", path]);
+      else if (existsSync(abs) || isLink(abs)) rmSync(abs, { force: true, recursive: false });
+    }
+  }
+
+  async commitPaths(worktreePath: string, paths: string[], message: string): Promise<string | null> {
+    if (paths.length === 0) return null;
+    // No --force: a path the repository ignores is refused by git instead of being committed.
+    await this.git(worktreePath, ["add", "--", ...paths]);
+    const staged = await runProcess("git", [...SAFE_GIT, "diff", "--cached", "--quiet", "--", ...paths], { cwd: worktreePath });
+    if (staged.exitCode === 0) return null;
+    await this.git(worktreePath, ["commit", "--quiet", "-m", message, "--", ...paths]);
+    return this.headSha(worktreePath);
+  }
+
   async filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>> {
     const out: Array<{ path: string; exists: boolean }> = [];
     for (const path of paths) {
@@ -167,6 +197,14 @@ export class GitWorkspace implements Workspace {
   async push(worktreePath: string, branch: string): Promise<void> {
     // Plain push: never --force. A rejected push surfaces as an error for a human.
     await this.git(worktreePath, ["push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000);
+  }
+}
+
+function isLink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 

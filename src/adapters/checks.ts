@@ -1,6 +1,6 @@
-import { createWriteStream, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { runProcess } from "../core/exec.js";
 import { childEnv, sandboxedShell, type IsolationDirs, type SandboxSpec } from "../core/isolation.js";
 import type { Redactor } from "../core/redact.js";
@@ -66,7 +66,14 @@ export interface ResolvedToolchain {
     requested: string | null;
     /** Where `requested` came from (e.g. ".nvmrc (refines toolchain.node 24)"). */
     from?: string | null;
+    /**
+     * The real directory of the `node` executable, first on PATH for checks and agents, so neither
+     * goes through a version-manager shim (asdf, mise, nodenv) that picks a version per directory
+     * and must read its own install to do so. Null only if the executable could not be located.
+     */
     binDir: string | null;
+    /** The Node installation (binDir's parent): agent sandboxes must be able to read it to run node. */
+    home?: string | null;
     /** What `node --version` reports with the exact environment and directory checks use. */
     version: string | null;
     source: "path" | "nvm" | "unresolved" | "not-required";
@@ -144,7 +151,10 @@ export async function resolveToolchain(
   const base = { requested: pin.spec, from: pin.source };
 
   const onPath = await nodeVersion("node", prepare(env), cwd);
-  if (nodeMatches(onPath, pin.spec)) return { env, node: { ...base, binDir: null, version: onPath, source: "path" } };
+  if (nodeMatches(onPath, pin.spec)) {
+    const pinned = await pinRealNode(env, pin.spec, prepare, cwd);
+    return { env: pinned?.env ?? env, node: { ...base, binDir: pinned?.binDir ?? null, home: pinned ? dirname(pinned.binDir) : null, version: onPath, source: "path" } };
+  }
 
   const nvmDir = join(baseEnv.NVM_DIR ?? join(homedir(), ".nvm"), "versions", "node");
   if (existsSync(nvmDir)) {
@@ -156,8 +166,8 @@ export async function resolveToolchain(
       const withBin = { ...env, PATH: [binDir, env.PATH ?? ""].filter(Boolean).join(delimiter) };
       const version = await nodeVersion("node", prepare(withBin), cwd);
       if (nodeMatches(version, pin.spec)) {
-        env.PATH = withBin.PATH;
-        return { env, node: { ...base, binDir, version, source: "nvm" } };
+        const pinned = await pinRealNode(withBin, pin.spec, prepare, cwd);
+        return { env: pinned?.env ?? withBin, node: { ...base, binDir: pinned?.binDir ?? binDir, home: dirname(pinned?.binDir ?? binDir), version, source: "nvm" } };
       }
     }
   }
@@ -186,6 +196,31 @@ export async function resolveRunToolchain(input: {
   const node = conflict ? { ...tc.node, source: "unresolved" as const, detail: conflict } : tc.node;
   // `env` is what children get; `toolchainEnv` is the unscrubbed base (PATH adjusted) for callers that scrub differently.
   return { env: prepare(tc.env), node, toolchainEnv: tc.env };
+}
+
+/**
+ * Put the real directory of the matching `node` first on PATH. `node` may be a shim that execs the
+ * real binary; asking the running Node for its own path gets past any number of shims. The pin is
+ * kept only if `node` still reports a matching version afterwards.
+ */
+async function pinRealNode(env: NodeJS.ProcessEnv, spec: string, prepare: (e: NodeJS.ProcessEnv) => NodeJS.ProcessEnv, cwd?: string): Promise<{ env: NodeJS.ProcessEnv; binDir: string } | null> {
+  let binDir: string;
+  try {
+    const r = await runProcess("node", ["-p", "process.execPath"], { env: prepare(env), timeoutMs: 10_000, ...(cwd ? { cwd } : {}) });
+    const execPath = r.exitCode === 0 ? r.stdout.trim().split("\n").at(-1) : undefined;
+    if (!execPath || !isAbsolute(execPath)) return null;
+    binDir = dirname(realpathSync(execPath));
+  } catch {
+    return null;
+  }
+  const rest = (env.PATH ?? "").split(delimiter).filter((p) => p && p !== binDir);
+  const pinned = { ...env, PATH: [binDir, ...rest].join(delimiter) };
+  return nodeMatches(await nodeVersion("node", prepare(pinned), cwd), spec) ? { env: pinned, binDir } : null;
+}
+
+/** Paths outside the worktree an agent's sandboxed shell must read to run the resolved toolchain. */
+export function toolchainReadPaths(node: ResolvedToolchain["node"]): string[] {
+  return node.home ? [node.home] : node.binDir ? [node.binDir] : [];
 }
 
 /** Human-readable toolchain line for plans, doctor and blockers. */

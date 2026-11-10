@@ -9,6 +9,7 @@ This page states what the orchestrator isolates, how each claim was verified, an
 | Orchestrator (git, gh, Linear API) | its own code only | you | none needed: repository hooks and fsmonitor are disabled for every git call (`-c core.hooksPath=/dev/null -c core.fsmonitor=false`) |
 | Setup (`pnpm install`) | package lifecycle scripts | you | **Seatbelt** + scrubbed env, network outbound |
 | Checks (lint, tests, build, oracle) | repository code, including the agent's changes | you | **Seatbelt** + scrubbed env, **no network** |
+| Screenshots (`screenshots.run`, e.g. Playwright) | repository code and a local browser + server | you | **Seatbelt** + scrubbed env, **no network except localhost**; only validated image files are committed |
 | Implementer (Claude Code) | the model's shell commands, plus tests it runs | you | **Claude Code sandbox** (Seatbelt) for Bash; permission fences for file tools |
 | Reviewer (Codex) | read-only shell commands | you | **Codex read-only sandbox** (Seatbelt); output redacted |
 | Planner (Claude Code) | none (Read/Grep/Glob only) | you | permission fences; no shell |
@@ -21,17 +22,20 @@ The main V1 hole was the checks. They execute code the agent just wrote (a test 
 
 **2. Seatbelt for setup and checks** (`seatbeltProfile`, run through `/usr/bin/sandbox-exec`):
 - writes denied everywhere except the worktree, temp dirs and package caches (pnpm store, `~/Library/Caches`, `~/.cache`)
-- reads denied for `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, `~/.t3/userdata`, `~/.codex`, Claude config dirs, `~/Library/Keychains`, and the orchestrator's DB, runs and repo configs
+- reads denied for `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, `~/.gitconfig`, `~/.config/git/config`, `~/.t3/userdata`, `~/.codex`, Claude config dirs, `~/Library/Keychains`, and the orchestrator's DB, runs and repo configs. The global git config is denied because it can hold tokens (a `url.<…>.insteadOf` with credentials in the URL); children never need it, since `GIT_CONFIG_GLOBAL` points at an empty file
 - mach-lookup to the keychain services denied
 - network: none for checks (loopback allowed), outbound for setup
 
 **3. Claude Code's own sandbox for the implementer.** It's configured with `--settings`, and `--setting-sources ""` so neither the repository's `.claude/settings*.json` nor your user settings apply:
 
 ```json
-{ "disableAllHooks": true, "disableClaudeAiConnectors": true, "enableAllProjectMcpServers": false,
+{ "disableAllHooks": true, "disableClaudeAiConnectors": true, "enableAllProjectMcpServers": false, "autoMemoryEnabled": false,
   "permissions": { "blockReadsOutsideWorkingDirectories": true, "blockWritesOutsideWorkingDirectories": true, "deny": ["Bash(git push:*)", "Bash(gh:*)", "Bash(curl:*)", "…", "WebFetch", "WebSearch"] },
   "sandbox": { "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false, "autoAllowBashIfSandboxed": false,
-               "filesystem": { "denyRead": ["~/.ssh", "…credential paths…"] }, "network": { "allowedDomains": [] },
+               "filesystem": { "denyRead": ["~/.ssh", "…credential paths…"],
+                               "allowRead": ["~/.cache/node/corepack", "<pinned Node install>", "~/.orchestrator/isolation/gitconfig-empty", "…/gh-empty"],
+                               "allowWrite": ["~/.cache/node/corepack"] },
+               "network": { "allowedDomains": [] },
                "credentials": { "envVars": [{ "name": "GH_TOKEN", "mode": "deny" }, "…"] } } }
 ```
 
@@ -40,13 +44,15 @@ More constraints on the implementer:
 - `--strict-mcp-config` loads no MCP servers.
 - Shell commands must also match the repository's allow-list. Anything else is denied (`--permission-prompts none`).
 - `disableClaudeAiConnectors` matters: without it, the implementer could reach your Linear workspace through a claude.ai connector, even with no API key in its environment.
+- **Auto memory is off** (`autoMemoryEnabled: false` in the settings, and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the environment of every Claude process). Claude Code keys auto memory on the *repository*, not the worktree: every worktree of the orchestrator's clone shares `<config dir>/projects/<clone>/memory/`. It is written outside the worktree despite `blockWritesOutsideWorkingDirectories`, and loaded into every later session. During BRU-485 (run `bru-485-3eb103`) an implementer saved "checks can't run here, don't retry" there, and the next run loaded it. Subscription auth is unaffected (`--bare` would also disable memory, but it ignores OAuth). Verified on 2.1.318 with a canary `MEMORY.md`: loaded by a default session, not loaded and no memory directory offered under the orchestrator's settings. Claude still writes its session transcripts under `<config dir>/projects/`, which `--resume` needs for fix rounds.
+- **Reads outside the worktree.** With `blockReadsOutsideWorkingDirectories`, Claude Code's Bash sandbox can read nothing under your home directory outside the worktree except `allowRead`. Three things are allowed: the corepack cache, the empty git/gh config stubs, and the **real** directory of the pinned Node. The orchestrator resolves that directory by asking the matching `node` for `process.execPath`, and puts it first on PATH for checks and agents alike. A version-manager shim such as `~/.asdf/shims/node` is therefore never executed inside the agent sandbox, where it fails with `Operation not permitted` because it cannot read `~/.asdf`. Nothing else becomes readable, and nothing becomes writable.
 
 **4. Tripwires.** Around every agent step and every setup/check command, the orchestrator fingerprints:
 - shell startup files, `~/.gitconfig`, `~/.npmrc` and `~/.ssh/authorized_keys`/`config`
 - Claude/Codex settings
 - the clone's `.git/config`, `hooks/`, `info/attributes`, `HEAD`, `packed-refs` and `refs/`
 
-Any change **fails** the run (it never auto-resumes), with the changed paths listed.
+Any change **fails** the run (it never auto-resumes), with the changed paths listed. There is no allow-list of "noisy" files. The artifact `tripwire-<ms>.json` records the snapshot window, both content fingerprints, and the file's current size, mtime, ctime, birth time and inode. It never records contents, because a changed file may hold a credential. A new inode or a birth time inside the window means the file was replaced, the way `git config` writes. The tripwire cannot tell *who* wrote a file: any process running as you can, including sessions that have nothing to do with the orchestrator. Inspect the change before deciding.
 
 **5. Secret scan before publishing.** After every commit, and again before push, the full diff and the PR body are scanned. The scan looks for token shapes (GitHub, Linear, Anthropic/OpenAI, Slack, AWS, private keys) and for the exact values of secrets in your environment, including the `gh` keyring token. A hit fails the run before anything is pushed.
 
@@ -88,7 +94,7 @@ These are re-checked on every `pnpm test` run on macOS (`test/unit/isolation.tes
 - **Setup has network.** Install scripts can reach the internet, but they cannot read credentials or write outside the worktree and caches.
 - **Caches are shared.** A sandboxed command can write to the pnpm store and `~/Library/Caches`, so cache poisoning across repositories is possible.
 - **Linux and Windows.** There's no check sandbox there yet, so live runs are blocked (fail closed). Bubblewrap support is on the roadmap.
-- **Tripwires detect a fixed set of paths** outside the worktree. They're not a complete filesystem audit.
+- **Tripwires detect a fixed set of paths** outside the worktree. They're not a complete filesystem audit, and they cannot attribute a change. A concurrent `git config --global` from another terminal or agent session fails the run exactly like an escape would. That is deliberate: run live runs while nothing else rewrites your dotfiles, or inspect and start a new run.
 
 ## Unattended execution: disabled
 

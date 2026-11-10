@@ -96,6 +96,23 @@ merge:
 
 Swap roles per repository (Codex implements and Claude reviews, for example) by changing `agents`. `isolation`, `limits` and `baseline_checks` are covered in [docs/isolation.md](docs/isolation.md).
 
+### Screenshots of UI changes
+
+For UI work, the orchestrator itself generates the screenshots from the implementation, using a command the repository already has:
+
+```yaml
+screenshots:
+  run: pnpm build && pnpm test:smoke        # e.g. Playwright smoke tests that call page.screenshot
+  outputs: ["docs/design/**/screenshots/*.png"]
+  when_changed: ["apps/**", "packages/react/**"]   # required only for changes touching these (empty: always)
+```
+
+- **When it runs:** after the checks pass, in the check sandbox (scrubbed env, credentials unreadable, no network except localhost).
+- **What is kept:** only regular PNG/JPEG/WebP files the command wrote that match `outputs`, within `max_files` and `max_file_mb`. They're committed to the branch in a commit of their own.
+- **Who sees them:** they're attached to the reviewer's prompt (`codex exec --image`) and embedded in the PR body, pinned to the reviewed commit.
+- **When it fails:** a failing command, no images, or an unusable file goes back to the implementer like a failing check. The implementer can't run the command and must never make images by hand.
+- **Environment check:** the baseline and `orchestrator preflight` also run the command on the untouched base. A machine that can't take screenshots (no browser, server won't start) blocks before any agent works.
+
 ### Operator briefs
 
 Scope and dependency decisions for one issue live in `config/briefs/<owner>/<repo>/<KEY>.md`, or `~/.orchestrator/briefs/…` to override locally. A brief is YAML front matter plus Markdown. It's authoritative over the issue text, it's given to the planner, implementer and reviewer, and its SHA-256 is recorded in the plan. See [the BRU-488 brief](config/briefs/bernacle/analyticool/BRU-488.md).
@@ -128,8 +145,8 @@ QUEUED → PLANNING → IMPLEMENTING → TESTING → REVIEWING → PR_OPEN → W
    - check agent invariants, and verify isolation (it fails closed)
    - optionally run the read-only planner
 2. **IMPLEMENTING** creates a worktree on `orch/<key>-<slug>`, runs setup (sandboxed), and runs the **baseline** checks on the untouched base: a red base blocks the run. The implementer then works in its sandbox. Afterwards the orchestrator checks the tripwires, computes the diff itself, commits it with hooks disabled, and scans the diff for secrets.
-3. **TESTING** runs every configured check, recording exit codes and logs.
-4. **REVIEWING** runs the reviewer on `git diff base...HEAD`, with the issue, the acceptance criteria and the verified check results.
+3. **TESTING** runs every configured check, recording exit codes and logs. When they pass and `screenshots` applies, it generates, validates and commits the screenshots.
+4. **REVIEWING** runs the reviewer on `git diff base...HEAD`, with the issue, the acceptance criteria, the verified check results and any orchestrator-generated screenshots.
 5. **FIXING** sends failing checks, blocking findings or CI failures back to the *same* implementer session (Claude `--resume`). Every fix is re-tested and re-reviewed. The budget is `max_fix_attempts`.
 6. **PR_OPEN** pushes (never force-pushes) and opens or reuses a **draft** PR whose body lists the changes, the orchestrator-run checks, and the review.
 7. **WAITING_FOR_CI** polls GitHub checks (`--ci-wait`, 30 min by default), then hands back. `resume` checks again.

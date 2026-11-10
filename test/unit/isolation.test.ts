@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -11,7 +11,9 @@ import {
   compareVersions,
   credentialPaths,
   defaultWritable,
+  describeTripwireChanges,
   isolationDirs,
+  isolationReadPaths,
   sandboxSupport,
   seatbeltProfile,
   takeTripwire,
@@ -99,6 +101,42 @@ describe("Claude Code isolation settings", () => {
   it("requires a Claude Code version with blockWritesOutsideWorkingDirectories", () => {
     expect(compareVersions("2.1.318", "2.1.314")).toBe(1);
     expect(compareVersions("2.1.300", "2.1.314")).toBe(-1);
+  });
+});
+
+describe("global git config", () => {
+  it("is unreadable to sandboxed children, who get an empty one instead (it can hold tokens)", () => {
+    const paths = credentialPaths({ HOME: "/Users/me" }, "/Users/me/.orchestrator");
+    expect(paths).toEqual(expect.arrayContaining(["/Users/me/.gitconfig", "/Users/me/.config/git/config"]));
+    expect(childEnv({ HOME: "/Users/me" }, { dirs }).GIT_CONFIG_GLOBAL).toBe(dirs.emptyGitConfig);
+    // The agent shell must still be able to read the empty stand-in, or every git command fails.
+    expect(isolationReadPaths(dirs)).toEqual([dirs.emptyGitConfig, dirs.emptyGhConfig]);
+  });
+});
+
+describe("Claude Code auto memory", () => {
+  it("is off in the isolation settings", () => {
+    expect(claudeIsolationSettings({ denyRead: [], deniedEnv: [], allow: [], deny: [] })).toMatchObject({ autoMemoryEnabled: false });
+  });
+});
+
+describe("tripwire evidence", () => {
+  it("records hashes and metadata, never contents, and shows a file replaced by rename (how git config writes)", () => {
+    const dir = join(scratch, "trip-evidence");
+    mkdirSync(dir, { recursive: true });
+    const f = join(dir, ".gitconfig");
+    writeFileSync(f, "[user]\n\tname = me\n");
+    const before = takeTripwire([f]);
+    const inode = statSync(f).ino;
+    writeFileSync(`${f}.lock`, "[url \"https://x-access-token:SECRET@github.com/\"]\n");
+    renameSync(`${f}.lock`, f);
+    const details = describeTripwireChanges(before, takeTripwire([f]));
+    expect(details).toHaveLength(1);
+    expect(details[0]!.path).toBe(f);
+    expect(details[0]!.before).not.toBe(details[0]!.after);
+    expect(details[0]!.now).toMatchObject({ exists: true, kind: "file" });
+    expect(details[0]!.now.inode).not.toBe(inode);
+    expect(JSON.stringify(details)).not.toContain("SECRET");
   });
 });
 
