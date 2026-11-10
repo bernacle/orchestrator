@@ -86,6 +86,9 @@ describe("skill installation", () => {
     expect(defaultTargets("codex", se).map((t) => t.dir)).toEqual([join(se.home, ".agents", "skills")]);
     const withDir = skillEnv({ ...se.env, CLAUDE_CONFIG_DIR: join(se.home, "cfg") });
     expect(defaultTargets("claude", withDir)[0]!.dir).toBe(join(se.home, "cfg", "skills"));
+    // From such a session the default home stays covered once it exists (a plain `claude` uses it).
+    mkdirSync(join(se.home, ".claude"), { recursive: true });
+    expect(defaultTargets("claude", withDir).map((t) => t.dir)).toContain(join(se.home, ".claude", "skills"));
     expect(defaultTargets("claude", se, { claudeHomes: ["/x"] }).map((t) => t.dir)).toEqual(["/x/skills"]);
     expect(t3ProviderHomes(join(se.home, "missing.json"))).toEqual({ claude: [], codex: [] });
   });

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createRealAdapters } from "./adapters/index.js";
 import { SnapshotTracker } from "./adapters/snapshot.js";
 import { detectT3Origin } from "./adapters/t3.js";
@@ -19,7 +19,7 @@ import { HANDLERS, type RunContext } from "./core/workflow.js";
 import { parseIssueRef } from "./intake/issue-ref.js";
 import { approvalChannelStatus, auditApproval, describeScope, runScope, systemApprover, type ApprovalPurpose, type ApprovalResult, type Approver } from "./core/approval.js";
 import { saveAssociation, type SavedAssociation } from "./intake/association.js";
-import { authorizeProposal, proposalFile } from "./intake/proposal.js";
+import { prepareAuthorization, writeAuthorization } from "./intake/proposal.js";
 
 export interface App {
   paths: Paths;
@@ -229,7 +229,7 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
     },
   });
   if (authorization) app.store.appendEvent(run.id, "QUEUED", "info", "run.authorized", `Live run approved by ${authorization.user} via ${authorization.channel} (scope ${authorization.scopeHash.slice(0, 12)})`, authorization);
-  return engineFor(app, loaded, snapshot, linearWorkspace).drive(run.id, { ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  return engineFor(app, loaded, snapshot, linearWorkspace).drive(run.id, { expect: { mode: run.mode, issueKey: run.issueKey, repo: run.repo }, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
 export function findRunOrThrow(app: App, id: string): RunRecord<RunContext> {
@@ -252,6 +252,8 @@ export async function resumeRun(
   if (loaded.config.repo !== run.repo) throw new ConfigError(`${loaded.source} now configures ${loaded.config.repo}, but the run is for ${run.repo}`);
   const accepted = [...new Set([...(run.context.options.acceptedDependencies ?? []), ...(opts.acceptDependencies ?? []).map((k) => k.toUpperCase())])];
 
+  // The mode decided here (approval or not) is the mode the drive uses, whatever the store says later.
+  const expect = { mode: run.mode, issueKey: run.issueKey, repo: run.repo };
   // Every resume of a live run asks a person again. The approval stored on the run is audit only:
   // the store is a file an agent can write, so a stored record can never stand in for consent.
   let authorization = run.context.authorization ?? null;
@@ -277,7 +279,7 @@ export async function resumeRun(
   });
   app.store.appendEvent(run.id, run.state, "info", "run.resume", `Resume requested at ${run.state}`);
   const snap = run.context.options.issueSnapshot;
-  return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: true, expect, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
 }
 
 /**
@@ -318,20 +320,38 @@ export async function requireApproval(
   return { purpose, scopeHash: req.scopeHash, approvedAt: res.at, channel: res.channel, user: res.user, detail: res.detail };
 }
 
-/** `orchestrator repo authorize`: grants the pending proposal's permissions after a person approves. */
-export async function authorizeRepository(app: App, repo: string, opts: { readOnly?: boolean; replace?: boolean } = {}): Promise<ReturnType<typeof authorizeProposal>> {
-  const pending = proposalFile(app.paths, repo);
-  if (!existsSync(pending)) throw new ConfigError(`no pending proposal for ${repo}; run \`orchestrator repo init\` in its checkout (or with --repo ${repo}) first`);
-  const sha = createHash("sha256").update(readFileSync(pending)).digest("hex");
+/**
+ * `orchestrator repo authorize`: grants the pending proposal's permissions after a person approves.
+ * The proposal is read, validated and frozen before asking; the prompt is built from what will be
+ * written, and the frozen bytes are what is written (the proposal is not read again afterwards).
+ */
+export async function authorizeRepository(app: App, repo: string, opts: { readOnly?: boolean; replace?: boolean } = {}): Promise<{ file: string; scope: "supervised" | "read_only"; sha256: string }> {
+  const prep = prepareAuthorization(app.paths, repo, opts);
+  const p = prep.config.permissions;
+  const grants = prep.scope === "read_only" || !p.agents.run
+    ? "dry runs only (no agent runs or remote writes)"
+    : [
+        "agent runs",
+        p.github.push ? "push" : null,
+        p.github.create_pr ? "draft PRs" : null,
+        p.github.merge ? "MERGE" : null,
+        p.linear.comment || p.linear.update_state ? "Linear updates" : null,
+      ].filter(Boolean).join(", ");
   await requireApproval(app, "authorize_repository", {
     issue: null,
     repo,
-    scopeHash: sha,
-    reason: opts.readOnly ? `authorize Orchestrator dry runs (no agent runs or remote writes) for ${repo}` : `authorize Orchestrator for ${repo} with the permissions in its proposal (agent runs, push, draft PRs; merge stays manual)`,
-    details: [`Proposal: ${pending} (sha256 ${sha.slice(0, 12)})`, `Scope:    ${opts.readOnly ? "read-only (dry runs only)" : "as proposed"}`],
+    scopeHash: createHash("sha256").update(prep.content).digest("hex"),
+    reason: `${prep.replaces ? "replace the Orchestrator authorization" : "authorize Orchestrator"} for ${repo}: ${grants}; merge ${prep.config.merge.mode}; budget $${prep.config.limits.max_run_cost_usd} per run`,
+    details: [
+      `Proposal:    ${prep.pending} (sha256 ${prep.sha256.slice(0, 12)})`,
+      `Writes:      ${prep.file}${prep.replaces ? " (replacing the existing file)" : ""}`,
+      `Scope:       ${prep.scope === "read_only" ? "read-only (dry runs only)" : "as proposed"}`,
+      `Permissions: agent runs ${p.agents.run}, push ${p.github.push}, draft PR ${p.github.create_pr}, merge ${p.github.merge}, Linear comment ${p.linear.comment}, Linear state ${p.linear.update_state}`,
+      `Merge:       ${prep.config.merge.mode}`,
+    ],
   });
-  // The proposal is re-hashed inside authorizeProposal; the approval names the same file.
-  return authorizeProposal(app.paths, repo, opts);
+  if (!opts.replace && existsSync(prep.file)) throw new ConfigError(`${prep.file} appeared while waiting for approval; nothing was written (pass --replace to overwrite it)`);
+  return writeAuthorization(prep);
 }
 
 /** `orchestrator associate`: records that an issue is this repository's work after a person approves. */

@@ -388,7 +388,7 @@ const planning: Handler<RunContext> = async (ctx) => {
   // ---- optional read-only planning
   let agentPlan: AgentPlan | null = null;
   const plannerCfg = config.agents.planner;
-  if (plannerCfg && (run.mode === "supervised" || run.context.options.withAgentPlan)) {
+  if (plannerCfg && (!ctx.dryRun || run.context.options.withAgentPlan)) {
     const planner = provider(ctx, plannerCfg);
     agents.unshift(agentAssignment("planner", plannerCfg, planner.provider, planner.describe({ ...sampleTask, cwd: clonePath, role: "planner", artifactPrefix: "plan" })));
     const prompt = plannerPrompt(issue, criteria.criteria, inspection.guidanceFiles, brief?.body);
@@ -427,7 +427,7 @@ const planning: Handler<RunContext> = async (ctx) => {
 
   const plan = buildExecutionPlan({
     runId: run.id,
-    mode: run.mode,
+    mode: ctx.dryRun ? "dry_run" : "supervised",
     now: ctx.now(),
     config,
     configSource: ctx.configSource,

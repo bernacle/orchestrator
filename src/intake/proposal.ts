@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify } from "yaml";
 import type { RepoInspection } from "../adapters/types.js";
 import { ConfigError, type Paths } from "../config/load.js";
-import { RepoConfigSchema } from "../config/schema.js";
+import { RepoConfigSchema, type RepoConfig } from "../config/schema.js";
 import { scriptNameFor } from "../planning/plan.js";
 import { safeUser } from "./association.js";
 
@@ -214,13 +214,30 @@ export function localConfigFile(paths: Paths, repo: string): string {
  * Turn a pending proposal into authorized operator config. `readOnly` removes every remote-write
  * and agent grant (dry runs only). Refuses to replace an existing config unless `replace`.
  */
-export function authorizeProposal(paths: Paths, repo: string, opts: { readOnly?: boolean; replace?: boolean; by?: string } = {}): { file: string; scope: "supervised" | "read_only"; sha256: string } {
+export interface PreparedAuthorization {
+  repo: string;
+  file: string;
+  pending: string;
+  scope: "supervised" | "read_only";
+  sha256: string;
+  replaces: boolean;
+  config: RepoConfig;
+  /** The exact bytes that will be written: frozen before anyone is asked. */
+  content: string;
+}
+
+/**
+ * Read, validate and freeze an authorization from the pending proposal. Nothing is written, so
+ * this runs before a person is asked, and what they are shown is exactly what gets written: the
+ * proposal is never read a second time (an agent could swap it while the prompt is open).
+ */
+export function prepareAuthorization(paths: Paths, repo: string, opts: { readOnly?: boolean; replace?: boolean; by?: string } = {}): PreparedAuthorization {
   const pending = proposalFile(paths, repo);
   if (!existsSync(pending)) throw new ConfigError(`no pending proposal for ${repo}; run \`orchestrator repo init\` in its checkout (or with --repo ${repo}) first`);
   const text = readFileSync(pending, "utf8");
   const sha256 = createHash("sha256").update(text).digest("hex");
   const raw = parseYaml(text) as Record<string, unknown>;
-  if (raw.repo !== repo) throw new ConfigError(`${pending} is for ${String(raw.repo)}, not ${repo}`);
+  if (!raw || typeof raw !== "object" || raw.repo !== repo) throw new ConfigError(`${pending} is for ${String((raw as Record<string, unknown> | null)?.repo)}, not ${repo}`);
   const scope = opts.readOnly ? "read_only" : "supervised";
   if (opts.readOnly) {
     raw.permissions = { agents: { run: false }, github: { push: false, create_pr: false, merge: false }, linear: { comment: false, update_state: false } };
@@ -230,9 +247,19 @@ export function authorizeProposal(paths: Paths, repo: string, opts: { readOnly?:
   if (!parsed.success) throw new ConfigError(`${pending}: invalid configuration\n${parsed.error.issues.map((i) => `  - ${i.path.join(".")}: ${i.message}`).join("\n")}`);
   if (parsed.data.linear.teams.includes("CHANGE-ME")) throw new ConfigError(`${pending}: set linear.teams to the Linear team key(s) for ${repo} before authorizing`);
   const file = localConfigFile(paths, repo);
-  if (existsSync(file) && !opts.replace) throw new ConfigError(`${file} already exists; pass --replace to overwrite it`);
-  mkdirSync(dirname(file), { recursive: true });
+  const replaces = existsSync(file);
+  if (replaces && !opts.replace) throw new ConfigError(`${file} already exists; pass --replace to overwrite it`);
   const header = `# Authorized orchestrator configuration for ${repo} (operator-owned; never inside the repository).\n`;
-  writeFileSync(file, `${header}${stringify(raw)}`);
-  return { file, scope, sha256 };
+  return { repo, file, pending, scope, sha256, replaces, config: parsed.data, content: `${header}${stringify(raw)}` };
+}
+
+/** Write a prepared authorization. Writes the frozen content; never re-reads the proposal. */
+export function writeAuthorization(prep: PreparedAuthorization): { file: string; scope: "supervised" | "read_only"; sha256: string } {
+  mkdirSync(dirname(prep.file), { recursive: true });
+  writeFileSync(prep.file, prep.content);
+  return { file: prep.file, scope: prep.scope, sha256: prep.sha256 };
+}
+
+export function authorizeProposal(paths: Paths, repo: string, opts: { readOnly?: boolean; replace?: boolean; by?: string } = {}): { file: string; scope: "supervised" | "read_only"; sha256: string } {
+  return writeAuthorization(prepareAuthorization(paths, repo, opts));
 }

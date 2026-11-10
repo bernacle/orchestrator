@@ -7,7 +7,7 @@ import type { Paths } from "../config/load.js";
 import { PermissionGate, type Permission } from "./policy.js";
 import type { Redactor } from "./redact.js";
 import { TERMINAL_STATES, type RunState } from "./states.js";
-import { hostName, type EventLevel, type RunRecord, type Store } from "./store.js";
+import { hostName, type EventLevel, type RunMode, type RunRecord, type Store } from "./store.js";
 
 /** Thrown by handlers to park the run in BLOCKED with an actionable reason. */
 export class BlockedError extends Error {
@@ -81,6 +81,13 @@ export interface EngineOptions {
   cancelPollMs?: number;
   /** Abort from outside (Ctrl-C): leaves the run resumable. */
   interrupt?: AbortSignal;
+  /**
+   * The run identity the caller authorized (mode, issue, repository). The drive uses these values,
+   * never the stored ones: the store is a file an agent can write, so a dry run rewritten to
+   * `supervised` mid-drive must not gain live effects. A stored value that differs stops the run.
+   * Defaults to the run as read when the drive starts.
+   */
+  expect?: { mode: RunMode; issueKey: string; repo: string };
 }
 
 const TRANSIENT = /(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up|\bHTTP 5\d\d\b|rate limit|\b50[234] (?:Bad Gateway|Service Unavailable|Gateway Timeout)\b)/i;
@@ -136,11 +143,18 @@ export class Engine<C extends object> {
       opts.onEvent?.({ level, state: run.state, type, message: this.deps.redactor.redact(message) });
     };
 
+    const initial = store.getRun<C>(runId)!;
+    const pinned = opts.expect ?? { mode: initial.mode, issueKey: initial.issueKey, repo: initial.repo };
     let resumed = false;
     try {
       for (;;) {
         let run = store.getRun<C>(runId)!;
         if (TERMINAL_STATES.has(run.state)) return run;
+        if (run.mode !== pinned.mode || run.issueKey !== pinned.issueKey || run.repo !== pinned.repo) {
+          const message = `run identity changed in the store during the drive (expected ${pinned.mode} ${pinned.issueKey} on ${pinned.repo}, found ${run.mode} ${run.issueKey} on ${run.repo}); stopped without further effects`;
+          emit(run, "error", "safety.violation", message);
+          return store.transition<C>(run.id, run.version, { to: "FAILED", reason: message });
+        }
         if (run.cancelRequested || stopKind === "cancel") {
           run = store.transition<C>(run.id, run.version, { to: "CANCELLED", reason: "cancelled by operator" });
           opts.onEvent?.({ level: "warn", state: run.state, type: "run.cancelled", message: "Run cancelled" });
@@ -168,7 +182,7 @@ export class Engine<C extends object> {
         const before = run.state;
         opts.onEvent?.({ level: "info", state: run.state, type: "step.started", message: `${run.state}` });
 
-        const outcome = await this.runStep(run, handler, controller.signal, emit, () => {
+        const outcome = await this.runStep(run, pinned.mode, handler, controller.signal, emit, () => {
           if (stopKind) throw new StopError(stopKind);
         });
 
@@ -203,13 +217,14 @@ export class Engine<C extends object> {
 
   private async runStep(
     run: RunRecord<C>,
+    mode: RunMode,
     handler: Handler<C>,
     signal: AbortSignal,
     emit: (run: RunRecord<C>, level: EventLevel, type: string, message: string, data?: unknown) => void,
     throwIfStopped: () => void,
   ): Promise<Outcome<C> | null> {
     for (let attempt = 1; ; attempt++) {
-      const ctx = this.context(run, signal, emit, throwIfStopped);
+      const ctx = this.context(run, mode, signal, emit, throwIfStopped);
       try {
         return await handler(ctx);
       } catch (err) {
@@ -235,13 +250,15 @@ export class Engine<C extends object> {
 
   private context(
     run: RunRecord<C>,
+    mode: RunMode,
     signal: AbortSignal,
     emit: (run: RunRecord<C>, level: EventLevel, type: string, message: string, data?: unknown) => void,
     throwIfStopped: () => void,
   ): StepContext<C> {
     const { store, redactor } = this.deps;
-    const dryRun = run.mode === "dry_run";
-    const gate = new PermissionGate(this.deps.config.permissions, run.mode);
+    // The pinned mode, not run.mode: see EngineOptions.expect.
+    const dryRun = mode === "dry_run";
+    const gate = new PermissionGate(this.deps.config.permissions, mode);
     const artifactDir = join(this.deps.paths.runs, run.id);
     mkdirSync(artifactDir, { recursive: true });
     let current = run;

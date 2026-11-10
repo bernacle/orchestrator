@@ -86,6 +86,11 @@ export function defaultTargets(provider: Provider, se: SkillEnv, overrides: { cl
     if (overrides.claudeHomes?.length) return unique(overrides.claudeHomes.map((h) => ({ provider, dir: join(resolve(h), "skills"), why: "--claude-home" })));
     const primary = se.env.CLAUDE_CONFIG_DIR ? resolve(se.env.CLAUDE_CONFIG_DIR) : join(se.home, ".claude");
     const targets: Target[] = [{ provider, dir: join(primary, "skills"), why: se.env.CLAUDE_CONFIG_DIR ? "$CLAUDE_CONFIG_DIR" : "~/.claude (default)" }];
+    // Run from a session with its own config dir (e.g. a T3 provider home), the default home is
+    // still the one a plain `claude` uses: keep it covered when it exists, so install, update and
+    // status see the same set from every session.
+    const fallback = join(se.home, ".claude");
+    if (se.env.CLAUDE_CONFIG_DIR && existsSync(fallback)) targets.push({ provider, dir: join(fallback, "skills"), why: "~/.claude (default Claude Code home)" });
     for (const h of t3ProviderHomes(se.t3Settings).claude) targets.push({ provider, dir: join(h, "skills"), why: "T3 Claude provider home" });
     return unique(targets);
   }

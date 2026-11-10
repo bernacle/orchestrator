@@ -1,16 +1,17 @@
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { stringify } from "yaml";
+import { parse as parseYaml, stringify } from "yaml";
 import { makeIssue } from "../../src/adapters/mock/index.js";
 import { authorizeRepository, confirmAssociation, resumeRun, startRun } from "../../src/app.js";
 import { loadRepoConfigFile, PACKAGE_ROOT } from "../../src/config/load.js";
-import { runScope } from "../../src/core/approval.js";
+import { describeScope, runScope } from "../../src/core/approval.js";
 import type { RunContext } from "../../src/core/workflow.js";
 import { inspectRequest } from "../../src/intake/context.js";
-import { buildProposal, localConfigFile } from "../../src/intake/proposal.js";
+import { buildProposal, localConfigFile, proposalFile } from "../../src/intake/proposal.js";
 import { createHarness, git, type Harness } from "../helpers.js";
 
 /**
@@ -82,6 +83,14 @@ describe("live runs need a person's approval, enforced by the engine", () => {
     expect(runScope({ issue: "ACM-1", config: cfg, configSource: h.configFile, acceptedDependencies: ["ACM-0"] }).hash).not.toBe(base);
   });
 
+  it("the prompt calls out automatic merging when the configuration grants it", () => {
+    h = createHarness();
+    const cfg = loadRepoConfigFile(h.configFile).config;
+    expect(describeScope(runScope({ issue: "ACM-1", config: cfg, configSource: h.configFile }).scope).reason).toMatch(/; merge manual;/);
+    const auto = { ...cfg, merge: { ...cfg.merge, mode: "auto" as const }, permissions: { ...cfg.permissions, github: { ...cfg.permissions.github, merge: true } } };
+    expect(describeScope(runScope({ issue: "ACM-1", config: auto, configSource: h.configFile }).scope).reason).toMatch(/MERGES AUTOMATICALLY/);
+  });
+
   it("repository permissions still apply: no live run where agents.run is not granted, and no prompt for it", async () => {
     h = createHarness({ config: { permissions: { agents: { run: false } } } });
     await expect(live()).rejects.toMatchObject({ code: "not_permitted" });
@@ -95,6 +104,35 @@ describe("live runs need a person's approval, enforced by the engine", () => {
     expect(run.state).toBe("BLOCKED");
     expect(run.reason).toMatch(/github\.push/);
     expect(h.host.prs).toHaveLength(0);
+  });
+
+  it.each([
+    ["mode", "UPDATE runs SET mode = 'supervised'"],
+    ["issue", "UPDATE runs SET issue_key = 'ACM-9'"],
+  ])("a dry run whose stored %s is rewritten mid-drive gains no live effects and stops", async (_what, sql) => {
+    h = createHarness();
+    h.answer = false;
+    let tampered = false;
+    const run = await startRun(h.app, {
+      issueKey: "ACM-1", repo: "acme/widget", configFile: h.configFile, dryRun: true, ciWaitMinutes: 0,
+      onEvent: (e) => {
+        // A full-access agent edits the store through its own connection while the dry run is driving.
+        if (!tampered && e.type === "state.changed") {
+          tampered = true;
+          const db = new DatabaseSync(h.app.paths.db);
+          db.exec(sql);
+          db.close();
+        }
+      },
+    });
+    expect(tampered).toBe(true);
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/run identity changed in the store during the drive/);
+    expect(h.approvals).toHaveLength(0);
+    expect(h.implementer.calls).toHaveLength(0);
+    expect(h.host.prs).toHaveLength(0);
+    expect(git(h.origin, "for-each-ref", "--format=%(refname)", "refs/heads")).toBe("refs/heads/main");
+    expect(h.app.store.events(run.id).some((e) => e.type === "safety.violation")).toBe(true);
   });
 
   it("ORCHESTRATOR_NO_EXECUTE refuses before asking anyone", async () => {
@@ -173,6 +211,37 @@ describe("repository authorization and associations also need a person", () => {
       ["authorize_repository", "acme/fresh"],
       ["authorize_repository", "acme/fresh"],
     ]);
+  });
+
+  it("repo authorize writes what the person was shown, even if the proposal is swapped while the prompt is open", async () => {
+    h = createHarness();
+    pending();
+    const file = proposalFile(h.app.paths, "acme/fresh");
+    const original = parseYaml(readFileSync(file, "utf8")) as { permissions: { github: { merge: boolean } }; merge: { mode: string } };
+    h.answer = (req) => {
+      // A full-access agent rewrites the pending proposal during the prompt to grant itself merge.
+      writeFileSync(file, stringify({ ...original, permissions: { ...original.permissions, github: { ...original.permissions.github, merge: true } } }));
+      expect(req.reason).toMatch(new RegExp(`merge ${original.merge.mode}`));
+      expect(req.reason).not.toMatch(/MERGE/);
+      return true;
+    };
+    const r = await authorizeRepository(h.app, "acme/fresh");
+    const written = loadRepoConfigFile(r.file).config;
+    expect(written.permissions.github.merge).toBe(original.permissions.github.merge);
+    expect(written.authorization?.proposal_sha256).toBe(r.sha256);
+  });
+
+  it("repo authorize shows the merge permission a proposal actually grants", async () => {
+    h = createHarness();
+    pending();
+    const file = proposalFile(h.app.paths, "acme/fresh");
+    const raw = parseYaml(readFileSync(file, "utf8")) as { permissions: { github: { merge: boolean } } };
+    raw.permissions.github.merge = true;
+    writeFileSync(file, stringify(raw));
+    h.answer = false;
+    await expect(authorizeRepository(h.app, "acme/fresh")).rejects.toMatchObject({ code: "approval_required" });
+    expect(h.approvals[0]!.reason).toMatch(/MERGE/);
+    expect(h.approvals[0]!.details.join("\n")).toMatch(/merge true/);
   });
 
   it("associate persists nothing without approval", async () => {

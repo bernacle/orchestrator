@@ -115,7 +115,7 @@ export function describeScope(scope: RunScope, extra: { title?: string | null; l
   if (p.github.push) actions.push("pushes a branch");
   if (p.github.create_pr) actions.push("opens a draft PR");
   if (p.linear.comment || p.linear.update_state) actions.push("updates Linear");
-  const reason = `start a live Orchestrator run of ${scope.issue} on ${scope.repo}: ${actions.join(", ")}; merge ${scope.merge.mode}; budget $${scope.limits.max_run_cost_usd}`;
+  const reason = `start a live Orchestrator run of ${scope.issue} on ${scope.repo}: ${actions.join(", ")}; ${scope.merge.mode === "auto" && p.github.merge ? "MERGES AUTOMATICALLY when checks pass" : `merge ${scope.merge.mode}`}; budget $${scope.limits.max_run_cost_usd}`;
   const details = [
     `Issue:       ${scope.issue}${extra.title ? ` — ${extra.title}` : ""}`,
     `Repository:  ${scope.repo}`,
