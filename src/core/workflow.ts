@@ -219,6 +219,10 @@ export interface RunContext {
     headIsReviewed: boolean;
     outsideCommits: Array<{ sha: string; message: string }> | null;
     recordedBy: "engine" | "reconcile";
+    /** The run had delivered (every gate held on the PR head) when the PR was merged. Absent on older records. */
+    delivered?: boolean;
+    stateAtMerge?: string;
+    reasonAtMerge?: string | null;
   } | null;
   lastChecks?: CheckResult[];
   lastReview?: ReviewOutcome | null;
@@ -1708,7 +1712,7 @@ const readyToMerge: Handler<RunContext> = async (ctx) => {
   const pr = require(c.pr, "pr");
   const status = await adapters.codeHost.getPullRequest(config.repo, pr.number);
   if (status.state === "MERGED") {
-    const merged = await mergeRecord(adapters.codeHost, config.repo, status, c.reviewedSha, "engine");
+    const merged = await mergeRecord(adapters.codeHost, config.repo, status, run, "engine");
     const message = describeMerge(pr, merged);
     ctx.log("info", "pr.merged", message, merged);
     return { to: "MERGED", reason: message, patch: { merged } };

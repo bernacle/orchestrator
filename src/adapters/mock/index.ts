@@ -142,7 +142,7 @@ export class MockCodeHost implements CodeHost {
   }
 
   /** A person merges (or closes) the PR on GitHub, with whatever head the branch has then. */
-  async simulateMerge(number: number, opts: { by?: string; close?: boolean } = {}): Promise<void> {
+  async simulateMerge(number: number, opts: { by?: string; close?: boolean; at?: string } = {}): Promise<void> {
     const pr = this.prs.find((p) => p.number === number);
     if (!pr) throw new Error(`no PR ${number}`);
     pr.headSha = this.headOverride ?? (await this.headOf(pr.headRefName));
@@ -151,7 +151,7 @@ export class MockCodeHost implements CodeHost {
       return;
     }
     pr.state = "MERGED";
-    pr.mergedAt = "2026-11-11T19:13:43.000Z";
+    pr.mergedAt = opts.at ?? new Date().toISOString();
     pr.mergeCommitSha = "f".repeat(40);
     pr.mergedBy = opts.by ?? "a-person";
   }

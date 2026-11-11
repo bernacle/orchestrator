@@ -213,7 +213,7 @@ program
       const picked = (found.byId ?? found.runs.find((r) => r.mode === "supervised")) as RunRecord<RunContext> | undefined;
       if (!picked) throw new RunError(`no live run for ${found.issueKey ?? target}`);
       const run = await reconcileRunById(app, picked.id);
-      const report = buildDeliveryReport(app.store, run);
+      const report = app.redactor.redactValue(buildDeliveryReport(app.store, run)) as ReturnType<typeof buildDeliveryReport>;
       if (opts.json) printJson("delivery_report", { report, run: summarizeRun(app.store, run) });
       else console.log(renderDeliveryMarkdown(report));
     }),
@@ -235,7 +235,7 @@ program
       if (!picked) throw new RunError(`no live run for ${found.issueKey ?? target}`);
       if (!opts.json) console.error(c.dim(`Watching ${picked.id} (${picked.state}) every ${opts.interval}s for up to ${opts.timeout} min…`));
       const { run, settled } = await watchRunById(app, picked.id, { intervalMs: opts.interval * 1000, timeoutMs: opts.timeout * 60_000, signal: interruptSignal() });
-      const report = buildDeliveryReport(app.store, run);
+      const report = app.redactor.redactValue(buildDeliveryReport(app.store, run)) as ReturnType<typeof buildDeliveryReport>;
       if (opts.json) printJson("watch", { settled, report, run: summarizeRun(app.store, run) });
       else console.log(`${renderDeliveryMarkdown(report)}\n${settled ? "" : c.dim(`Still ${run.state}; nothing more to record yet. ${nextStep(run)}`)}`);
       process.exitCode = exitCodeFor(run);

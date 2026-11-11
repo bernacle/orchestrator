@@ -14,6 +14,7 @@ import type { RunContext } from "./workflow.js";
  * the next time anything settles the run). Never throws: reporting must not break a run.
  */
 const NOTIFY_WITHIN_MS = 24 * 60 * 60_000;
+const RECONCILE_BUDGET_MS = 30_000;
 
 export async function settleRun(app: App, run: RunRecord<RunContext>): Promise<{ report: DeliveryReport; path: string } | null> {
   if (run.mode !== "supervised") return null;
@@ -24,12 +25,16 @@ export async function settleRun(app: App, run: RunRecord<RunContext>): Promise<{
     app.store.appendEvent(run.id, run.state, "warn", "report.failed", `Could not write the delivery report: ${(err as Error).message}`);
     return null;
   }
-  // A notification is news only about a recent change; an old run looked at again stays quiet.
-  const recent = Date.now() - Date.parse(run.updatedAt) < NOTIFY_WITHIN_MS;
-  const n = recent ? notificationFor(app.store, run, written.report) : null;
+  // A notification is news only about a recent change: an old run looked at again, or a PR merged
+  // long ago and only now recorded (first status after an upgrade), stays quiet.
+  const changedAt = Date.parse(run.context.merged?.at ?? run.updatedAt);
+  const n = Date.now() - changedAt < NOTIFY_WITHIN_MS && app.notifier.name !== "none" ? notificationFor(app.store, run, written.report) : null;
   if (n && !app.store.events(run.id).some((e) => e.type === "notify.sent" && (e.data as { key?: string } | null)?.key === n.key)) {
-    const res = await app.notifier.send({ ...n, message: app.redactor.redact(n.message) }).catch((err: Error) => ({ ok: false, detail: err.message }));
-    app.store.appendEvent(run.id, run.state, res.ok ? "info" : "warn", "notify.sent", `${res.ok ? "Notified" : "Notification failed"} (${app.notifier.name}): ${n.message}`, { key: n.key, ok: res.ok, detail: res.detail });
+    // Claimed before sending: two concurrent settles can't both send it. A failed send is logged, not retried.
+    const message = app.redactor.redact(n.message);
+    app.store.appendEvent(run.id, run.state, "info", "notify.sent", `Notifying (${app.notifier.name}): ${message}`, { key: n.key });
+    const res = await app.notifier.send({ ...n, message }).catch((err: Error) => ({ ok: false, detail: err.message }));
+    if (!res.ok) app.store.appendEvent(run.id, run.state, "warn", "notify.failed", `Notification failed (${app.notifier.name}): ${res.detail}`, { key: n.key });
   }
   return written;
 }
@@ -46,8 +51,12 @@ function configFor(app: App, run: RunRecord<RunContext>): LoadedRepoConfig {
  */
 export async function reconcileRuns(app: App, runs: Array<RunRecord<RunContext>>, loaded?: LoadedRepoConfig): Promise<Array<RunRecord<RunContext>>> {
   const out: Array<RunRecord<RunContext>> = [];
+  // GitHub unreachable must not make status, context or a new run slow: stop at the first failure
+  // and stay within a total budget; the remaining runs are checked next time.
+  const deadline = Date.now() + RECONCILE_BUDGET_MS;
+  let unreachable = false;
   for (const candidate of runs) {
-    if (!reconcilable(candidate)) {
+    if (!reconcilable(candidate) || unreachable || Date.now() > deadline) {
       out.push(candidate);
       continue;
     }
@@ -57,7 +66,12 @@ export async function reconcileRuns(app: App, runs: Array<RunRecord<RunContext>>
       if (changed) await settleRun(app, run);
       out.push(run);
     } catch (err) {
-      app.store.appendEvent(candidate.id, candidate.state, "warn", "reconcile.failed", `Could not check PR #${candidate.context.pr?.number} now (non-fatal): ${(err as Error).message}`);
+      unreachable = true;
+      // Once an hour at most per run: an offline laptop must not fill the timeline.
+      const last = [...app.store.events(candidate.id)].reverse().find((e) => e.type === "reconcile.failed");
+      if (!last || Date.now() - Date.parse(last.ts) > 60 * 60_000) {
+        app.store.appendEvent(candidate.id, candidate.state, "warn", "reconcile.failed", `Could not check PR #${candidate.context.pr?.number} now (non-fatal; checked again later): ${(err as Error).message}`);
+      }
       out.push(app.store.getRun<RunContext>(candidate.id) ?? candidate);
     }
   }
@@ -85,8 +99,15 @@ export async function watchRun(app: App, id: string, opts: WatchOptions): Promis
     if (TERMINAL_STATES.has(run.state)) return { run, settled: true };
     if (!reconcilable(run) || Date.now() + opts.intervalMs > deadline || opts.signal?.aborted) return { run, settled: false };
     await new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, opts.intervalMs);
-      opts.signal?.addEventListener("abort", () => (clearTimeout(t), resolve()), { once: true });
+      const onAbort = () => {
+        clearTimeout(t);
+        resolve();
+      };
+      const t = setTimeout(() => {
+        opts.signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, opts.intervalMs);
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
     run = app.store.getRun<RunContext>(id)!;
   }

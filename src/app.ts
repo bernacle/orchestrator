@@ -277,7 +277,8 @@ async function settled(app: App, run: RunRecord<RunContext>): Promise<RunRecord<
 export async function reconcileRunById(app: App, id: string): Promise<RunRecord<RunContext>> {
   const run = findRunOrThrow(app, id);
   const [after] = await reconcileRuns(app, [run]);
-  await settleRun(app, after!);
+  // A process driving the run settles it itself; a report written mid-drive would be stale.
+  if (!app.store.leaseHolder(run.id)) await settleRun(app, after!);
   return app.store.getRun<RunContext>(run.id)!;
 }
 
@@ -285,7 +286,7 @@ export async function reconcileRunById(app: App, id: string): Promise<RunRecord<
 export async function watchRunById(app: App, id: string, opts: WatchOptions): Promise<{ run: RunRecord<RunContext>; settled: boolean }> {
   const run = findRunOrThrow(app, id);
   const res = await watchRun(app, run.id, opts);
-  await settleRun(app, res.run);
+  if (!app.store.leaseHolder(run.id)) await settleRun(app, res.run);
   return { run: app.store.getRun<RunContext>(run.id)!, settled: res.settled };
 }
 

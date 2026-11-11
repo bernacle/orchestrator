@@ -15,34 +15,56 @@ export function reconcilable(run: RunRecord<RunContext>): boolean {
 }
 
 /**
- * The merge as GitHub reports it. When the merged head is not the commit the engine reviewed, the
- * commits added outside the engine are listed (read-only compare), so the history says exactly what
- * the independent review did and did not cover.
+ * The last commit the engine published: every push is of an independently approved commit, so this
+ * is what the review covered on GitHub. (`reviewedSha` can be a newer local commit a later review
+ * rejected, which never reached the PR.)
  */
-export async function mergeRecord(codeHost: CodeHost, repo: string, pr: PullRequestStatus, reviewedSha: string | null | undefined, recordedBy: MergeRecord["recordedBy"]): Promise<MergeRecord> {
-  const headIsReviewed = Boolean(reviewedSha) && pr.headSha === reviewedSha;
+export function lastApprovedPush(c: RunContext): string | null {
+  return c.pushed?.at(-1) ?? c.pr?.headSha ?? (c.reviewApproved ? (c.reviewedSha ?? null) : null);
+}
+
+/** Whether the run had delivered (every gate held on the PR head) when the PR was merged. */
+function deliveredAt(run: Pick<RunRecord<RunContext>, "state" | "context">): boolean {
+  const c = run.context;
+  return run.state === "READY_TO_MERGE" && Boolean(c.merge?.eligible) && Boolean(c.reviewApproved) && c.merge?.headSha === c.reviewedSha;
+}
+
+/**
+ * The merge as GitHub reports it, measured against the last commit the engine approved and pushed.
+ * When the merged head differs, the commits added outside the engine are listed (read-only compare),
+ * so the history says exactly what the independent review did and did not cover. It also keeps
+ * whether the run had delivered at that point, so a merge of an undelivered PR is never recorded as
+ * an ordinary completion.
+ */
+export async function mergeRecord(codeHost: CodeHost, repo: string, pr: PullRequestStatus, run: Pick<RunRecord<RunContext>, "state" | "reason" | "context">, recordedBy: MergeRecord["recordedBy"]): Promise<MergeRecord> {
+  const approved = lastApprovedPush(run.context);
+  const headIsReviewed = Boolean(approved) && pr.headSha === approved;
   let outsideCommits: MergeRecord["outsideCommits"] = headIsReviewed ? [] : null;
-  if (!headIsReviewed && reviewedSha) {
-    outsideCommits = await codeHost.compareCommits(repo, reviewedSha, pr.headSha).catch(() => null);
+  if (!headIsReviewed && approved) {
+    outsideCommits = await codeHost.compareCommits(repo, approved, pr.headSha).catch(() => null);
   }
   return {
     at: pr.mergedAt ?? null,
     by: pr.mergedBy ?? null,
     mergeCommitSha: pr.mergeCommitSha ?? null,
     headSha: pr.headSha,
-    reviewedSha: reviewedSha ?? null,
+    reviewedSha: approved,
     headIsReviewed,
     outsideCommits,
     recordedBy,
+    delivered: deliveredAt(run),
+    stateAtMerge: run.state,
+    reasonAtMerge: run.reason,
   };
 }
 
 export function describeMerge(pr: { number: number }, m: MergeRecord): string {
   const who = m.by ? ` by ${m.by}` : "";
   const when = m.at ? ` at ${m.at}` : "";
-  if (m.headIsReviewed) return `PR #${pr.number} merged${who}${when} at the reviewed commit ${m.headSha.slice(0, 8)}`;
+  const undelivered = m.delivered === false ? ` before Orchestrator delivered it (the run was ${m.stateAtMerge}${m.reasonAtMerge ? `: ${m.reasonAtMerge}` : ""})` : "";
+  if (m.headIsReviewed) return `PR #${pr.number} merged${who}${when} at the reviewed commit ${m.headSha.slice(0, 8)}${undelivered}`;
   const n = m.outsideCommits?.length;
-  return `PR #${pr.number} merged${who}${when} at ${m.headSha.slice(0, 8)}, not the reviewed commit ${m.reviewedSha?.slice(0, 8) ?? "(none)"}: ${n === undefined || n === null ? "commits" : `${n} commit(s)`} added outside Orchestrator, not reviewed by it`;
+  return `PR #${pr.number} merged${who}${when}${undelivered} at ${m.headSha.slice(0, 8)}, not the reviewed commit ${m.reviewedSha?.slice(0, 8) ?? "(none)"}: ${n === undefined || n === null ? "commits" : `${n} commit(s)`} added outside Orchestrator, not reviewed by it`;
 }
 
 export interface ReconcileResult {
@@ -63,7 +85,8 @@ export async function reconcileRun(store: Store, codeHost: CodeHost, runId: stri
   if (!reconcilable(run)) return { run, changed: false, note: `nothing to reconcile at ${run.state}` };
   const owner = `${hostName()}:${process.pid}:reconcile-${randomBytes(3).toString("hex")}`;
   try {
-    store.acquireLease(runId, owner, 60_000);
+    // Longer than two GitHub calls can take (60 s each), so a resume cannot take the run mid-record.
+    store.acquireLease(runId, owner, 5 * 60_000);
   } catch (err) {
     if (err instanceof LeaseError) return { run, changed: false, note: "a process is driving this run; it records the outcome itself" };
     throw err;
@@ -87,7 +110,7 @@ export async function reconcileRun(store: Store, codeHost: CodeHost, runId: stri
       });
       return { run, changed: true, note: null };
     }
-    const merged = await mergeRecord(codeHost, run.repo, pr, run.context.reviewedSha, "reconcile");
+    const merged = await mergeRecord(codeHost, run.repo, pr, run, "reconcile");
     const message = describeMerge(ref, merged);
     if (run.state !== "READY_TO_MERGE") {
       run = store.transition<RunContext>(run.id, run.version, { to: "READY_TO_MERGE", reason: `PR #${ref.number} was merged`, event: { type: "reconcile.merged", message: `${message}; recorded without driving the run` } });
@@ -101,5 +124,7 @@ export async function reconcileRun(store: Store, codeHost: CodeHost, runId: stri
 }
 
 export function completionReason(m: MergeRecord): string {
-  return m.headIsReviewed ? "merged" : `merged with ${m.outsideCommits ? `${m.outsideCommits.length} commit(s)` : "commits"} added outside Orchestrator`;
+  const parts = [m.headIsReviewed ? "merged" : `merged with ${m.outsideCommits ? `${m.outsideCommits.length} commit(s)` : "commits"} added outside Orchestrator`];
+  if (m.delivered === false) parts.push(`before delivery (the run was ${m.stateAtMerge})`);
+  return parts.join(" ");
 }

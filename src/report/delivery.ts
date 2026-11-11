@@ -102,6 +102,9 @@ export function buildDeliveryReport(store: Store, run: RunRecord<RunContext>): D
     outcome = "completed";
     const mg = c.merged;
     headline = `Completed: ${prLabel} was merged${mg?.by ? ` by ${mg.by}` : ""}; the run is closed.`;
+    if (mg?.delivered === false) {
+      headline += ` It was merged before Orchestrator delivered it: the run was ${mg.stateAtMerge}${mg.reasonAtMerge ? ` (${mg.reasonAtMerge})` : ""}, so its checks, CI or review did not all pass on what was merged.`;
+    }
     if (mg && !mg.headIsReviewed) {
       headline += ` ${mg.outsideCommits ? `${mg.outsideCommits.length} commit(s)` : "Commits"} added outside Orchestrator after its review were merged too; Orchestrator did not review them.`;
     }
@@ -280,11 +283,17 @@ export function notificationFor(store: Store, run: RunRecord<RunContext>, report
       return {
         key: `delivered:${report.pr?.reviewedSha ?? ""}`,
         title,
-        message: `${pr} is ready for your review${report.pr?.markedReady ? "" : " (still a draft)"}: CI green, independently reviewed.${judge ? ` ${judge} acceptance criteri${judge === 1 ? "on needs" : "a need"} your judgement.` : ""}`,
+        message: `${pr} is ready for your review${report.pr?.markedReady ? "" : " (still a draft)"}: ${report.ci?.state === "pass" ? "CI green, " : ""}independently reviewed.${judge ? ` ${judge} acceptance criteri${judge === 1 ? "on needs" : "a need"} your judgement.` : ""}`,
       };
     }
-    case "completed":
-      return { key: "completed", title, message: `${pr} merged; run completed.${report.pr?.merged && !report.pr.merged.headIsReviewed ? " The merged head includes commits Orchestrator did not review." : ""}` };
+    case "completed": {
+      const mg = report.pr?.merged;
+      return {
+        key: "completed",
+        title,
+        message: `${pr} merged; run completed.${mg?.delivered === false ? " It was merged before Orchestrator delivered it." : ""}${mg && !mg.headIsReviewed ? " The merged head includes commits Orchestrator did not review." : ""}`,
+      };
+    }
     case "cancelled":
       return run.reason?.includes("closed without merging") ? { key: "cancelled", title, message: `${pr} was closed without merging; run cancelled.` } : null;
     default:

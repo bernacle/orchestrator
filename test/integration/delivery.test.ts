@@ -146,6 +146,80 @@ describe("merge reconciliation", () => {
   });
 });
 
+describe("merge records stay honest", () => {
+  it("measures a merge against the last commit Orchestrator pushed, and says the PR was merged before delivery", async () => {
+    let firstSha = "";
+    h = createHarness({
+      implement: (task, call) => {
+        if (call === 3) return { ok: false, error: "agent crashed" };
+        writeFileSync(join(task.cwd, "feature.txt"), call === 1 ? "hello\n" : "hello again\n");
+        return {};
+      },
+      // The CI fix is rejected by the reviewer: that commit stays local and is never pushed.
+      review: (_t, n) => ({ structured: n === 1 ? { verdict: "approve", summary: "ok", findings: [], criteria: [] } : { verdict: "request_changes", summary: "no", findings: [{ id: "F1", severity: "major", file: null, line: null, title: "x", detail: "", suggestion: null, actionable: true }], criteria: [] } }),
+    });
+    const origCreate = h.host.createPullRequest.bind(h.host);
+    h.host.createPullRequest = async (input) => {
+      const pr = await origCreate(input);
+      firstSha = pr.headSha;
+      return pr;
+    };
+    h.host.ciScript = (pr) => [{ name: "CI", bucket: pr.headSha === firstSha ? "fail" : "pass" }];
+    const blocked = await start();
+    expect(blocked.state).toBe("BLOCKED");
+    expect(blocked.context.reviewedSha).not.toBe(firstSha); // the rejected local commit
+
+    await h.host.simulateMerge(1);
+    const run = await reconcileRunById(h.app, blocked.id);
+    expect(run.state).toBe("COMPLETED");
+    // The merged head is exactly what Orchestrator approved and pushed: no invented outside commits.
+    expect(run.context.merged).toMatchObject({ headSha: firstSha, reviewedSha: firstSha, headIsReviewed: true, delivered: false, stateAtMerge: "BLOCKED" });
+    expect(run.reason).toBe("merged before delivery (the run was BLOCKED)");
+    const r = report(run.id);
+    expect(r.headline).toMatch(/merged before Orchestrator delivered it: the run was BLOCKED/);
+    expect(r.headline).not.toMatch(/outside Orchestrator/);
+    expect(h.notes.at(-1)?.message).toMatch(/merged before Orchestrator delivered it/);
+  });
+
+  it("says commits were added outside Orchestrator even when they cannot be listed", async () => {
+    h = createHarness();
+    const delivered = await start();
+    pushOutsideCommit(delivered.context.branch!);
+    h.host.compare = async () => {
+      throw new Error("HTTP 404");
+    };
+    await h.host.simulateMerge(1);
+    const run = await reconcileRunById(h.app, delivered.id);
+    expect(run.state).toBe("COMPLETED");
+    expect(run.context.merged?.outsideCommits).toBeNull();
+    expect(run.reason).toBe("merged with commits added outside Orchestrator");
+  });
+
+  it("an unreachable GitHub never breaks context, and is logged once", async () => {
+    h = createHarness();
+    const delivered = await start();
+    h.host.getPullRequest = async () => {
+      throw new Error("fetch failed: ENOTFOUND api.github.com");
+    };
+    const first = await inspectRequest(h.app, { issueRef: "ACM-1", repo: "acme/widget", configFile: h.configFile });
+    const second = await inspectRequest(h.app, { issueRef: "ACM-1", repo: "acme/widget", configFile: h.configFile });
+    expect(first.problems.map((p) => p.code)).toContain("active_run_exists");
+    expect(second.problems.map((p) => p.code)).toContain("active_run_exists");
+    expect(h.app.store.getRun(delivered.id)!.state).toBe("READY_TO_MERGE");
+    expect(types(delivered.id).filter((t) => t === "reconcile.failed")).toHaveLength(1);
+  });
+
+  it("a merge recorded long after it happened sends no notification", async () => {
+    h = createHarness();
+    const delivered = await start();
+    const before = h.notes.length;
+    await h.host.simulateMerge(1, { at: "2026-01-01T00:00:00.000Z" });
+    const run = await reconcileRunById(h.app, delivered.id);
+    expect(run.state).toBe("COMPLETED");
+    expect(h.notes).toHaveLength(before);
+  });
+});
+
 describe("delivery report", () => {
   it("is written when a run settles and says what is left for the person", async () => {
     h = createHarness();
@@ -248,6 +322,15 @@ describe("notifications", () => {
     expect(h.notes.map((n) => n.key)).toEqual([`delivered:${run.context.reviewedSha}`, "completed"]);
   });
 
+  it("never claim CI is green when no CI was reported", async () => {
+    h = createHarness({ config: { merge: { require_ci: false } } });
+    h.host.ciScript = () => [];
+    const run = await start();
+    expect(report(run.id).outcome).toBe("delivered");
+    expect(h.notes.at(-1)?.message).not.toMatch(/CI green/);
+    expect(h.notes.at(-1)?.message).toMatch(/independently reviewed/);
+  });
+
   it("tell the person when a run is blocked or failed", async () => {
     h = createHarness({ implement: () => ({ text: "nothing" }) });
     const blocked = await start();
@@ -266,9 +349,8 @@ describe("notifications", () => {
     h.notifyFails = true;
     const run = await start();
     expect(run.state).toBe("READY_TO_MERGE");
-    const sent = h.app.store.events(run.id).filter((e) => e.type === "notify.sent");
-    expect(sent).toHaveLength(1);
-    expect((sent[0]!.data as { ok: boolean }).ok).toBe(false);
+    expect(h.app.store.events(run.id).filter((e) => e.type === "notify.sent")).toHaveLength(1);
+    expect(h.app.store.events(run.id).filter((e) => e.type === "notify.failed")).toHaveLength(1);
     h.notifyFails = false;
     await settleRun(h.app, h.app.store.getRun<RunContext>(run.id)!);
     expect(h.notes).toHaveLength(0);
