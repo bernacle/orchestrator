@@ -46,11 +46,12 @@ export interface RenderedSkill {
 /**
  * Subcommands Claude Code may run without its own permission prompt while the skill is active.
  * Safe to pre-approve because none of them can start live work or grant anything without the
- * engine's own human approval: context/status/review only read; `run` is a dry run unless
- * `--execute`, which the engine gates behind a system prompt; `repo init` writes a pending
- * proposal that grants nothing. `resume`, `repo authorize`, `associate` and `auth` still ask.
+ * engine's own authorization: context/status/review/`repo trusted` only read; `run` is a dry run
+ * unless `--execute`, and `run --execute` and `resume` of a live run are gated by the engine
+ * (a system prompt, or a trust the user granted with one); `repo init` writes a pending proposal
+ * that grants nothing. `repo authorize`, `repo trust`, `associate` and `auth` still ask.
  */
-export const PREAPPROVED_SUBCOMMANDS = ["context", "status", "review", "run", "repo init"];
+export const PREAPPROVED_SUBCOMMANDS = ["context", "status", "review", "run", "resume", "repo init", "repo trusted"];
 
 export function frontmatter(fields: Record<string, unknown>): string {
   return `---\n${stringify(fields, { lineWidth: 0 }).trimEnd()}\n---\n\n`;

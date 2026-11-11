@@ -1,6 +1,7 @@
 import type { Issue } from "../adapters/types.js";
 import type { App } from "../app.js";
 import { sandboxSupport } from "../core/isolation.js";
+import { describeTrustState } from "../core/trust.js";
 import type { RunRecord } from "../core/store.js";
 import type { RunContext } from "../core/workflow.js";
 import { cliInvocation, summarizeRun, type RunSummary } from "../report/summary.js";
@@ -40,6 +41,8 @@ export interface NextAction {
   needsUserApproval: boolean;
   /** Must be run by the user in their own terminal (credential entry). */
   userRunsIt?: boolean;
+  /** The repository is trusted: the engine starts this without a per-run system prompt. */
+  trusted?: boolean;
 }
 
 export interface ExecutionMode {
@@ -48,6 +51,8 @@ export interface ExecutionMode {
   available: boolean;
   description: string;
   missing: string[];
+  /** Live mode only: how the engine authorizes it ("trusted": no per-run prompt; "per_run_approval": a system prompt). */
+  authorization?: "trusted" | "per_run_approval";
 }
 
 export interface RequestContext {
@@ -68,6 +73,12 @@ export interface RequestContext {
   modes: ExecutionMode[];
   /** How a person approves a live run here (enforced by the engine, not by the skill). */
   approval: { channel: string; available: boolean; detail: string } | null;
+  /**
+   * The repository's authorization mode, as the engine will apply it (core/trust.ts). "trusted":
+   * live runs and resumes start without a per-run prompt. Anything else: supervised, every live run
+   * and resume asks. Only `orchestrator repo trust` (with a system prompt) can make it trusted.
+   */
+  trust: { mode: "trusted" | "supervised"; status: "trusted" | "untrusted" | "stale" | "invalid"; detail: string; trustedBy: string | null; trustedAt: string | null; changed: string[]; renew: string | null } | null;
   problems: Problem[];
   warnings: string[];
   nextActions: NextAction[];
@@ -212,8 +223,23 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
     if (!sb.available && loaded.config.isolation.require) liveMissing.push(`no sandbox: ${sb.detail}`);
   }
   if (app.env.ORCHESTRATOR_NO_EXECUTE) liveMissing.push("ORCHESTRATOR_NO_EXECUTE is set: live runs are disabled in this environment");
+  const trustState = loaded ? app.trust.evaluate(loaded) : null;
+  const trusted = trustState?.status === "trusted";
+  const trust: RequestContext["trust"] = trustState
+    ? {
+        mode: trusted ? "trusted" : "supervised",
+        status: trustState.status,
+        detail: describeTrustState(trustState),
+        trustedBy: trustState.status === "trusted" || trustState.status === "stale" ? trustState.record.trustedBy : null,
+        trustedAt: trustState.status === "trusted" || trustState.status === "stale" ? trustState.record.trustedAt : null,
+        changed: trustState.status === "stale" ? trustState.changed : [],
+        renew: trustState.status === "stale" || trustState.status === "invalid" ? `${cli} repo trust ${loaded!.config.repo}` : null,
+      }
+    : null;
+  if (trustState && (trustState.status === "stale" || trustState.status === "invalid")) warnings.push(describeTrustState(trustState));
   const approval = app.approvalStatus ? await app.approvalStatus() : null;
-  if (approval && !approval.available) liveMissing.push(approval.detail);
+  // A trusted repository needs no prompt to start; without trust, a live run needs one that can be shown.
+  if (approval && !approval.available && !trusted) liveMissing.push(approval.detail);
   const modes: ExecutionMode[] = [
     { id: "dry_run", command: `${target} --dry-run --json`, available: dryMissing.length === 0, description: "plan and simulate: reads Linear and GitHub, fetches into the orchestrator's own clone, changes nothing", missing: dryMissing },
     {
@@ -227,8 +253,9 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
       id: "supervised",
       command: `${target} --execute`,
       available: liveMissing.length === 0,
-      description: `supervised live run: isolated worktree, ${loaded?.config.agents.implementer.adapter ?? "implementer"} implements, ${loaded?.config.agents.reviewer.adapter ?? "reviewer"} reviews, branch pushed, draft PR opened; merge stays ${loaded?.config.merge.mode ?? "manual"}`,
+      description: `${trusted ? "live run in a trusted repository (no per-run prompt)" : "supervised live run"}: isolated worktree, ${loaded?.config.agents.implementer.adapter ?? "implementer"} implements, ${loaded?.config.agents.reviewer.adapter ?? "reviewer"} reviews, branch pushed, draft PR opened; merge stays ${loaded?.config.merge.mode ?? "manual"}`,
       missing: liveMissing,
+      authorization: trusted ? "trusted" : "per_run_approval",
     },
   ];
 
@@ -247,11 +274,17 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
   if (has("association_unverified")) next.push({ id: "confirm_association", command: `${cli} associate ${ref.key} --repo ${selection.repo}`, description: `record that ${ref.key} is ${selection.repo} work; the user confirms a system prompt`, needsUserApproval: true });
   for (const r of runs.active) {
     next.push({ id: "inspect_run", command: `${cli} status ${r.id} --json`, description: `inspect ${r.id} (${r.state})`, needsUserApproval: false });
-    if (!r.driving) next.push({ id: "resume_run", command: `${cli} resume ${r.id}`, description: `resume ${r.id} from ${r.state}${r.blockedFrom ? ` (blocked in ${r.blockedFrom})` : ""}`, needsUserApproval: true });
+    if (!r.driving) next.push({ id: "resume_run", command: `${cli} resume ${r.id}`, description: `resume ${r.id} from ${r.state}${r.blockedFrom ? ` (blocked in ${r.blockedFrom})` : ""}${trusted ? "; trusted repository: no per-run prompt" : ""}`, needsUserApproval: true, ...(trusted ? { trusted: true } : {}) });
   }
   if (problems.length === 0) {
     next.push({ id: "dry_run", command: modes[0]!.command, description: modes[0]!.description, needsUserApproval: false });
-    if (modes[2]!.available) next.push({ id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. The CLI asks the user to confirm with Touch ID / password on this Mac before anything starts`, needsUserApproval: true });
+    if (modes[2]!.available) {
+      next.push(
+        trusted
+          ? { id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. The user trusted ${loaded!.config.repo} (orchestrator repo trust), so the engine starts it without a system prompt; the user's request to implement the issue with Orchestrator is the go-ahead`, needsUserApproval: false, trusted: true }
+          : { id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. The CLI asks the user to confirm with Touch ID / password on this Mac before anything starts`, needsUserApproval: true },
+      );
+    }
   }
 
   return {
@@ -264,6 +297,7 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
     runs,
     modes,
     approval,
+    trust,
     problems,
     warnings,
     nextActions: next,

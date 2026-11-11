@@ -7,7 +7,9 @@ import { runProcess } from "./exec.js";
 
 /**
  * Human approval for actions that grant or use remote-write authority: starting (or resuming) a
- * live run, authorizing a repository, confirming an issue ↔ repository association.
+ * live run, authorizing a repository, confirming an issue ↔ repository association, trusting a
+ * repository. A trusted repository (core/trust.ts) is the one exception for live runs and resumes:
+ * there the person approved, once, a standing delegation for that repository's exact scope.
  *
  * Trust model. The caller of this CLI is often an LLM agent with a full-access shell. Anything it
  * can type, it can forge: a `--yes` flag, an "approval" file, a row in the SQLite store. So no
@@ -27,7 +29,7 @@ import { runProcess } from "./exec.js";
  * that *Orchestrator* never becomes the vehicle for unapproved live work. See docs/skills.md.
  */
 
-export type ApprovalPurpose = "live_run" | "resume_live_run" | "authorize_repository" | "confirm_association";
+export type ApprovalPurpose = "live_run" | "resume_live_run" | "authorize_repository" | "confirm_association" | "trust_repository";
 
 export interface ApprovalRequest {
   purpose: ApprovalPurpose;

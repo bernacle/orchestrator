@@ -4,6 +4,7 @@ export const CAPABILITIES: Array<{ area: string; feature: string; status: "suppo
   { area: "runs", feature: "Dry run with full plan and simulated timeline", status: "supported", note: "--dry-run (default unless --execute)" },
   { area: "runs", feature: "Supervised live run (implement → test → review → fix → PR)", status: "supported", note: "--execute; needs permissions in repo config" },
   { area: "runs", feature: "Resume after crash / Ctrl-C, cancel, single-driver lease", status: "supported", note: "resume, cancel" },
+  { area: "runs", feature: "Trusted-repository mode: live runs and resumes without a per-run prompt", status: "supported", note: "opt-in per repository: repo trust / untrust / trusted; never covers merges" },
   { area: "runs", feature: "Plan approval gate before implementation", status: "planned", note: "today: review the dry run, then --execute" },
   { area: "runs", feature: "Unattended queue / scheduler", status: "planned", note: "disabled: needs a VM/container boundary first (docs/isolation.md)" },
   { area: "runs", feature: "Run limits: cost cap, wall clock, correction rounds", status: "supported", note: "limits.*, merge.max_fix_attempts" },

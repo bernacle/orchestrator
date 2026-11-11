@@ -5,6 +5,7 @@ import { cancelRun, findRunOrThrow, IntakeError, openApp, resumeRun, RunError, s
 import { ConfigError, listRepoConfigs, loadRepoConfig, PACKAGE_ROOT } from "../config/load.js";
 import { CredentialError } from "../credentials/linear.js";
 import { LeaseError, type RunRecord } from "../core/store.js";
+import { TrustError } from "../core/trust.js";
 import { TERMINAL_STATES } from "../core/states.js";
 import type { RunContext } from "../core/workflow.js";
 import { IssueRefError } from "../intake/issue-ref.js";
@@ -100,15 +101,17 @@ program
   .option("--cwd <dir>", "directory to identify the repository from (default: the current directory)")
   .option("--linear-workspace <urlKey>", "Linear workspace whose stored key to use (default: from the URL or the repository config)")
   .option("--dry-run", "plan and simulate only; change nothing (default)")
-  .option("--execute", "start a supervised live run (agents edit code, a branch is pushed, a draft PR is opened) after you confirm a system prompt: Touch ID / password on macOS")
+  .option("--execute", "start a live run (agents edit code, a branch is pushed, a draft PR is opened) after you confirm a system prompt: Touch ID / password on macOS. In a repository you trusted (orchestrator repo trust), no per-run prompt")
+  .option("--require-approval", "with --execute: ask for your approval in a system prompt even if the repository is trusted")
   .option("--with-agent-plan", "in a dry run, also run the read-only planner agent (costs tokens, changes nothing)")
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; recorded in the audit trail)", (v: string, prev: string[]) => [...prev, v], [] as string[])
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt, 30)
   .option("--issue-snapshot <issue.json>", "dry run only: replay Linear data recorded by an earlier run (runs/<id>/issue.json)")
   .option("--json", "print a versioned JSON summary (schemaVersion 1) instead of the plan")
-  .action(async (issue: string, opts: { repo?: string; config?: string; cwd?: string; linearWorkspace?: string; dryRun?: boolean; execute?: boolean; withAgentPlan?: boolean; acceptDependency: string[]; ciWait: number; issueSnapshot?: string; json?: boolean }) => {
+  .action(async (issue: string, opts: { repo?: string; config?: string; cwd?: string; linearWorkspace?: string; dryRun?: boolean; execute?: boolean; requireApproval?: boolean; withAgentPlan?: boolean; acceptDependency: string[]; ciWait: number; issueSnapshot?: string; json?: boolean }) => {
     output.json = Boolean(opts.json);
     if (opts.dryRun && opts.execute) throw new RunError("--dry-run and --execute are mutually exclusive");
+    if (opts.requireApproval && !opts.execute) throw new RunError("--require-approval applies to live runs (--execute) only");
     const dryRun = !opts.execute;
     if (!opts.dryRun && !opts.execute) console.error(c.dim("No --execute given: running as a dry run."));
     const onEvent = progress(Boolean(opts.json));
@@ -124,6 +127,7 @@ program
         acceptDependencies: opts.acceptDependency,
         ciWaitMinutes: opts.ciWait,
         ...(opts.issueSnapshot ? { issueSnapshot: opts.issueSnapshot } : {}),
+        ...(opts.requireApproval ? { requireApproval: true } : {}),
         ...(onEvent ? { onEvent } : {}),
         interrupt: interruptSignal(),
       });
@@ -229,19 +233,21 @@ program
 
 program
   .command("resume")
-  .description("Continue a run (re-enters the blocked step, re-checks CI or merge state). Accepts a run id or an issue key / URL. Live runs ask you to confirm a system prompt again.")
+  .description("Continue a run (re-enters the blocked step, re-checks CI or merge state). Accepts a run id or an issue key / URL. Live runs ask you to confirm a system prompt again, except in a trusted repository (where the run keeps its time window).")
   .argument("<target>", "run id or unique prefix, or an issue key / Linear URL (resolved to its only resumable run)")
   .option("--repo <owner/name>", "with an issue: only runs on this repository")
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt)
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; audited)", (v: string, prev: string[]) => [...prev, v], [] as string[])
+  .option("--require-approval", "ask for your approval in a system prompt even if the repository is trusted (also grants a new time window)")
   .option("--json", "print a versioned JSON summary (schemaVersion 1)")
-  .action((target: string, opts: { repo?: string; ciWait?: number; acceptDependency: string[]; json?: boolean }) =>
+  .action((target: string, opts: { repo?: string; ciWait?: number; acceptDependency: string[]; requireApproval?: boolean; json?: boolean }) =>
     withApp(async (app) => {
       output.json = Boolean(opts.json);
       const found = await resumableRun(app, target, opts.repo ? { repo: opts.repo } : {});
       const run = await resumeRun(app, found.id, {
         ...(opts.ciWait !== undefined ? { ciWaitMinutes: opts.ciWait } : {}),
         acceptDependencies: opts.acceptDependency,
+        ...(opts.requireApproval ? { requireApproval: true } : {}),
         ...(opts.json ? {} : { onEvent: progress(false)! }),
         interrupt: interruptSignal(),
       });
@@ -289,8 +295,10 @@ program
   .description("List configured repositories")
   .action(() =>
     withApp((app) => {
-      for (const { config, source } of listRepoConfigs(app.paths)) {
-        console.log(`${c.bold(config.repo)}  teams ${config.linear.teams.join(",")}  merge ${config.merge.mode}${config.authorization ? `  authorized ${config.authorization.scope} by ${config.authorization.authorized_by}` : ""}  ${c.dim(source)}`);
+      for (const loaded of listRepoConfigs(app.paths)) {
+        const { config, source } = loaded;
+        const trusted = app.trust.evaluate(loaded).status === "trusted";
+        console.log(`${c.bold(config.repo)}  teams ${config.linear.teams.join(",")}  merge ${config.merge.mode}${config.authorization ? `  authorized ${config.authorization.scope} by ${config.authorization.authorized_by}` : ""}  ${trusted ? c.yellow("trusted") : "supervised"}  ${c.dim(source)}`);
       }
     }),
   );
@@ -304,7 +312,7 @@ registerAuthCommands(program);
 registerSkillCommands(program, pkg.version);
 
 program.parseAsync(process.argv).catch((err: unknown) => {
-  const known = err instanceof RunError || err instanceof ConfigError || err instanceof LeaseError || err instanceof IssueRefError || err instanceof CredentialError;
+  const known = err instanceof RunError || err instanceof ConfigError || err instanceof LeaseError || err instanceof IssueRefError || err instanceof CredentialError || err instanceof TrustError;
   if (output.json) {
     const e = err as Error;
     printJson("error", {
