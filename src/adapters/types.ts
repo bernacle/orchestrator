@@ -88,6 +88,8 @@ export interface PullRequestStatus {
   mergeStateStatus: string;
   reviewDecision: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
   checks: Array<{ name: string; bucket: CheckBucket; detailsUrl?: string }>;
+  /** The PR description, when the host returned it (used to confirm the orchestrator wrote the PR). */
+  body?: string;
 }
 
 export interface CodeHost {
@@ -98,6 +100,10 @@ export interface CodeHost {
   findPullRequest(repo: string, headBranch: string): Promise<PullRequestStatus | null>;
   createPullRequest(input: { repo: string; base: string; head: string; title: string; body: string; draft: boolean; labels: string[] }): Promise<PullRequestStatus>;
   getPullRequest(repo: string, number: number): Promise<PullRequestStatus>;
+  /** Replace the description of a PR. The engine only calls it for PRs its own run created. */
+  updatePullRequestBody(input: { repo: string; number: number; body: string }): Promise<void>;
+  /** Mark a draft PR ready for review. Never merges. */
+  markPullRequestReady(input: { repo: string; number: number }): Promise<void>;
   /** Must pin the head SHA; implementations must never use admin overrides. */
   mergePullRequest(input: { repo: string; number: number; headSha: string; method: "squash" | "merge" | "rebase" }): Promise<void>;
   /**
@@ -151,6 +157,11 @@ export interface Workspace {
    */
   commitBlobs(worktreePath: string, files: Array<{ path: string; data: Buffer }>, message: string): Promise<string | null>;
   push(worktreePath: string, branch: string): Promise<void>;
+  /**
+   * Put the worktree back at `sha`, which must be an ancestor of HEAD (a local commit the branch
+   * already contains): reset tracked files and remove untracked ones (ignored files stay).
+   */
+  resetTo(worktreePath: string, sha: string): Promise<void>;
   /** Which of `paths` exist at `ref` (read-only, from git objects). */
   filesExist(repoPath: string, ref: string, paths: string[]): Promise<Array<{ path: string; exists: boolean }>>;
   /** Remove a worktree the orchestrator created (preflight only). */

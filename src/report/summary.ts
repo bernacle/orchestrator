@@ -42,6 +42,10 @@ export interface RunSummary {
   budget: { costUsd: number; maxRunCostUsd: number | null; maxRunMinutes: number | null };
   checks: Array<{ name: string; ok: boolean; optional: boolean; exitCode: number | null }> | null;
   review: { verdict: string; approved: boolean; blocking: number; summary: string; findingCount: number } | null;
+  /** Every acceptance criterion with the latest review's verdict (`needs_human`: a person must judge it). */
+  criteria: Array<{ id: string; text: string; source: string; status: string; evidence: string }> | null;
+  /** The bounded round for actionable minor findings, when one ran. */
+  minorRound: { status: string; approvedSha: string; findings: string[]; reason: string | null } | null;
   pr: { number: number; url: string } | null;
   merge: { eligible: boolean; ciState: string; reasons: string[] } | null;
   worktreePath: string | null;
@@ -76,6 +80,8 @@ export function summarizeRun(store: Store, run: RunRecord<RunContext>): RunSumma
     budget: { costUsd: ctx.costUsd ?? 0, maxRunCostUsd: plan?.limits?.maxRunCostUsd ?? null, maxRunMinutes: plan?.limits?.maxRunMinutes ?? null },
     checks: checks?.map((c) => ({ name: c.name, ok: c.ok, optional: c.optional, exitCode: c.exitCode })) ?? null,
     review: review ? { verdict: review.verdict, approved: review.approved, blocking: review.blocking, summary: review.summary, findingCount: review.findings.length } : null,
+    criteria: review?.criteria?.map((c) => ({ id: c.id, text: c.text, source: c.source, status: c.status, evidence: c.evidence })) ?? null,
+    minorRound: ctx.minorRound ? { status: ctx.minorRound.status, approvedSha: ctx.minorRound.approvedSha, findings: ctx.minorRound.findings.map((f) => f.id), reason: ctx.minorRound.reason ?? null } : null,
     pr: ctx.pr ? { number: ctx.pr.number, url: ctx.pr.url } : null,
     merge: ctx.merge ? { eligible: ctx.merge.eligible, ciState: ctx.merge.ciState, reasons: ctx.merge.reasons } : null,
     worktreePath: ctx.worktreePath ?? null,
@@ -88,14 +94,35 @@ export function summarizeRun(store: Store, run: RunRecord<RunContext>): RunSumma
 export function reviewFindings(run: RunRecord<RunContext>): {
   runId: string;
   state: string;
-  rounds: Array<{ attempt: number; trigger: string; verdict: string; approved: boolean; reviewedSha: string; summary: string; findings: NonNullable<RunContext["rounds"][number]["review"]>["findings"] }>;
+  rounds: Array<{
+    attempt: number;
+    trigger: string;
+    verdict: string;
+    approved: boolean;
+    reviewedSha: string;
+    summary: string;
+    findings: NonNullable<RunContext["rounds"][number]["review"]>["findings"];
+    criteria: NonNullable<NonNullable<RunContext["rounds"][number]["review"]>["criteria"]>;
+    /** No reviewer ran: the commit is one an earlier round approved. */
+    reused: boolean;
+  }>;
 } {
   return {
     runId: run.id,
     state: run.state,
     rounds: (run.context.rounds ?? [])
       .filter((r) => r.review)
-      .map((r) => ({ attempt: r.attempt, trigger: r.trigger, verdict: r.review!.verdict, approved: r.review!.approved, reviewedSha: r.review!.reviewedSha, summary: r.review!.summary, findings: r.review!.findings })),
+      .map((r) => ({
+        attempt: r.attempt,
+        trigger: r.trigger,
+        verdict: r.review!.verdict,
+        approved: r.review!.approved,
+        reviewedSha: r.review!.reviewedSha,
+        summary: r.review!.summary,
+        findings: r.review!.findings,
+        criteria: r.review!.criteria ?? [],
+        reused: Boolean(r.review!.reused),
+      })),
   };
 }
 

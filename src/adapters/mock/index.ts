@@ -69,6 +69,8 @@ export class MockCodeHost implements CodeHost {
   readonly name = "mock-github";
   readonly prs: PullRequestStatus[] = [];
   readonly merges: Array<{ number: number; headSha: string }> = [];
+  readonly bodyUpdates: Array<{ number: number; body: string }> = [];
+  readonly readied: number[] = [];
   ciScript: (pr: PullRequestStatus, reads: number) => PullRequestStatus["checks"] = () => [{ name: "CI", bucket: "pass" }];
   /** Overrides the PR head (e.g. simulate a push by someone else). */
   headOverride: string | null = null;
@@ -108,8 +110,8 @@ export class MockCodeHost implements CodeHost {
       reviewDecision: null,
       checks: [],
     };
-    (pr as PullRequestStatus & { body: string; title: string }).body = input.body;
-    (pr as PullRequestStatus & { body: string; title: string }).title = input.title;
+    pr.body = input.body;
+    (pr as PullRequestStatus & { title: string }).title = input.title;
     this.prs.push(pr);
     return { ...pr };
   }
@@ -124,6 +126,20 @@ export class MockCodeHost implements CodeHost {
   linked: Record<string, import("../types.js").PrEvidence[]> = {};
   async linkedPullRequests(input: { issueKey: string }): Promise<import("../types.js").PrEvidence[]> {
     return this.linked[input.issueKey] ?? [];
+  }
+
+  async updatePullRequestBody(input: { number: number; body: string }): Promise<void> {
+    const pr = this.prs.find((p) => p.number === input.number);
+    if (!pr) throw new Error(`no PR ${input.number}`);
+    pr.body = input.body;
+    this.bodyUpdates.push({ number: input.number, body: input.body });
+  }
+
+  async markPullRequestReady(input: { number: number }): Promise<void> {
+    const pr = this.prs.find((p) => p.number === input.number);
+    if (!pr) throw new Error(`no PR ${input.number}`);
+    pr.isDraft = false;
+    this.readied.push(input.number);
   }
 
   async mergePullRequest(input: { number: number; headSha: string }): Promise<void> {

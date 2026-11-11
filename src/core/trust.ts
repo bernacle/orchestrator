@@ -62,7 +62,7 @@ export interface TrustScope {
   limits: RepoConfig["limits"];
   isolation: RepoConfig["isolation"];
   review: RepoConfig["review"];
-  pullRequest: { draft: boolean };
+  pullRequest: { draft: boolean; markReadyWhenDelivered?: boolean };
   forbiddenPaths: string[];
   baselineChecks: boolean;
   /** Network a setup/check command asks for beyond its default (commands themselves run sandboxed). */
@@ -85,7 +85,7 @@ export function trustScope(loaded: LoadedRepoConfig): { scope: TrustScope; hash:
     limits: c.limits,
     isolation: c.isolation,
     review: c.review,
-    pullRequest: { draft: c.pull_request.draft },
+    pullRequest: { draft: c.pull_request.draft, markReadyWhenDelivered: c.pull_request.mark_ready_when_delivered },
     forbiddenPaths: [...c.forbidden_paths],
     baselineChecks: c.baseline_checks,
     commandNetwork: [
@@ -128,7 +128,7 @@ export function describeTrust(scope: TrustScope, opts: { renewing?: boolean } = 
   const rev = agentName(scope.agents.reviewer);
   const actions = [`${impl} implements in a sandboxed worktree`, `${rev} reviews`];
   if (p.github.push) actions.push("pushes branches");
-  if (p.github.create_pr) actions.push("opens draft PRs");
+  if (p.github.create_pr) actions.push(scope.pullRequest.markReadyWhenDelivered ? "opens draft PRs and marks them ready for review once every check, CI and the review pass" : "opens draft PRs");
   if (p.linear.comment || p.linear.update_state) actions.push("updates Linear");
   const reason =
     `${opts.renewing ? "renew trust" : "trust"} ${scope.repo} for Orchestrator live runs and resumes WITHOUT asking you each time: ${actions.join(", ")}; ` +
@@ -141,7 +141,8 @@ export function describeTrust(scope: TrustScope, opts: { renewing?: boolean } = 
     `Never:       merge (${p.github.merge ? "GRANTED — not trustable" : "not granted"}; merge.mode ${scope.merge.mode}), new permissions, accepted dependencies, new time windows, repository authorization`,
     `Limits:      $${scope.limits.max_run_cost_usd} and ${scope.limits.max_run_minutes} min per run (a trusted resume keeps the run's window), ${scope.merge.max_fix_attempts} fix rounds`,
     `Isolation:   sandbox required ${scope.isolation.require}, setup network ${scope.isolation.setup_network}, checks network ${scope.isolation.checks_network}${scope.isolation.read_paths.length ? `, extra read paths ${scope.isolation.read_paths.join(", ")}` : ""}`,
-    `Review:      distinct provider ${scope.review.require_distinct_provider}, blocking ${scope.review.blocking_severities.join("/")}`,
+    `Review:      distinct provider ${scope.review.require_distinct_provider}, blocking ${scope.review.blocking_severities.join("/")}, minor-finding rounds ${scope.review.minor_fix_rounds ?? 0}`,
+    `PR:          draft ${scope.pullRequest.draft}, marked ready when delivered ${scope.pullRequest.markReadyWhenDelivered ?? false}; descriptions of its own PRs kept in sync`,
     `Ends:        on \`orchestrator repo untrust ${scope.repo}\`, or when any of the above changes in the config (runs then ask again)`,
   ];
   return { reason, details };

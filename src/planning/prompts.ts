@@ -1,12 +1,13 @@
 import type { CheckResult, Issue } from "../adapters/types.js";
 import type { AgentPlan } from "./plan.js";
-import { formatFindings, type Finding, type ReviewOutcome } from "./review.js";
+import { formatCriteria, formatDispositions, formatFindings, type Criterion, type CriterionReport, type Finding, type ImplementerReport, type ReviewOutcome } from "./review.js";
 
 const MAX_DESCRIPTION = 12_000;
 const MAX_COMMENTS = 10;
 
-function issueBlock(issue: Issue, criteria: string[]): string {
+function issueBlock(issue: Issue, criteria: Array<string | Criterion>): string {
   const comments = issue.comments.slice(-MAX_COMMENTS);
+  const numbered = criteria.every((c) => typeof c !== "string");
   return [
     `# ${issue.key}: ${issue.title}`,
     issue.url ? `Linear: ${issue.url}` : "",
@@ -15,7 +16,11 @@ function issueBlock(issue: Issue, criteria: string[]): string {
     issue.description.slice(0, MAX_DESCRIPTION) || "(no description)",
     "",
     "## Acceptance criteria",
-    criteria.length ? criteria.map((c) => `- ${c}`).join("\n") : "(none stated explicitly; infer conservatively from the description and say so)",
+    criteria.length
+      ? numbered
+        ? formatCriteria(criteria as Criterion[])
+        : criteria.map((c) => `- ${typeof c === "string" ? c : c.text}`).join("\n")
+      : "(none stated explicitly; infer conservatively from the description and say so)",
     comments.length
       ? `\n## Discussion (latest ${comments.length} comments)\n${comments.map((c) => `- ${c.author} (${c.createdAt.slice(0, 10)}): ${c.body.replace(/\n/g, " ").slice(0, 800)}`).join("\n")}`
       : "",
@@ -51,6 +56,7 @@ export function plannerPrompt(issue: Issue, criteria: string[], guidanceFiles: s
     "Read the repository and produce the smallest implementation plan that satisfies the acceptance criteria.",
     guidanceFiles.length ? `Start with the repository guidance: ${guidanceFiles.join(", ")}.` : "",
     "Ground every step in files you actually opened. Put product decisions you cannot infer in open_questions.",
+    "In acceptance_criteria, list every verifiable requirement the issue itself states, in its done/acceptance section and in its scope, one per item, phrased so a reviewer can check it against the diff, the tests and screenshots. Do not invent requirements the issue does not state, and do not restate implementation steps.",
     "Respond only with JSON matching the provided schema.",
   ].join("\n");
 }
@@ -74,7 +80,7 @@ function screenshotTaskBlock(s: ScreenshotBrief | null | undefined): string {
   ].join("\n");
 }
 
-export function implementerPrompt(input: { issue: Issue; criteria: string[]; plan: AgentPlan | null; checks: string[]; guidanceFiles: string[]; brief?: string | null; openQuestions?: string[]; screenshots?: ScreenshotBrief | null }): string {
+export function implementerPrompt(input: { issue: Issue; criteria: Criterion[]; plan: AgentPlan | null; checks: string[]; guidanceFiles: string[]; brief?: string | null; openQuestions?: string[]; screenshots?: ScreenshotBrief | null }): string {
   return [
     issueBlock(input.issue, input.criteria),
     "",
@@ -87,7 +93,7 @@ export function implementerPrompt(input: { issue: Issue; criteria: string[]; pla
     "## Your task",
     "Implement this issue in the current git worktree.",
     input.guidanceFiles.length ? `Follow the repository's own guidance first: ${input.guidanceFiles.join(", ")}.` : "",
-    "Keep the change focused on the acceptance criteria. Add or update tests for behaviour you change.",
+    "Keep the change focused on the acceptance criteria. Add or update tests for behaviour you change. The independent reviewer judges every criterion (AC1, AC2, …) one by one; one it finds not met blocks the change.",
     input.checks.length ? `The orchestrator will run these checks afterwards; run the relevant ones yourself first:\n${input.checks.map((c) => `- ${c}`).join("\n")}` : "",
     screenshotTaskBlock(input.screenshots),
     "Do not commit or push. Finish with a short summary: what changed, why, and anything you could not do.",
@@ -120,15 +126,39 @@ export function fixPromptForScreenshots(input: { reason: string; result?: CheckR
     .join("\n");
 }
 
-export function fixPromptForReview(review: ReviewOutcome, blocking: Finding[], attempt: number, maxAttempts: number): string {
+const REPORT_INSTRUCTIONS =
+  "Do not commit or push. Your final output is structured: a short summary, and for every finding id above whether you fixed it or declined it, with a one-line note (for a decline, the reason). The reviewer checks your notes against the code.";
+
+export function fixPromptForReview(review: ReviewOutcome, blocking: Finding[], attempt: number, maxAttempts: number, unmet: CriterionReport[] = []): string {
   return [
     `## Correction round ${attempt} of ${maxAttempts}: independent review requested changes`,
     `Reviewer summary: ${review.summary}`,
     "",
-    "Address every finding below. If you believe a finding is wrong, do not ignore it silently: explain why in your summary and leave the code as is.",
+    "Address every finding below. If you believe a finding is wrong, do not ignore it silently: decline it with your reason and leave the code as is.",
     formatFindings(blocking),
+    unmet.length
+      ? `\n### Acceptance criteria the reviewer found not met\n${unmet.map((c) => `- ${c.id}: ${c.text}\n  Reviewer: ${c.evidence.replace(/\n/g, " ")}`).join("\n")}\nMeet each one in the code, tests or screenshots. Report each criterion id like a finding id.`
+      : "",
     "",
-    "Do not commit or push. Summarise what you changed per finding id.",
+    REPORT_INSTRUCTIONS,
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
+}
+
+/** The one bounded round for actionable minor findings, after an approval. */
+export function fixPromptForMinorFindings(review: ReviewOutcome, minor: Finding[], approvedSha: string): string {
+  return [
+    `## Minor findings round: the independent review approved commit ${approvedSha.slice(0, 12)}`,
+    `Reviewer summary: ${review.summary}`,
+    "",
+    "The change is approved. The reviewer also reported these minor findings, which it considers actionable within this issue. Fix each one you can with a small, safe change, with a test where behaviour changes:",
+    formatFindings(minor),
+    "",
+    "Stay strictly within these findings: no refactors, no new scope, no unrelated changes. Decline a finding, with your reason, if fixing it would need a product decision or a broader change.",
+    "Your result is checked and reviewed again. If it is not approved, the orchestrator delivers the approved commit instead, so a risky fix is worse than a clear decline.",
+    "",
+    REPORT_INSTRUCTIONS,
   ].join("\n");
 }
 
@@ -143,11 +173,15 @@ export function fixPromptForCi(failing: Array<{ name: string; detailsUrl?: strin
 
 export function reviewerPrompt(input: {
   issue: Issue;
-  criteria: string[];
+  criteria: Criterion[];
   baseSha: string;
   headSha: string;
   checks: CheckResult[];
   previous: Finding[];
+  /** The implementer's self-reported response to `previous` (to verify, not to trust). */
+  dispositions?: ImplementerReport | null;
+  /** Replaces the heading line of the previous-findings section (e.g. findings raised on another commit). */
+  previousNote?: string;
   brief?: string | null;
   screenshots?: { command: string; files: string[]; commitSha: string | null } | null;
 }): string {
@@ -174,22 +208,125 @@ export function reviewerPrompt(input: {
           "Inspect them. Judge whether they show what the acceptance criteria ask for (states, themes, viewports) and whether the UI in them looks correct; report problems you can see as findings against the code that renders them.",
         ].join("\n")
       : "",
-    input.previous.length ? `\n## Findings from the previous round (verify each is actually resolved)\n${formatFindings(input.previous)}` : "",
+    input.previous.length ? `\n## ${input.previousNote ?? "Findings from the previous round (verify each is actually resolved)"}\n${formatFindings(input.previous)}` : "",
+    input.previous.length && input.dispositions
+      ? `\n## The implementer's response to those findings (self-reported: verify it)\n${formatDispositions(input.dispositions)}\nA declined finding stays a finding if you still think it matters; drop it only if the reason convinces you.`
+      : "",
     "",
     "## Output",
     "Respond only with JSON matching the provided schema.",
     "Severity: blocker = must not merge; major = should fix before merge; minor = worth fixing; nit = optional polish.",
-    'Use verdict "approve" only if there are no blocker or major findings.',
+    "Set `actionable` to true when a concrete, small change within this issue's scope resolves the finding, false when it needs a product decision, a broader change or another issue.",
+    input.criteria.length
+      ? "In `criteria`, give exactly one verdict per acceptance criterion id above (AC1, AC2, …), with evidence (file, test or screenshot): `met` when the change demonstrably satisfies it, `not_met` when it does not (that blocks the change, like a major finding), `needs_human` only when it depends on a product or design judgement the code, tests and screenshots cannot settle."
+      : "There are no numbered acceptance criteria: return an empty `criteria` array.",
+    'Use verdict "approve" only if there are no blocker or major findings and no criterion is `not_met`.',
   ].join("\n");
+}
+
+/** Hidden marker naming the run that created a PR: the engine only rewrites bodies it owns. */
+export function prOwnerMarker(runId: string): string {
+  return `<!-- orchestrator-run: ${runId} -->`;
+}
+
+/**
+ * True when `body` carries this run's marker, which only the orchestrator writes when it opens a PR.
+ * PRs opened before the marker existed have none, so their descriptions are never rewritten.
+ */
+export function prOwnedByRun(body: string | undefined, runId: string): boolean {
+  return Boolean(body?.includes(prOwnerMarker(runId)));
+}
+
+export interface PrCiStatus {
+  state: "pending" | "pass" | "fail" | "none";
+  sha: string;
+  checks: Array<{ name: string; bucket: string }>;
+  /** CI failed and the correction budget is spent: the run stops instead of fixing it. */
+  stopping?: boolean;
+}
+
+export interface PrReviewRound {
+  attempt: number;
+  trigger: string;
+  verdict: string;
+  approved: boolean;
+  reviewedSha: string;
+  findings: Finding[];
+  /** The implementer's response in the round that followed this review. */
+  response?: ImplementerReport | null;
+}
+
+export interface PrMinorRound {
+  status: "running" | "applied" | "declined" | "rejected" | "reverted";
+  approvedSha: string;
+  findings: Finding[];
+  response?: ImplementerReport | null;
+  reason?: string | null;
+  /** Blocking findings the review raised on the discarded attempt; the restored commit was reviewed against them. */
+  rejectedFindings?: Finding[];
+}
+
+const CRITERION_MARK: Record<CriterionReport["status"], string> = { met: "[x]", not_met: "[ ]", needs_human: "[ ]" };
+
+function criterionLine(c: CriterionReport): string {
+  const evidence = c.evidence.replace(/\s*\n\s*/g, " ").trim();
+  const label = c.status === "met" ? "" : c.status === "not_met" ? " — ❌ **not met**" : " — ⚠️ **needs your judgement**";
+  return `- ${CRITERION_MARK[c.status]} **${c.id}** ${c.text}${c.source === "planner" ? " _(derived from the issue's scope)_" : ""}${label}${evidence ? `: ${evidence}` : ""}`;
+}
+
+function ciBlock(ci: PrCiStatus | null | undefined): string {
+  if (!ci) return "⏳ Waiting for GitHub CI on the pushed commit.";
+  const names = (b: string) => ci.checks.filter((k) => k.bucket === b).map((k) => `\`${k.name}\``).join(", ");
+  switch (ci.state) {
+    case "pass":
+      return `✅ Passed on \`${ci.sha.slice(0, 12)}\`${ci.checks.length ? `: ${names("pass") || ci.checks.map((k) => `\`${k.name}\``).join(", ")}` : ""}.`;
+    case "fail":
+      return ci.stopping
+        ? `❌ Failing on \`${ci.sha.slice(0, 12)}\`: ${names("fail")}. The correction budget is spent, so the orchestrator stopped without a fix: this PR is not deliverable as is.`
+        : `❌ Failing on \`${ci.sha.slice(0, 12)}\`: ${names("fail")}. The orchestrator is correcting it; this description is updated when a fixed commit is reviewed.`;
+    case "pending":
+      return `⏳ Running on \`${ci.sha.slice(0, 12)}\`.`;
+    case "none":
+      return `No CI checks were reported for \`${ci.sha.slice(0, 12)}\`.`;
+  }
+}
+
+function minorBlock(m: PrMinorRound | null | undefined): string {
+  if (!m || m.status === "running") return "";
+  const ids = m.findings.map((f) => f.id).join(", ");
+  const responses = m.response?.findings.length ? `\n${formatDispositions(m.response)}` : "";
+  switch (m.status) {
+    case "applied":
+      return `### Minor findings\nAfter approving \`${m.approvedSha.slice(0, 12)}\`, the reviewer's actionable minor findings (${ids}) went through one more correction round. That result was re-checked and re-reviewed, and is the commit delivered here.${responses}`;
+    case "declined":
+      return `### Minor findings\nThe implementer declined the reviewer's minor findings (${ids}) without changing code, so this PR delivers the approved commit \`${m.approvedSha.slice(0, 12)}\`.${responses}`;
+    case "rejected":
+    case "reverted":
+      return `### Minor findings\nA correction round for the minor findings (${ids}) was not accepted${m.reason ? ` (${m.reason})` : ""}. This PR therefore delivers the last approved commit \`${m.approvedSha.slice(0, 12)}\`, re-checked after the attempt was undone${m.rejectedFindings?.length ? `, and reviewed again against the blocking findings raised on the discarded attempt (${m.rejectedFindings.map((f) => f.id).join(", ")})` : ""}. These findings are still open:\n${formatFindings(m.findings)}`;
+  }
+}
+
+function historyBlock(rounds: PrReviewRound[]): string {
+  if (rounds.length < 2) return "";
+  const lines = rounds.map((r) => {
+    const found = r.findings.length ? r.findings.map((f) => `${f.id} [${f.severity}] ${f.title}`).join("; ") : "no findings";
+    const response = r.response?.findings.length ? `\n  Implementer: ${r.response.findings.map((d) => `${d.id} ${d.status}${d.note ? ` (${d.note.replace(/\n/g, " ").slice(0, 160)})` : ""}`).join("; ")}` : "";
+    return `- Round ${r.attempt} (${r.trigger}) on \`${r.reviewedSha.slice(0, 12)}\`: **${r.approved ? "approved" : r.verdict}** — ${found}${response}`;
+  });
+  return `<details><summary>Review history (${rounds.length} rounds)</summary>\n\n${lines.join("\n")}\n\n</details>`;
 }
 
 export function pullRequestBody(input: {
   issue: Issue;
-  criteria: string[];
+  /** Every criterion with the engine's verdict for it (see criteriaReport). */
+  criteria: CriterionReport[];
   runId: string;
   changedFiles: Array<{ status: string; path: string }>;
   checks: CheckResult[];
   review: ReviewOutcome | null;
+  reviewHistory?: PrReviewRound[];
+  minorRound?: PrMinorRound | null;
+  ci?: PrCiStatus | null;
   attempts: number;
   implementer: string;
   reviewer: string;
@@ -198,13 +335,23 @@ export function pullRequestBody(input: {
   briefSource?: string | null;
   /** Orchestrator-generated screenshots, with URLs that render them from the pushed commit. */
   screenshots?: Array<{ path: string; url: string }>;
+  /** The PR is marked ready for review once every delivery gate passes (pull_request.mark_ready_when_delivered). */
+  markReadyWhenDelivered?: boolean;
 }): string {
+  const needsHuman = input.criteria.filter((c) => c.status !== "met");
+  const open = input.review?.findings ?? [];
   return [
+    prOwnerMarker(input.runId),
     `Resolves ${input.issue.key}: ${input.issue.title}`,
     input.issue.url ? `\nLinear: ${input.issue.url}` : "",
     "",
+    needsHuman.length
+      ? `> [!IMPORTANT]\n> ${needsHuman.length} acceptance criteri${needsHuman.length === 1 ? "on needs" : "a need"} your judgement before merging: ${needsHuman.map((c) => c.id).join(", ")}. See below.\n`
+      : "",
     "## Acceptance criteria",
-    input.criteria.length ? input.criteria.map((c) => `- [ ] ${c}`).join("\n") : "_None stated in the issue._",
+    input.criteria.length
+      ? `_Judged one by one by the independent reviewer (${input.reviewer}) on \`${input.reviewedSha.slice(0, 12)}\`. Only a criterion the reviewer found met is ticked._\n\n${input.criteria.map(criterionLine).join("\n")}`
+      : "_None stated in the issue; the reviewer judged the change against the description._",
     "",
     "## Changes",
     input.changedFiles.map((f) => `- \`${f.status}\` ${f.path}`).join("\n") || "_No file changes recorded._",
@@ -212,17 +359,26 @@ export function pullRequestBody(input: {
     "## Verification (run by the orchestrator, not self-reported)",
     input.checks.map((c) => `- ${c.ok ? "✅" : "❌"} \`${c.command}\``).join("\n") || "_No checks configured._",
     "",
+    "## CI",
+    ciBlock(input.ci),
+    "",
     input.screenshots?.length
       ? `## Screenshots (generated by the orchestrator from the reviewed commit)\n${input.screenshots.map((f) => `**\`${f.path}\`**\n\n![${f.path}](${f.url})`).join("\n\n")}\n`
       : "",
     "## Independent review",
     input.review
-      ? `${input.reviewer} reviewed \`${input.reviewedSha.slice(0, 12)}\`: **${input.review.verdict}**. ${input.review.summary}\n\n${input.review.findings.length ? `Non-blocking findings:\n${formatFindings(input.review.findings)}` : ""}`
+      ? `${input.reviewer} reviewed \`${input.reviewedSha.slice(0, 12)}\`: **${input.review.verdict}**. ${input.review.summary}${open.length ? `\n\nOpen non-blocking findings:\n${formatFindings(open)}` : ""}`
       : "_Not reviewed._",
+    minorBlock(input.minorRound),
+    historyBlock(input.reviewHistory ?? []),
     "",
     input.openQuestions?.length ? `\n## Open product questions (decided conservatively by the implementer; please confirm)\n${input.openQuestions.map((q) => `- ${q}`).join("\n")}\n` : "",
     "---",
     `Prepared by the orchestrator (run \`${input.runId}\`). Implementer: ${input.implementer}. Correction rounds: ${input.attempts}.${input.briefSource ? ` Operator brief: \`${input.briefSource}\`.` : ""}`,
-    "This PR was opened as a draft. A human decides when it is ready and merges it.",
-  ].join("\n");
+    input.markReadyWhenDelivered
+      ? "Opened as a draft; the orchestrator marks it ready for review only after the checks, CI and the independent review pass on this commit. A human merges it."
+      : "This PR was opened as a draft. A human decides when it is ready and merges it.",
+  ]
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
 }

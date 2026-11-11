@@ -91,6 +91,12 @@ permissions:
   agents: { run: true }
   github: { push: true, create_pr: true, merge: false }
   linear: { comment: false, update_state: false }
+review:
+  blocking_severities: [blocker, major]
+  minor_fix_rounds: 1                 # one bounded round for actionable minor findings after an approval (0: off)
+pull_request:
+  draft: true
+  mark_ready_when_delivered: false    # opt in: mark the draft ready once CI, checks and the review pass (never merges)
 merge:
   mode: manual
   require_ci: true
@@ -143,18 +149,19 @@ QUEUED → PLANNING → IMPLEMENTING → TESTING → REVIEWING → PR_OPEN → W
 1. **PLANNING** works through these steps, then writes `plan.md` / `plan.json`:
    - fetch the issue (description, comments, relations, sub-issues)
    - classify dependencies with Linear, GitHub-PR and file evidence, plus the operator brief
-   - extract acceptance criteria
+   - extract acceptance criteria (the issue's own list, plus verifiable requirements the read-only planner reads in its scope, numbered AC1…)
    - inspect the repository at `origin/<base>` (scripts, CI workflow, guidance files, branch protection)
    - resolve the toolchain
    - check agent invariants, and verify isolation (it fails closed)
    - optionally run the read-only planner
 2. **IMPLEMENTING** creates a worktree on `orch/<key>-<slug>`, runs setup (sandboxed), and runs the **baseline** checks on the untouched base: a red base blocks the run. The implementer then works in its sandbox. Afterwards the orchestrator checks the tripwires, computes the diff itself, commits it with hooks disabled, and scans the diff for secrets.
 3. **TESTING** runs every configured check, recording exit codes and logs. When they pass and `screenshots` applies, it generates, validates and commits the screenshots.
-4. **REVIEWING** runs the reviewer on `git diff base...HEAD`, with the issue, the acceptance criteria, the verified check results and any orchestrator-generated screenshots.
-5. **FIXING** sends failing checks, blocking findings or CI failures back to the *same* implementer session (Claude `--resume`). Every fix is re-tested and re-reviewed. The budget is `max_fix_attempts`.
-6. **PR_OPEN** pushes (never force-pushes) and opens or reuses a **draft** PR whose body lists the changes, the orchestrator-run checks, and the review.
+4. **REVIEWING** runs the reviewer on `git diff base...HEAD`, with the issue, the numbered acceptance criteria, the verified check results and any orchestrator-generated screenshots. The reviewer returns findings and **one verdict per criterion** (`met`, `not_met`, `needs_human`). A criterion that is `not_met` blocks approval like a major finding; one with no verdict counts as `needs_human`, never as met.
+5. **FIXING** sends failing checks, blocking findings, unmet criteria or CI failures back to the *same* implementer session (Claude `--resume`). In review rounds the implementer answers each finding (`fixed` or `declined`, with a reason), and the reviewer verifies those answers. A round that declines everything with reasons is re-reviewed rather than blocked. Every fix is re-tested and re-reviewed. The budget is `max_fix_attempts`.
+   - **Minor findings.** After an approval, the reviewer's actionable `minor` findings (never nits) get **one** extra round (`review.minor_fix_rounds`). Its result is re-checked and re-reviewed. If it isn't approved, or breaks a check, the engine restores the approved commit, re-runs the checks on it, and delivers it with its approval; the PR lists what stayed open. This round never uses up `max_fix_attempts`.
+6. **PR_OPEN** pushes (never force-pushes) and opens or reuses a **draft** PR. Its description lists the criteria (ticked only when the reviewer found them met, with criteria that need your judgement flagged at the top), the changes, the orchestrator-run checks, CI, screenshots, the review and its history. The orchestrator keeps the description of its own PR in step after every push and CI result. It never edits a PR it didn't write.
 7. **WAITING_FOR_CI** polls GitHub checks (`--ci-wait`, 30 min by default), then hands back. `resume` checks again.
-8. **READY_TO_MERGE** reports merge eligibility. In `manual` mode the run parks here, a human merges, and `resume` records the merge.
+8. **READY_TO_MERGE** reports merge eligibility. With `pull_request.mark_ready_when_delivered`, the draft is marked ready for review once every gate passes on the reviewed commit. In `manual` mode the run parks here, a human merges, and `resume` records the merge.
 
 All artifacts live in `~/.orchestrator/runs/<run-id>/`: prompts, agent transcripts, check logs, review JSON, plan, merge report. `orchestrator status <run-id>` lists them along with every external action the run took.
 

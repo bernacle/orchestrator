@@ -68,6 +68,8 @@ export interface MergeInputs {
   reviewedSha: string | null;
   reviewApproved: boolean;
   unresolvedBlockingFindings: number;
+  /** Acceptance criteria the independent reviewer found not met on the reviewed commit. */
+  unmetCriteria?: number;
   /** GitHub login the orchestrator is acting as. */
   actor: string;
 }
@@ -112,6 +114,7 @@ export function evaluateMerge(input: MergeInputs): MergeEligibility {
     }
   }
   if (input.unresolvedBlockingFindings > 0) reasons.push(`${input.unresolvedBlockingFindings} unresolved blocking finding(s)`);
+  if ((input.unmetCriteria ?? 0) > 0) reasons.push(`${input.unmetCriteria} acceptance criteria not met`);
   if (pr.reviewDecision === "CHANGES_REQUESTED") reasons.push("a GitHub reviewer requested changes");
   if (protection.requiredApprovals > 0 && pr.reviewDecision !== "APPROVED") {
     reasons.push(`branch requires ${protection.requiredApprovals} approving GitHub review(s)`);

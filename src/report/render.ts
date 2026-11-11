@@ -44,6 +44,9 @@ export function renderPlanMarkdown(p: ExecutionPlan): string {
   );
   push(`### Acceptance criteria (${p.acceptanceCriteria.source === "none" ? "none found" : `from ${p.acceptanceCriteria.source}`})`);
   push(...(p.acceptanceCriteria.criteria.length ? p.acceptanceCriteria.criteria.map((x) => `- ${x}`) : ["- _none stated_"]), "");
+  if (p.acceptanceCriteria.derived?.length) {
+    push("Derived from the issue's scope by the read-only planner (the reviewer judges these too):", ...p.acceptanceCriteria.derived.map((x) => `- ${x}`), "");
+  }
 
   push("### Dependencies");
   if (p.dependencies.length === 0) push("- none");

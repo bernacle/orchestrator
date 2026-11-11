@@ -173,9 +173,27 @@ export const RepoConfigSchema = z
         blocking_severities: z.array(z.enum(["blocker", "major", "minor", "nit"])).default(["blocker", "major"]),
         /** Reviewer must come from a different provider than the implementer. */
         require_distinct_provider: z.boolean().default(true),
+        /**
+         * After an approval, one more correction round for the reviewer's actionable `minor` findings
+         * (never nits). Its result is checked and reviewed again; if it is not approved, the approved
+         * commit is restored, re-checked and delivered. 0 turns it off. Never counts against
+         * merge.max_fix_attempts.
+         */
+        minor_fix_rounds: z.number().int().min(0).max(1).default(1),
       })
       .prefault({}),
-    pull_request: z.object({ draft: z.boolean().default(true), labels: z.array(z.string()).default([]) }).prefault({}),
+    pull_request: z
+      .object({
+        draft: z.boolean().default(true),
+        labels: z.array(z.string()).default([]),
+        /**
+         * Mark the orchestrator's draft PR ready for review once it is delivered: the reviewed commit is
+         * the PR head, CI passed on it, and the independent review approved it with every acceptance
+         * criterion met or flagged for a person. Never merges. Off unless the operator opts in.
+         */
+        mark_ready_when_delivered: z.boolean().default(false),
+      })
+      .prefault({}),
     /**
      * Isolation for repository code (setup, checks) and agent shells. With `require: true` a live run
      * is BLOCKED when the sandbox is unavailable instead of running unsandboxed.

@@ -9,7 +9,7 @@ import type { BranchProtection, CheckBucket, CodeHost, PrEvidence, PullRequestSt
  * is configured with. Never passes --admin; merges always pin --match-head-commit.
  */
 
-const PR_FIELDS = "number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup";
+const PR_FIELDS = "number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,body";
 
 type Gh = (args: string[]) => Promise<string>;
 
@@ -176,6 +176,21 @@ export class GitHubHost implements CodeHost {
     return [...out.values()].filter((p) => p.via !== "search" || p.link !== "none");
   }
 
+  async updatePullRequestBody(input: { repo: string; number: number; body: string }): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "orch-pr-"));
+    const bodyFile = join(dir, "body.md");
+    writeFileSync(bodyFile, input.body);
+    try {
+      await this.gh(["pr", "edit", String(input.number), "--repo", input.repo, "--body-file", bodyFile]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  async markPullRequestReady(input: { repo: string; number: number }): Promise<void> {
+    await this.gh(["pr", "ready", String(input.number), "--repo", input.repo]);
+  }
+
   async mergePullRequest(input: { repo: string; number: number; headSha: string; method: "squash" | "merge" | "rebase" }): Promise<void> {
     if (!/^[0-9a-f]{40}$/.test(input.headSha)) throw new Error("refusing to merge without a full head SHA");
     await this.gh(["pr", "merge", String(input.number), "--repo", input.repo, `--${input.method}`, "--match-head-commit", input.headSha]);
@@ -198,6 +213,7 @@ interface RawPr {
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   mergeStateStatus: string;
   reviewDecision: string | null;
+  body?: string;
   statusCheckRollup: Array<
     | { __typename: "CheckRun"; name: string; status: string; conclusion: string | null; detailsUrl?: string }
     | { __typename: "StatusContext"; context: string; state: string; targetUrl?: string }
@@ -245,6 +261,7 @@ export function mapPr(pr: RawPr): PullRequestStatus {
       bucket: bucketFor(c),
       detailsUrl: c.__typename === "CheckRun" ? c.detailsUrl : c.targetUrl,
     })),
+    ...(typeof pr.body === "string" ? { body: pr.body } : {}),
   };
 }
 
