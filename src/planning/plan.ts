@@ -15,12 +15,14 @@ export interface AgentPlan {
   tests: string[];
   risks: string[];
   open_questions: string[];
+  /** Verifiable requirements the planner read in the issue (done section and scope); absent on older plans. */
+  acceptance_criteria?: string[];
 }
 
 export const AGENT_PLAN_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["summary", "steps", "files", "tests", "risks", "open_questions"],
+  required: ["summary", "steps", "files", "tests", "risks", "open_questions", "acceptance_criteria"],
   properties: {
     summary: { type: "string" },
     steps: { type: "array", items: { type: "string" } },
@@ -31,6 +33,7 @@ export const AGENT_PLAN_SCHEMA = {
     tests: { type: "array", items: { type: "string" } },
     risks: { type: "array", items: { type: "string" } },
     open_questions: { type: "array", items: { type: "string" } },
+    acceptance_criteria: { type: "array", items: { type: "string" } },
   },
 } as const;
 
@@ -50,6 +53,7 @@ export function parseAgentPlan(value: unknown): AgentPlan | null {
     tests: strings(v.tests),
     risks: strings(v.risks),
     open_questions: strings(v.open_questions),
+    acceptance_criteria: strings(v.acceptance_criteria).map((s) => s.trim()).filter(Boolean),
   };
 }
 
@@ -114,7 +118,11 @@ export interface ExecutionPlan {
   generatedAt: string;
   configSource: string;
   issue: Pick<Issue, "key" | "title" | "url" | "state" | "team" | "project" | "labels" | "priority" | "assignee" | "updatedAt"> & { commentCount: number };
-  acceptanceCriteria: { criteria: string[]; source: "section" | "checklist" | "none" };
+  /**
+   * `criteria`: stated in the issue. `derived`: further verifiable requirements the read-only planner
+   * read in the issue's scope (absent on older plans). Both are judged by the reviewer, one by one.
+   */
+  acceptanceCriteria: { criteria: string[]; source: "section" | "checklist" | "none"; derived?: string[] };
   dependencies: ClassifiedDependency[];
   readiness: Pick<ReadinessSummary, "parent" | "openChildren" | "blocks">;
   brief: { source: string; sha256: string; decisions: string[] } | null;
@@ -201,7 +209,7 @@ export interface BuildPlanInput {
   config: RepoConfig;
   configSource: string;
   issue: Issue;
-  criteria: { criteria: string[]; source: "section" | "checklist" | "none" };
+  criteria: { criteria: string[]; source: "section" | "checklist" | "none"; derived?: string[] };
   readiness: ReadinessSummary;
   dependencies: DependencyReport;
   brief: { source: string; sha256: string; decisions: string[] } | null;
@@ -238,7 +246,7 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
 
   for (const inv of input.invariants) if (!inv.ok) blockers.push(`${inv.rule}: ${inv.detail}`);
   for (const c of checks) if (c.verification === "script-missing") blockers.push(`check "${c.name}" runs \`${c.command}\` but package.json has no such script`);
-  if (input.criteria.source === "none") warnings.push("issue has no explicit acceptance criteria; the reviewer will judge against the description");
+  if (input.criteria.source === "none" && !input.criteria.derived?.length) warnings.push("issue has no explicit acceptance criteria; the reviewer will judge against the description");
   if (input.toolchain.source === "unresolved") blockers.push(`toolchain: ${describeNode(input.toolchain)}`);
   if (!input.protection.protected) warnings.push(`${input.baseBranch} has no branch protection or rulesets: GitHub will not enforce CI or reviews, so only manual merges are possible`);
   if (input.inspection.headSha !== input.repoInfo.baseSha) {

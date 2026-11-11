@@ -79,7 +79,9 @@ When present, show these fields:
 - the budget and cost so far;
 - blockers, verbatim;
 - check results and review findings;
-- the PR URL;
+- acceptance criteria (`criteria` in status): every one the reviewer did not find `met` — quote `needs_human` criteria verbatim as needing the user's judgement, never as done;
+- the minor-finding round (`minorRound`), when one ran: applied, declined, or rejected with the approved commit delivered instead;
+- the PR URL, and whether it is still a draft;
 - the `next` step.
 
 When there are blockers, also quote the dependency table and the isolation section of `plan.md` verbatim. Never summarize a blocker away. Self-reported agent success is not verification: point to the engine's checks and review instead. A run that FAILED because of a tripwire or a secret-scan hit means stop and tell the user. Never retry it.

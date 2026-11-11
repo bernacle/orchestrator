@@ -138,11 +138,11 @@ Otherwise the run asks you in the system prompt, exactly as in supervised mode. 
 
 - the repository and config file path;
 - `base_branch`, `local_path` and `linear.workspace`;
-- all of `permissions`, `merge`, `agents`, `limits`, `isolation` and `review`;
-- `pull_request.draft`, `forbidden_paths` and `baseline_checks`;
+- all of `permissions`, `merge`, `agents`, `limits`, `isolation` and `review` (including `review.minor_fix_rounds`);
+- `pull_request.draft`, `pull_request.mark_ready_when_delivered`, `forbidden_paths` and `baseline_checks`;
 - any per-command `network` overrides.
 
-Changing any of these makes the trust **stale**, even if the change narrows something. That includes running from a different `--config`. `context`, `doctor` and `repo trusted` then say what changed, and `orchestrator repo trust` renews it, with a prompt. Check and setup *commands* are not part of the scope: they run in the sandbox either way, just as the per-run approval never covered them.
+Changing any of these makes the trust **stale**, even if the change narrows something. So does an Orchestrator update that adds a field to the scope: the 2026-11 review-completion update added `review.minor_fix_rounds` and `pull_request.mark_ready_when_delivered`, so a repository trusted before it asks once more. That includes running from a different `--config`. `context`, `doctor` and `repo trusted` then say what changed, and `orchestrator repo trust` renews it, with a prompt. Check and setup *commands* are not part of the scope: they run in the sandbox either way, just as the per-run approval never covered them.
 
 Every trusted start or resume is audited like an approval:
 

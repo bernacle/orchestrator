@@ -186,6 +186,10 @@ program
       for (const r of findings.rounds) {
         console.log(`${c.bold(`Round ${r.attempt}`)} (${r.trigger}) on ${r.reviewedSha.slice(0, 8)}: ${r.approved ? c.green("approved") : c.yellow(r.verdict)} — ${r.summary}`);
         for (const f of r.findings) console.log(`  [${f.severity}] ${f.file ?? "-"}${f.line ? `:${f.line}` : ""} ${f.title}\n      ${f.detail}${f.suggestion ? `\n      → ${f.suggestion}` : ""}`);
+        for (const k of r.criteria) {
+          const mark = k.status === "met" ? c.green("met") : k.status === "not_met" ? c.red("NOT MET") : c.yellow("needs your judgement");
+          console.log(`  ${k.id} ${mark}: ${k.text}${k.evidence ? `\n      ${k.evidence}` : ""}`);
+        }
       }
     }),
   );

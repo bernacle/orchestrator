@@ -60,6 +60,35 @@ export function extractAcceptanceCriteria(description: string): { criteria: stri
   return { criteria: [], source: "none" };
 }
 
+/** At most this many criteria are judged one by one; more would dilute the review. */
+export const MAX_CRITERIA = 15;
+
+const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/**
+ * Criteria the planner derived from the issue that the issue's own list does not already state
+ * (compared loosely), capped so the total stays at MAX_CRITERIA.
+ */
+export function deriveAdditionalCriteria(stated: readonly string[], planned: readonly string[]): string[] {
+  const seen = new Set(stated.map(normalize));
+  const out: string[] = [];
+  for (const c of planned) {
+    const n = normalize(c);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    out.push(c.trim());
+    if (stated.length + out.length >= MAX_CRITERIA) break;
+  }
+  return out;
+}
+
+/** The run's numbered criteria: the issue's own first, then the planner's derived ones. */
+export function numberCriteria(ac: { criteria: string[]; derived?: string[] } | undefined): Array<{ id: string; text: string; source: "issue" | "planner" }> {
+  if (!ac) return [];
+  const all = [...ac.criteria.map((text) => ({ text, source: "issue" as const })), ...(ac.derived ?? []).map((text) => ({ text, source: "planner" as const }))];
+  return all.slice(0, Math.max(MAX_CRITERIA, ac.criteria.length)).map((c, i) => ({ id: `AC${i + 1}`, ...c }));
+}
+
 export function slugify(text: string, max = 40): string {
   const slug = text
     .toLowerCase()

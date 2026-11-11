@@ -221,6 +221,15 @@ export class GitWorkspace implements Workspace {
     await this.git(repoPath, ["worktree", "prune"]);
   }
 
+  async resetTo(worktreePath: string, sha: string): Promise<void> {
+    if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new Error(`refusing to reset to ${sha}: not a full commit id`);
+    // Only back along the branch's own history: never onto a commit the branch does not contain.
+    const ancestor = await runProcess("git", [...SAFE_GIT, "merge-base", "--is-ancestor", sha, "HEAD"], { cwd: worktreePath });
+    if (ancestor.exitCode !== 0) throw new Error(`refusing to reset: ${sha.slice(0, 12)} is not an ancestor of HEAD`);
+    await this.git(worktreePath, ["reset", "--quiet", "--hard", sha]);
+    await this.git(worktreePath, ["clean", "--quiet", "-fd"]);
+  }
+
   async push(worktreePath: string, branch: string): Promise<void> {
     // Plain push: never --force. A rejected push surfaces as an error for a human.
     await this.git(worktreePath, ["push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000);
