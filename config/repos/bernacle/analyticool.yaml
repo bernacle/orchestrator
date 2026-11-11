@@ -137,6 +137,10 @@ baseline_checks: true       # run all checks on the untouched base first; a red 
 pull_request:
   draft: true
   labels: []
+  # Once the reviewed commit is the PR head, CI passed on it and the independent review approved it
+  # (no acceptance criterion unmet), the orchestrator marks its draft ready for review. It never merges:
+  # merge.mode stays manual and permissions.github.merge stays false.
+  mark_ready_when_delivered: true
 
 permissions:
   agents:
