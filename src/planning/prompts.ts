@@ -180,6 +180,8 @@ export function reviewerPrompt(input: {
   previous: Finding[];
   /** The implementer's self-reported response to `previous` (to verify, not to trust). */
   dispositions?: ImplementerReport | null;
+  /** Replaces the heading line of the previous-findings section (e.g. findings raised on another commit). */
+  previousNote?: string;
   brief?: string | null;
   screenshots?: { command: string; files: string[]; commitSha: string | null } | null;
 }): string {
@@ -206,7 +208,7 @@ export function reviewerPrompt(input: {
           "Inspect them. Judge whether they show what the acceptance criteria ask for (states, themes, viewports) and whether the UI in them looks correct; report problems you can see as findings against the code that renders them.",
         ].join("\n")
       : "",
-    input.previous.length ? `\n## Findings from the previous round (verify each is actually resolved)\n${formatFindings(input.previous)}` : "",
+    input.previous.length ? `\n## ${input.previousNote ?? "Findings from the previous round (verify each is actually resolved)"}\n${formatFindings(input.previous)}` : "",
     input.previous.length && input.dispositions
       ? `\n## The implementer's response to those findings (self-reported: verify it)\n${formatDispositions(input.dispositions)}\nA declined finding stays a finding if you still think it matters; drop it only if the reason convinces you.`
       : "",
@@ -227,16 +229,20 @@ export function prOwnerMarker(runId: string): string {
   return `<!-- orchestrator-run: ${runId} -->`;
 }
 
-/** True when `body` was written by the orchestrator for this run (marker, or the footer older runs wrote). */
+/**
+ * True when `body` carries this run's marker, which only the orchestrator writes when it opens a PR.
+ * PRs opened before the marker existed have none, so their descriptions are never rewritten.
+ */
 export function prOwnedByRun(body: string | undefined, runId: string): boolean {
-  if (!body) return false;
-  return body.includes(prOwnerMarker(runId)) || body.includes(`Prepared by the orchestrator (run \`${runId}\`)`);
+  return Boolean(body?.includes(prOwnerMarker(runId)));
 }
 
 export interface PrCiStatus {
   state: "pending" | "pass" | "fail" | "none";
   sha: string;
   checks: Array<{ name: string; bucket: string }>;
+  /** CI failed and the correction budget is spent: the run stops instead of fixing it. */
+  stopping?: boolean;
 }
 
 export interface PrReviewRound {
@@ -256,6 +262,8 @@ export interface PrMinorRound {
   findings: Finding[];
   response?: ImplementerReport | null;
   reason?: string | null;
+  /** Blocking findings the review raised on the discarded attempt; the restored commit was reviewed against them. */
+  rejectedFindings?: Finding[];
 }
 
 const CRITERION_MARK: Record<CriterionReport["status"], string> = { met: "[x]", not_met: "[ ]", needs_human: "[ ]" };
@@ -273,7 +281,9 @@ function ciBlock(ci: PrCiStatus | null | undefined): string {
     case "pass":
       return `✅ Passed on \`${ci.sha.slice(0, 12)}\`${ci.checks.length ? `: ${names("pass") || ci.checks.map((k) => `\`${k.name}\``).join(", ")}` : ""}.`;
     case "fail":
-      return `❌ Failing on \`${ci.sha.slice(0, 12)}\`: ${names("fail")}. The orchestrator is correcting it; this description is updated when a fixed commit is reviewed.`;
+      return ci.stopping
+        ? `❌ Failing on \`${ci.sha.slice(0, 12)}\`: ${names("fail")}. The correction budget is spent, so the orchestrator stopped without a fix: this PR is not deliverable as is.`
+        : `❌ Failing on \`${ci.sha.slice(0, 12)}\`: ${names("fail")}. The orchestrator is correcting it; this description is updated when a fixed commit is reviewed.`;
     case "pending":
       return `⏳ Running on \`${ci.sha.slice(0, 12)}\`.`;
     case "none":
@@ -292,7 +302,7 @@ function minorBlock(m: PrMinorRound | null | undefined): string {
       return `### Minor findings\nThe implementer declined the reviewer's minor findings (${ids}) without changing code, so this PR delivers the approved commit \`${m.approvedSha.slice(0, 12)}\`.${responses}`;
     case "rejected":
     case "reverted":
-      return `### Minor findings\nA correction round for the minor findings (${ids}) was not accepted${m.reason ? ` (${m.reason})` : ""}. This PR therefore delivers the last approved commit \`${m.approvedSha.slice(0, 12)}\`, re-checked after the attempt was undone. These findings are still open:\n${formatFindings(m.findings)}`;
+      return `### Minor findings\nA correction round for the minor findings (${ids}) was not accepted${m.reason ? ` (${m.reason})` : ""}. This PR therefore delivers the last approved commit \`${m.approvedSha.slice(0, 12)}\`, re-checked after the attempt was undone${m.rejectedFindings?.length ? `, and reviewed again against the blocking findings raised on the discarded attempt (${m.rejectedFindings.map((f) => f.id).join(", ")})` : ""}. These findings are still open:\n${formatFindings(m.findings)}`;
   }
 }
 

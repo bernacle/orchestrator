@@ -2,7 +2,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentScript } from "../../src/adapters/mock/index.js";
-import { startRun } from "../../src/app.js";
+import { resumeRun, startRun } from "../../src/app.js";
 import { approve, createHarness, git, writeFeature, type Harness } from "../helpers.js";
 
 let h: Harness;
@@ -76,7 +76,40 @@ describe("minor findings after an approval", () => {
     expect(h.implementer.calls).toHaveLength(1);
   });
 
-  it("restore the approved commit, re-checked, when the round is not approved, and never spend the correction budget", async () => {
+  it("restore the approved commit, re-checked and re-reviewed against the blockers the rejected attempt raised, without spending the correction budget", async () => {
+    h = createHarness({
+      implement: (task, call) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        if (call === 2) writeFileSync(join(task.cwd, "extra.txt"), "risky\n");
+        return {};
+      },
+      review: reviews(review("approve", [finding("R2", "minor")]), review("request_changes", [finding("R3", "major")]), review("approve")),
+      config: { merge: { max_fix_attempts: 0 } },
+    });
+    const run = await start();
+
+    expect(run.state).toBe("READY_TO_MERGE");
+    const approvedSha = run.context.minorRound!.approvedSha;
+    expect(run.context.minorRound?.status).toBe("reverted");
+    expect(run.context.minorRound?.rejectedFindings?.map((f) => f.id)).toEqual(["R3"]);
+    expect(run.context.rounds.map((r) => r.trigger)).toEqual(["initial", "minor", "revert"]);
+    // Delivered: exactly the commit approved before the round.
+    expect(run.context.reviewedSha).toBe(approvedSha);
+    expect(pushedHead(run.context.branch!)).toBe(approvedSha);
+    expect(git(h.origin, "show", `${approvedSha}:feature.txt`)).toBe("hello");
+    expect(() => git(h.origin, "show", `${approvedSha}:extra.txt`)).toThrow();
+    // R3 might apply to the approved commit too: it was reviewed again against it, not waved through.
+    expect(h.reviewer.calls).toHaveLength(3);
+    expect(h.reviewer.calls[2]!.prompt).toContain("raised on a later attempt that was discarded");
+    expect(h.reviewer.calls[2]!.prompt).toContain("R3 [major]");
+    expect(run.context.rounds.at(-1)?.checks?.every((c) => c.ok)).toBe(true);
+    expect(eventTypes()).toContain("minor.restored");
+    expect(body()).toContain(`delivers the last approved commit \`${approvedSha.slice(0, 12)}\``);
+    expect(body()).toContain("reviewed again against the blocking findings raised on the discarded attempt (R3)");
+    expect(body()).toContain("R2 [minor]");
+  });
+
+  it("never deliver the restored commit when its re-review finds the blocker applies to it too", async () => {
     h = createHarness({
       implement: (task, call) => {
         writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
@@ -87,24 +120,67 @@ describe("minor findings after an approval", () => {
       config: { merge: { max_fix_attempts: 0 } },
     });
     const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/review not approved/);
+    expect(h.host.prs).toHaveLength(0);
+  });
 
+  it("reuse the approval of the restored commit when the rejection raised no blocking finding", async () => {
+    h = createHarness({
+      implement: (task, call) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        if (call === 2) writeFileSync(join(task.cwd, "extra.txt"), "x\n");
+        return {};
+      },
+      review: reviews(review("approve", [finding("R2", "minor")]), review("request_changes", [finding("R4", "minor")])),
+    });
+    const run = await start();
     expect(run.state).toBe("READY_TO_MERGE");
-    const approvedSha = run.context.minorRound!.approvedSha;
-    expect(run.context.minorRound?.status).toBe("reverted");
-    expect(run.context.rounds.map((r) => r.trigger)).toEqual(["initial", "minor", "revert"]);
-    // Delivered: exactly the commit approved before the round, with its approval; no third review.
-    expect(run.context.reviewedSha).toBe(approvedSha);
-    expect(pushedHead(run.context.branch!)).toBe(approvedSha);
-    expect(git(h.origin, "show", `${approvedSha}:feature.txt`)).toBe("hello");
-    expect(() => git(h.origin, "show", `${approvedSha}:extra.txt`)).toThrow();
     expect(h.reviewer.calls).toHaveLength(2);
     expect(run.context.rounds.at(-1)?.review?.reused).toBe(true);
-    // The restored commit was checked again before delivery.
-    expect(run.context.rounds.at(-1)?.checks?.every((c) => c.ok)).toBe(true);
-    expect(eventTypes()).toContain("minor.restored");
     expect(eventTypes()).toContain("review.reused");
-    expect(body()).toContain(`delivers the last approved commit \`${approvedSha.slice(0, 12)}\``);
-    expect(body()).toContain("R2 [minor]");
+  });
+
+  it("restore the approved commit when the implementer fails during the round", async () => {
+    h = createHarness({
+      implement: (task, call) => {
+        if (call === 1) writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        return call === 1 ? {} : { ok: false, error: "budget exhausted" };
+      },
+      review: reviews(review("approve", [finding("R2", "minor")])),
+    });
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(run.context.minorRound?.status).toBe("reverted");
+    expect(run.context.minorRound?.reason).toMatch(/budget exhausted/);
+    expect(h.reviewer.calls).toHaveLength(1);
+  });
+
+  it("block, then re-run the checks on resume, when the restored commit no longer passes", async () => {
+    h = createHarness({
+      implement: (task, call) => {
+        writeFileSync(join(task.cwd, "feature.txt"), "hello\n");
+        if (call === 1) writeFileSync(join(task.cwd, ".gitignore"), "flaky-marker\n");
+        else {
+          // An ignored leftover survives the restore and breaks the check: an "environment" change.
+          writeFileSync(join(task.cwd, "flaky-marker"), "x\n");
+          writeFileSync(join(task.cwd, "extra.txt"), "x\n");
+        }
+        return {};
+      },
+      review: reviews(review("approve", [finding("R2", "minor")])),
+      config: { checks: [{ name: "feature-exists", run: "test -f feature.txt && test ! -f flaky-marker" }] },
+    });
+    let run = await start();
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/restored after the minor-finding round, no longer passes/);
+    expect(h.host.prs).toHaveLength(0);
+
+    rmSync(join(run.context.worktreePath!, "flaky-marker"));
+    run = await resumeRun(h.app, run.id, { ciWaitMinutes: 0 });
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(run.context.reviewedSha).toBe(run.context.minorRound?.approvedSha);
+    expect(run.context.rounds.at(-1)?.checks?.every((c) => c.ok)).toBe(true);
   });
 
   it("restore the approved commit when the round breaks the checks", async () => {
@@ -285,6 +361,31 @@ describe("PR description and delivery", () => {
     expect(eventTypes()).toContain("pr.body_not_owned");
   });
 
+  it("stops editing a description a person changed, even when the marker survives", async () => {
+    h = createHarness();
+    const origCreate = h.host.createPullRequest.bind(h.host);
+    h.host.createPullRequest = async (input) => {
+      const pr = await origCreate(input);
+      const live = h.host.prs.find((p) => p.number === pr.number)!;
+      live.body = `${live.body}\n\nReviewer notes from a person.`;
+      return pr;
+    };
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(h.host.bodyUpdates).toHaveLength(0);
+    expect(body()).toContain("Reviewer notes from a person.");
+  });
+
+  it("keeps delivering when a description update fails", async () => {
+    h = createHarness();
+    h.host.updatePullRequestBody = async () => {
+      throw new Error("gh: HTTP 422");
+    };
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(eventTypes()).toContain("pr.body_update_failed");
+  });
+
   it("marks the PR ready for review once delivered, only when the operator opted in, and never merges", async () => {
     h = createHarness({ config: { pull_request: { mark_ready_when_delivered: true } } });
     const run = await start();
@@ -293,6 +394,14 @@ describe("PR description and delivery", () => {
     expect(h.host.prs[0]!.isDraft).toBe(false);
     expect(h.host.merges).toHaveLength(0);
     expect(run.reason).toMatch(/marked ready for review; a human merges/);
+  });
+
+  it("does not mark the PR ready without CI that passed, even when the config does not require CI", async () => {
+    h = createHarness({ config: { pull_request: { mark_ready_when_delivered: true }, merge: { require_ci: false } } });
+    h.host.ciScript = () => [];
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(h.host.readied).toHaveLength(0);
   });
 
   it("keeps the PR a draft by default", async () => {

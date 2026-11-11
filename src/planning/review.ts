@@ -151,7 +151,14 @@ export function parseReview(value: unknown): ReviewOutcome {
  * A criterion is never reported as met without the reviewer saying so.
  */
 export function criteriaReport(outcome: Pick<ReviewOutcome, "criteria"> | null, criteria: readonly Criterion[]): CriterionReport[] {
-  const byId = new Map((outcome?.criteria ?? []).map((v) => [v.id.toUpperCase(), v]));
+  // A criterion judged twice keeps its worst verdict: a repeated id can never turn not_met into met.
+  const rank: Record<CriterionStatus, number> = { met: 0, needs_human: 1, not_met: 2 };
+  const byId = new Map<string, CriterionVerdict>();
+  for (const v of outcome?.criteria ?? []) {
+    const key = v.id.toUpperCase();
+    const prev = byId.get(key);
+    if (!prev || rank[v.status] > rank[prev.status]) byId.set(key, v);
+  }
   return criteria.map((c) => {
     const v = byId.get(c.id.toUpperCase());
     return v ? { ...c, status: v.status, evidence: v.evidence } : { ...c, status: "needs_human", evidence: "The reviewer gave no verdict for this criterion." };

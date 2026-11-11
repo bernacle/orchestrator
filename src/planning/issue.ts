@@ -63,7 +63,7 @@ export function extractAcceptanceCriteria(description: string): { criteria: stri
 /** At most this many criteria are judged one by one; more would dilute the review. */
 export const MAX_CRITERIA = 15;
 
-const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const normalize = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 
 /**
  * Criteria the planner derived from the issue that the issue's own list does not already state

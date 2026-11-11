@@ -51,6 +51,16 @@ describe("review decision", () => {
     expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).toContain("actionable");
   });
 
+  it("a criterion judged twice keeps its worst verdict", () => {
+    const d = decideReview(
+      parseReview({ verdict: "approve", summary: "", findings: [], criteria: [...verdicts("not_met", "met"), { id: "ac1", status: "met", evidence: "" }] }),
+      ["blocker", "major"],
+      criteria,
+    );
+    expect(d.approved).toBe(false);
+    expect(d.criteria[0]!.status).toBe("not_met");
+  });
+
   it("criteriaReport keeps every criterion in order", () => {
     expect(criteriaReport(null, criteria).map((c) => [c.id, c.status])).toEqual([
       ["AC1", "needs_human"],
@@ -80,6 +90,8 @@ describe("implementer report", () => {
 describe("criteria from the planner", () => {
   it("adds only requirements the issue's own list does not state, capped", () => {
     expect(deriveAdditionalCriteria(["Renders two themes."], ["renders two themes", "Axes stay readable", "axes stay readable!"])).toEqual(["Axes stay readable"]);
+    // Non-Latin text is compared, not dropped.
+    expect(deriveAdditionalCriteria(["Gráfico legível"], ["gráfico legível", "Добавить тесты"])).toEqual(["Добавить тесты"]);
     const many = Array.from({ length: 30 }, (_, i) => `req ${i}`);
     expect(deriveAdditionalCriteria(["a", "b"], many)).toHaveLength(MAX_CRITERIA - 2);
   });
@@ -134,8 +146,8 @@ describe("PR description", () => {
     expect(prOwnedByRun(body, base.runId)).toBe(true);
     expect(prOwnedByRun(body, "other-run")).toBe(false);
     expect(prOwnedByRun("A person's text", base.runId)).toBe(false);
-    // PRs opened before the marker existed carry the footer.
-    expect(prOwnedByRun("Prepared by the orchestrator (run `acm-1-abc123`). …", base.runId)).toBe(true);
+    // PRs opened before the marker existed only carry the footer: never treated as the engine's to rewrite.
+    expect(prOwnedByRun("Prepared by the orchestrator (run `acm-1-abc123`). …", base.runId)).toBe(false);
     expect(body.startsWith(prOwnerMarker(base.runId))).toBe(true);
   });
 
