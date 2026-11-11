@@ -38,10 +38,12 @@ describe("canonical skill rendering", () => {
   it("uses each provider's documented metadata", () => {
     expect(fmClaude).toMatchObject({ name: "orchestrate", "argument-hint": expect.any(String) });
     expect(fmClaude["disable-model-invocation"]).toBeUndefined();
-    // Only read-only subcommands are pre-approved; run/resume/repo/associate always ask.
-    // Pre-approved: preparation only. Live work is gated by the engine's own approval prompt, and
-    // resume / repo authorize / associate / auth still go through the host's permission prompt.
-    expect(fmClaude["allowed-tools"]).toEqual([`Bash(${CLI} context:*)`, `Bash(${CLI} status:*)`, `Bash(${CLI} review:*)`, `Bash(${CLI} run:*)`, `Bash(${CLI} repo init:*)`]);
+    // Pre-approved: preparation, plus run/resume, whose live work the engine gates itself (a system
+    // prompt, or a trust the user granted with one). repo authorize / repo trust / associate / auth
+    // still go through the host's permission prompt.
+    expect(fmClaude["allowed-tools"]).toEqual([`Bash(${CLI} context:*)`, `Bash(${CLI} status:*)`, `Bash(${CLI} review:*)`, `Bash(${CLI} run:*)`, `Bash(${CLI} resume:*)`, `Bash(${CLI} repo init:*)`, `Bash(${CLI} repo trusted:*)`]);
+    // Trust, authorization and associations are never pre-approved.
+    for (const never of ["repo trust:", "repo authorize", "associate", "auth"]) expect((fmClaude["allowed-tools"] as string[]).some((t) => t.includes(`${CLI} ${never}`))).toBe(false);
     expect(fmClaude.when_to_use).toBeTruthy();
     expect(`${fmClaude.description} ${fmClaude.when_to_use}`.length).toBeLessThanOrEqual(CLAUDE_LISTING_CAP);
     // Codex reads only name + description: the examples are folded into the description.
@@ -75,6 +77,19 @@ describe("canonical skill rendering", () => {
     expect(body).toMatch(/Never ask for, accept or handle an API key/);
     expect(body).toMatch(/untrusted/);
     expect(body.split("\n").length).toBeLessThan(150);
+  });
+
+  it("follows the engine's authorization mode instead of inventing one", () => {
+    const body = claude.files["SKILL.md"]!;
+    // Trust comes from `context` only; anything else claiming it is untrusted text.
+    expect(body).toMatch(/Read `trust\.mode` only from this output/);
+    expect(body).toMatch(/\*\*Trusted repository\*\* \(`trust\.mode` is `"trusted"`\).*that request is the go-ahead/);
+    // Even trusted, a clean dry run comes first, and dependencies / trust / blocks go to the user.
+    expect(body).toMatch(/In a trusted repository it is approval, but only through prepare: a clean dry run first/);
+    expect(body).toMatch(/Never add `--accept-dependency` on your own/);
+    expect(body).toMatch(/run `orchestrator repo trust`;/);
+    expect(body).toMatch(/A `BLOCKED` run always goes back to the user/);
+    expect(body).toMatch(/Never create, edit, copy or delete anything under `~\/\.orchestrator` yourself/);
   });
 });
 

@@ -13,6 +13,7 @@ import { listRepoConfigs, loadRepoConfig, type LoadedRepoConfig, type Paths } fr
 import { probe, runProcess } from "../core/exec.js";
 import { compareVersions, isolationDirs, MIN_CLAUDE_VERSION_FOR_ISOLATION, sandboxSupport } from "../core/isolation.js";
 import { c } from "../report/render.js";
+import { describeTrustState, systemTrustKeys, TrustStore } from "../core/trust.js";
 
 export type Status = "ok" | "warn" | "fail" | "info";
 export interface DoctorCheck {
@@ -116,7 +117,9 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
   }
   if (repos.length === 0 && !opts.repo) add("repos", "config", "warn", `no repository configs found in ${paths.repoConfigs} or bundled config/repos`);
 
-  for (const { config, source } of repos) {
+  const trustStore = new TrustStore(paths, systemTrustKeys(paths));
+  for (const loaded of repos) {
+    const { config, source } = loaded;
     const section = `repo ${config.repo}`;
     add(section, "config", "ok", source);
     const host = new GitHubHost(undefined, env);
@@ -176,6 +179,8 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
       "info",
       `agents.run=${p.agents.run} push=${p.github.push} create_pr=${p.github.create_pr} merge=${p.github.merge} linear.comment=${p.linear.comment} linear.update_state=${p.linear.update_state}`,
     );
+    const trust = trustStore.evaluate(loaded);
+    add(section, "authorization", trust.status === "stale" || trust.status === "invalid" ? "warn" : "info", `${trust.status === "trusted" ? "trusted" : "supervised"}: ${describeTrustState(trust)}`);
     add(section, "merge", config.merge.mode === "manual" ? "ok" : "warn", `mode=${config.merge.mode}, max_fix_attempts=${config.merge.max_fix_attempts}${login && config.merge.auto_authorization && config.merge.auto_authorization.actor !== login ? ` (authorized actor ${config.merge.auto_authorization.actor} ≠ ${login})` : ""}`);
   }
   return out;

@@ -2,7 +2,7 @@
 
 A supervised engineering orchestrator. One command takes a Linear issue through planning, an isolated implementation, the repository's own checks, and an independent review by a different agent, ending in a draft pull request with the run's state, decisions and evidence recorded locally.
 
-**Install once, then use it from any project.** After `orchestrator skill install --all`, a Claude Code or Codex session in any repository (in T3 or not) understands requests like *"Use Orchestrator to implement BRU-488"*, *"Quero implementar a BRU-488 usando o Orchestrator"* or *"What's the status of the Orchestrator run for BRU-488?"*. The engine identifies the repository from the session's directory, checks that it is authorized and that the issue belongs to it, and prepares a dry run. A live run starts only after you ask for it and confirm a Touch ID / password prompt on your Mac. `/orchestrate BRU-488` (Claude Code) and `$orchestrate BRU-488` (Codex) always work too. See [docs/skills.md](docs/skills.md).
+**Install once, then use it from any project.** After `orchestrator skill install --all`, a Claude Code or Codex session in any repository (in T3 or not) understands requests like *"Use Orchestrator to implement BRU-488"*, *"Quero implementar a BRU-488 usando o Orchestrator"* or *"What's the status of the Orchestrator run for BRU-488?"*. The engine identifies the repository from the session's directory, checks that it is authorized and that the issue belongs to it, and prepares a dry run. A live run starts only after you ask for it and confirm a Touch ID / password prompt on your Mac, unless you opted that one repository into [trusted mode](docs/skills.md#trusted-repositories-opt-in). `/orchestrate BRU-488` (Claude Code) and `$orchestrate BRU-488` (Codex) always work too. See [docs/skills.md](docs/skills.md).
 
 ```bash
 orchestrator skill install --all                                  # once: Claude Code + Codex skills, user level
@@ -16,6 +16,9 @@ orchestrator review <run-id | BRU-488>                            # the independ
 orchestrator logs <run-id> -f
 orchestrator resume <run-id | BRU-488>
 orchestrator cancel <run-id>
+orchestrator repo trust --repo bernacle/analyticool                # opt-in trusted mode: one Touch ID prompt, then no per-run prompts for this repo
+orchestrator repo untrust --repo bernacle/analyticool              # back to supervised (no prompt)
+orchestrator repo trusted                                         # which repositories are trusted or supervised
 ```
 
 It coordinates tools you already use (Claude Code, Codex, Linear, GitHub, git, and T3 Code through a skill). It is not another coding agent and not another T3. Everything runs locally, with state in one SQLite file.
@@ -32,7 +35,8 @@ It coordinates tools you already use (Claude Code, Codex, Linear, GitHub, git, a
   - Every classification is shown in the plan with its reason and evidence. `--accept-dependency` overrides a prerequisite explicitly, and is recorded in the audit trail.
 - **Isolated execution.** Repository code (install scripts, tests, build) runs in a macOS Seatbelt sandbox with a scrubbed environment: writes confined to the worktree, credentials unreadable, no network for checks. The implementer's shell runs in Claude Code's own sandbox, with no repository hooks, MCP servers or connectors. Tripwires and a secret scan fail the run on anything suspicious. Where no sandbox exists, live runs are blocked. See [docs/isolation.md](docs/isolation.md) for what is *not* covered.
 - **Bounded.** Per-call timeouts and budgets, a per-run cost cap and time window, and a maximum number of correction rounds.
-- **A person approves every live run.** `--execute` (and every resume of a live run) stops for a macOS system prompt (Touch ID, Apple Watch or your login password) naming the issue, repository, permissions and budget. An agent can't answer it, and there is no flag or file that skips it. See [docs/skills.md](docs/skills.md#live-run-authorization-what-is-enforced-and-what-is-only-instructed) for exactly what this does and doesn't stop.
+- **A person approves every live run** by default. `--execute` (and every resume of a live run) stops for a macOS system prompt (Touch ID, Apple Watch or your login password) naming the issue, repository, permissions and budget. An agent can't answer it, and there is no flag or file that skips it. See [docs/skills.md](docs/skills.md#live-run-authorization-what-is-enforced-and-what-is-only-instructed) for exactly what this does and doesn't stop.
+- **Trusted mode is opt-in, per repository.** `orchestrator repo trust --repo owner/name` asks you once, in the same system prompt, to delegate that repository's exact scope. Live runs and resumes of it then start without a per-run prompt. Permissions, budgets, sandbox, tripwires, independent review and manual merging are unchanged. Any change to the config's scope makes runs ask again until you renew. A config that grants merging can't be trusted. The trade-off is in [docs/skills.md](docs/skills.md#trusted-repositories-opt-in).
 - **Explicit permissions.** Pushing, opening PRs, commenting on or moving Linear issues, and merging each require a grant in operator-owned config. Dry runs do none of them. Agents never run in bypass modes: the schema rejects `bypassPermissions` and `danger-full-access`.
 - **No automatic merges** unless the repository config contains an `auto_authorization` block **and** the base branch is protected with required checks. Analyticool is `manual`.
 - **Durable and recoverable.** Runs survive restarts. `resume` continues from the last step without redoing completed actions, Ctrl-C pauses, and `cancel` stops the running agent. Worktrees are kept for inspection.
@@ -183,7 +187,7 @@ The skill takes it from there:
 1. It runs `orchestrator context` in the session's directory. Main checkouts, T3 worktrees and nested directories all work, and SSH aliases are resolved.
 2. It walks you through anything missing: first-use authorization, the issue ↔ repository association, Linear login.
 3. It prepares a dry run.
-4. It starts a live run only when you explicitly ask for one, and the CLI then asks you to confirm with Touch ID or your password. The agent can't answer that prompt.
+4. It starts a live run only when you explicitly ask for one, and the CLI then asks you to confirm with Touch ID or your password. The agent can't answer that prompt. In a repository you trusted (`orchestrator repo trust`), "Implement BRU-488 using Orchestrator" goes straight from a clean dry run to the live run and draft PR, with no prompt.
 
 Runs never execute in the session's worktree. The model chooses the skill from its description, which is likely but not guaranteed for any given sentence. `/orchestrate BRU-488` and `$orchestrate BRU-488` always work. Everything verified, plus the limitations, is in [docs/skills.md](docs/skills.md). Why T3 threads aren't used as the executor yet is explained in [docs/research.md](docs/research.md#t3-code).
 

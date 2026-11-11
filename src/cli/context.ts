@@ -1,10 +1,12 @@
 import type { Command } from "commander";
-import { authorizeRepository, confirmAssociation, RunError } from "../app.js";
+import { authorizeRepository, confirmAssociation, repositoryTrust, RunError, trustRepository, untrustRepository } from "../app.js";
+import { describeTrustState } from "../core/trust.js";
 import { inspectRequest, publicContext, type RequestContext } from "../intake/context.js";
 import { proposeConfiguration } from "../intake/first-use.js";
 import { parseIssueRef } from "../intake/issue-ref.js";
 import { SnapshotTracker } from "../adapters/snapshot.js";
 import { configStatus } from "../intake/resolve.js";
+import { listRepoConfigs } from "../config/load.js";
 import { c } from "../report/render.js";
 import { output, printJson, withApp } from "./common.js";
 
@@ -97,6 +99,70 @@ export function registerContextCommands(program: Command): void {
       }),
     );
 
+  const repoArg = (positional: string | undefined, opts: { repo?: string }): string => {
+    const r = opts.repo ?? positional;
+    if (!r) throw new RunError("name the repository: --repo owner/name");
+    if (positional && opts.repo && positional.toLowerCase() !== opts.repo.toLowerCase()) throw new RunError(`two different repositories given (${positional}, ${opts.repo})`);
+    return r;
+  };
+  repo
+    .command("trust")
+    .description(
+      "Trusted mode (opt-in): let live runs and resumes of ONE repository start without a per-run system prompt, after you confirm a one-time prompt (Touch ID / password on macOS) showing exactly what is delegated. Repository permissions, budgets, sandbox, review and manual merging still apply; any change to the config's scope makes runs ask again until you renew",
+    )
+    .argument("[owner/name]", "repository (or --repo)")
+    .option("--repo <owner/name>", "repository to trust")
+    .option("--json", "versioned JSON (schemaVersion 1)")
+    .action((positional: string | undefined, opts: { repo?: string; json?: boolean }) =>
+      withApp(async (app) => {
+        output.json = Boolean(opts.json);
+        const name = repoArg(positional, opts);
+        const r = await trustRepository(app, name);
+        const data = { repo: r.record.repo, state: r.state, file: r.file, trustId: r.record.id, scopeHash: r.record.scopeHash, configSource: r.record.scope.configSource, trustedBy: r.record.trustedBy, trustedAt: r.record.trustedAt, revoke: `orchestrator repo untrust ${r.record.repo}` };
+        if (opts.json) return printJson("trust", data);
+        console.log(
+          r.state === "already_trusted"
+            ? `${r.record.repo} is already trusted for its current configuration (trust ${r.record.id}, ${r.record.trustedAt.slice(0, 10)}); nothing changed.`
+            : `${c.green("Trusted")} ${r.record.repo} (trust ${r.record.id}) → ${r.file}
+Live runs and resumes of ${r.record.repo} now start without a per-run prompt, while ${r.record.scope.configSource} keeps this scope.
+Revoke any time: orchestrator repo untrust ${r.record.repo}`,
+        );
+      }),
+    );
+  repo
+    .command("untrust")
+    .description("Revoke trusted mode for a repository: every live run and resume asks in a system prompt again. Needs no approval (it only removes authority)")
+    .argument("[owner/name]", "repository (or --repo)")
+    .option("--repo <owner/name>", "repository to stop trusting")
+    .option("--json", "versioned JSON (schemaVersion 1)")
+    .action((positional: string | undefined, opts: { repo?: string; json?: boolean }) =>
+      withApp((app) => {
+        output.json = Boolean(opts.json);
+        const name = repoArg(positional, opts);
+        const removed = untrustRepository(app, name);
+        if (opts.json) return printJson("untrust", { repo: name.toLowerCase(), removed });
+        console.log(removed ? `${c.green("Revoked")} trust for ${name}: live runs and resumes ask again.` : `${name} was not trusted; nothing changed.`);
+      }),
+    );
+  repo
+    .command("trusted")
+    .description("Read-only: show the authorization mode (trusted or supervised) of one repository, or of every configured or trusted repository")
+    .option("--repo <owner/name>", "one repository")
+    .option("--json", "versioned JSON (schemaVersion 1)")
+    .action((opts: { repo?: string; json?: boolean }) =>
+      withApp((app) => {
+        output.json = Boolean(opts.json);
+        const names = opts.repo ? [opts.repo] : [...new Set([...listRepoConfigs(app.paths).map((l) => l.config.repo.toLowerCase()), ...app.trust.repos()])].sort();
+        const rows = names.map((n) => {
+          const t = repositoryTrust(app, n);
+          return { repo: n, mode: t.state?.status === "trusted" ? "trusted" : "supervised", trust: t.state?.status ?? "unknown", detail: t.state ? describeTrustState(t.state) : t.error, configSource: t.loaded?.source ?? null };
+        });
+        if (opts.json) return printJson("trust_status", rows);
+        if (!rows.length) return console.log("No configured repositories.");
+        for (const r of rows) console.log(`${c.bold(r.repo)}  ${r.mode === "trusted" ? c.yellow("trusted") : "supervised"}  ${c.dim(r.detail ?? "")}`);
+      }),
+    );
+
   program
     .command("associate")
     .description("Record that an issue belongs to a repository after you confirm a system prompt (stored in ~/.orchestrator/associations.json)")
@@ -128,13 +194,14 @@ export function renderContext(ctx: RequestContext): string {
   if (ctx.association) lines.push(`${ok(ctx.association.verified)} association  ${ctx.association.verified ? ctx.association.evidence.map((e) => e.detail).join("; ") : ctx.association.remedy}`);
   if (ctx.runs.active.length) lines.push(`${c.yellow("●")} active runs  ${ctx.runs.active.map((x) => `${x.id} ${x.state}${x.driving ? " (running)" : ""}`).join(", ")}`);
   else if (ctx.runs.recent.length) lines.push(`  recent runs  ${ctx.runs.recent.map((x) => `${x.id} ${x.mode} ${x.state}`).join(", ")}`);
-  if (ctx.approval) lines.push(`${ok(ctx.approval.available)} approval     ${ctx.approval.detail}`);
+  if (ctx.trust) lines.push(`${ctx.trust.mode === "trusted" ? c.yellow("●") : " "} authorization ${ctx.trust.mode}: ${ctx.trust.detail}`);
+  if (ctx.approval && ctx.trust?.mode !== "trusted") lines.push(`${ok(ctx.approval.available)} approval     ${ctx.approval.detail}`);
   lines.push("", c.bold("Modes"));
   for (const m of ctx.modes) lines.push(`  ${ok(m.available)} ${m.id.padEnd(24)} ${m.available ? c.dim(m.command) : c.dim(`unavailable: ${m.missing.join("; ")}`)}`);
   for (const w of ctx.warnings) lines.push(c.yellow(`warning: ${w}`));
   if (ctx.nextActions.length) {
     lines.push("", c.bold("Next"));
-    for (const a of ctx.nextActions) lines.push(`  ${a.command}${a.needsUserApproval ? c.yellow("  (needs your approval)") : ""}${a.userRunsIt ? c.yellow("  (run it yourself)") : ""}\n    ${c.dim(a.description)}`);
+    for (const a of ctx.nextActions) lines.push(`  ${a.command}${a.needsUserApproval ? c.yellow("  (needs your approval)") : ""}${a.trusted ? c.yellow("  (trusted: no per-run prompt)") : ""}${a.userRunsIt ? c.yellow("  (run it yourself)") : ""}\n    ${c.dim(a.description)}`);
   }
   return lines.join("\n");
 }

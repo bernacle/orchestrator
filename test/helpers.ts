@@ -11,6 +11,7 @@ import type { Adapters, Issue } from "../src/adapters/types.js";
 import { openApp, type App } from "../src/app.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import type { ApprovalRequest, Approver } from "../src/core/approval.js";
+import { fileTrustKeys } from "../src/core/trust.js";
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
@@ -160,6 +161,8 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
     const app: App = openApp({
       env,
       approver,
+      // Never the real login Keychain in tests: trust seal keys go to the harness's own home.
+      trustKeys: fileTrustKeys(join(root, "home", "credentials")),
       tracker: () => tracker,
       adapters: (): Adapters => ({
         tracker,

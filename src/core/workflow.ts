@@ -97,6 +97,12 @@ export interface RunContext {
     channel: string;
     user: string;
     detail: string;
+    /**
+     * "trust": no prompt; the repository was trusted for this exact scope (core/trust.ts). Absent
+     * on runs created before trusted mode existed, which were all approved by a person.
+     */
+    basis?: "approval" | "trust";
+    trust?: { id: string; scopeHash: string; trustedBy: string; trustedAt: string } | null;
   } | null;
   /** Start of the current limit window (run creation, reset on operator resume). */
   limitWindowStartedAt?: string;
@@ -283,7 +289,7 @@ function enforceLimits(ctx: Ctx, what: string, metered = true): number {
   const started = Date.parse(ctx.run.context.limitWindowStartedAt ?? ctx.run.createdAt);
   const minutes = (ctx.now().getTime() - started) / 60_000;
   if (minutes > limits.max_run_minutes) {
-    throw new BlockedError(`run time limit reached before ${what}: ${Math.round(minutes)} of ${limits.max_run_minutes} minutes (limits.max_run_minutes); resume to grant a new window`);
+    throw new BlockedError(`run time limit reached before ${what}: ${Math.round(minutes)} of ${limits.max_run_minutes} minutes (limits.max_run_minutes); a resume approved by a person grants a new window (in a trusted repository: resume --require-approval)`);
   }
   return remaining;
 }
