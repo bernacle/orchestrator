@@ -9,7 +9,7 @@ import type { BranchProtection, CheckBucket, CodeHost, PrEvidence, PullRequestSt
  * is configured with. Never passes --admin; merges always pin --match-head-commit.
  */
 
-const PR_FIELDS = "number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,body";
+const PR_FIELDS = "number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,body,mergedAt,mergeCommit,mergedBy";
 
 type Gh = (args: string[]) => Promise<string>;
 
@@ -187,6 +187,12 @@ export class GitHubHost implements CodeHost {
     }
   }
 
+  async compareCommits(repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>> {
+    if (![base, head].every((s) => /^[0-9a-f]{7,64}$/.test(s))) throw new Error("compareCommits takes commit ids only");
+    const data = await this.json<{ commits?: Array<{ sha: string; commit: { message: string } }> }>(["api", `repos/${repo}/compare/${base}...${head}`]);
+    return (data.commits ?? []).map((c) => ({ sha: c.sha, message: c.commit.message.split("\n")[0] ?? "" }));
+  }
+
   async markPullRequestReady(input: { repo: string; number: number }): Promise<void> {
     await this.gh(["pr", "ready", String(input.number), "--repo", input.repo]);
   }
@@ -214,6 +220,9 @@ interface RawPr {
   mergeStateStatus: string;
   reviewDecision: string | null;
   body?: string;
+  mergedAt?: string | null;
+  mergeCommit?: { oid: string } | null;
+  mergedBy?: { login: string } | null;
   statusCheckRollup: Array<
     | { __typename: "CheckRun"; name: string; status: string; conclusion: string | null; detailsUrl?: string }
     | { __typename: "StatusContext"; context: string; state: string; targetUrl?: string }
@@ -262,6 +271,9 @@ export function mapPr(pr: RawPr): PullRequestStatus {
       detailsUrl: c.__typename === "CheckRun" ? c.detailsUrl : c.targetUrl,
     })),
     ...(typeof pr.body === "string" ? { body: pr.body } : {}),
+    ...(pr.mergedAt ? { mergedAt: pr.mergedAt } : {}),
+    ...(pr.mergeCommit?.oid ? { mergeCommitSha: pr.mergeCommit.oid } : {}),
+    ...(pr.mergedBy?.login ? { mergedBy: pr.mergedBy.login } : {}),
   };
 }
 

@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { cancelRun, findRunOrThrow, IntakeError, openApp, resumeRun, RunError, startRun, type App } from "../app.js";
+import { cancelRun, findRunOrThrow, IntakeError, openApp, reconcileRunById, resumeRun, RunError, startRun, watchRunById, type App } from "../app.js";
+import { reconcileRuns, settleRun } from "../core/settle.js";
+import { buildDeliveryReport, renderDeliveryMarkdown } from "../report/delivery.js";
 import { ConfigError, listRepoConfigs, loadRepoConfig, PACKAGE_ROOT } from "../config/load.js";
 import { CredentialError } from "../credentials/linear.js";
 import { LeaseError, type RunRecord } from "../core/store.js";
@@ -153,8 +155,12 @@ program
       output.json = Boolean(opts.json);
       if (target) {
         const found = await runsForTarget(app, target, opts.repo ? { repo: opts.repo } : {});
+        // Status first records anything a person did to the PRs (merge, close): read-only, no approval.
+        found.runs = (await reconcileRuns(app, found.runs as Array<RunRecord<RunContext>>)) as typeof found.runs;
         if (found.byId) {
-          const run = found.byId;
+          const run = found.runs[0] as RunRecord<RunContext>;
+          // Catch up a report or notification a crash may have missed (both are idempotent).
+          if (!app.store.leaseHolder(run.id)) await settleRun(app, run);
           if (opts.json) printJson("run_detail", { run: summarizeRun(app.store, run), artifacts: app.store.artifacts(run.id), effects: app.store.effects(run.id) });
           else console.log(renderRunDetail(run, app.store.artifacts(run.id), app.store.effects(run.id), app.store.leaseHolder(run.id)));
           return;
@@ -164,7 +170,7 @@ program
         else console.log(runs.length ? renderStatusTable(runs, (rid) => app.store.leaseHolder(rid)) : `No runs for ${found.issueKey}${found.repo ? ` on ${found.repo}` : ""}.`);
         return;
       }
-      const runs = app.store.listRuns(opts.limit) as Array<RunRecord<RunContext>>;
+      const runs = await reconcileRuns(app, app.store.listRuns(opts.limit) as Array<RunRecord<RunContext>>);
       if (opts.json) printJson("runs", runs.map((r) => summarizeRun(app.store, r)));
       else console.log(renderStatusTable(runs, (rid) => app.store.leaseHolder(rid)));
     }),
@@ -191,6 +197,48 @@ program
           console.log(`  ${k.id} ${mark}: ${k.text}${k.evidence ? `\n      ${k.evidence}` : ""}`);
         }
       }
+    }),
+  );
+
+program
+  .command("report")
+  .description("The run's delivery report: outcome, PR and reviewed commit, checks and CI, acceptance criteria, open findings, review history, screenshots, recovery and API-equivalent usage")
+  .argument("<target>", "run id or prefix, or an issue key / Linear URL (its newest live run)")
+  .option("--repo <owner/name>", "with an issue: only runs on this repository")
+  .option("--json", "versioned JSON (schemaVersion 1)")
+  .action((target: string, opts: { repo?: string; json?: boolean }) =>
+    withApp(async (app) => {
+      output.json = Boolean(opts.json);
+      const found = await runsForTarget(app, target, opts.repo ? { repo: opts.repo } : {});
+      const picked = (found.byId ?? found.runs.find((r) => r.mode === "supervised")) as RunRecord<RunContext> | undefined;
+      if (!picked) throw new RunError(`no live run for ${found.issueKey ?? target}`);
+      const run = await reconcileRunById(app, picked.id);
+      const report = app.redactor.redactValue(buildDeliveryReport(app.store, run)) as ReturnType<typeof buildDeliveryReport>;
+      if (opts.json) printJson("delivery_report", { report, run: summarizeRun(app.store, run) });
+      else console.log(renderDeliveryMarkdown(report));
+    }),
+  );
+
+program
+  .command("watch")
+  .description("Follow a delivered run until its PR is merged or closed, then record it and print the delivery report. Read-only towards GitHub, no approval; bounded and in the foreground (no daemon)")
+  .argument("<target>", "run id or prefix, or an issue key / Linear URL (its newest live run)")
+  .option("--repo <owner/name>", "with an issue: only runs on this repository")
+  .option("--interval <seconds>", "how often to check the PR", positiveInt, 60)
+  .option("--timeout <minutes>", "give up after this long (the run still completes on the next status call)", positiveInt, 110)
+  .option("--json", "versioned JSON (schemaVersion 1)")
+  .action((target: string, opts: { repo?: string; interval: number; timeout: number; json?: boolean }) =>
+    withApp(async (app) => {
+      output.json = Boolean(opts.json);
+      const found = await runsForTarget(app, target, opts.repo ? { repo: opts.repo } : {});
+      const picked = (found.byId ?? found.runs.find((r) => r.mode === "supervised")) as RunRecord<RunContext> | undefined;
+      if (!picked) throw new RunError(`no live run for ${found.issueKey ?? target}`);
+      if (!opts.json) console.error(c.dim(`Watching ${picked.id} (${picked.state}) every ${opts.interval}s for up to ${opts.timeout} min…`));
+      const { run, settled } = await watchRunById(app, picked.id, { intervalMs: opts.interval * 1000, timeoutMs: opts.timeout * 60_000, signal: interruptSignal() });
+      const report = app.redactor.redactValue(buildDeliveryReport(app.store, run)) as ReturnType<typeof buildDeliveryReport>;
+      if (opts.json) printJson("watch", { settled, report, run: summarizeRun(app.store, run) });
+      else console.log(`${renderDeliveryMarkdown(report)}\n${settled ? "" : c.dim(`Still ${run.state}; nothing more to record yet. ${nextStep(run)}`)}`);
+      process.exitCode = exitCodeFor(run);
     }),
   );
 

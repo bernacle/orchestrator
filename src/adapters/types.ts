@@ -90,6 +90,10 @@ export interface PullRequestStatus {
   checks: Array<{ name: string; bucket: CheckBucket; detailsUrl?: string }>;
   /** The PR description, when the host returned it (used to confirm the orchestrator wrote the PR). */
   body?: string;
+  /** Set once merged (null or absent otherwise). */
+  mergedAt?: string | null;
+  mergeCommitSha?: string | null;
+  mergedBy?: string | null;
 }
 
 export interface CodeHost {
@@ -104,6 +108,8 @@ export interface CodeHost {
   updatePullRequestBody(input: { repo: string; number: number; body: string }): Promise<void>;
   /** Mark a draft PR ready for review. Never merges. */
   markPullRequestReady(input: { repo: string; number: number }): Promise<void>;
+  /** Read-only: the commits in `head` that `base` does not have, oldest first. */
+  compareCommits(repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>>;
   /** Must pin the head SHA; implementations must never use admin overrides. */
   mergePullRequest(input: { repo: string; number: number; headSha: string; method: "squash" | "merge" | "rebase" }): Promise<void>;
   /**

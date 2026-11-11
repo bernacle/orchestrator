@@ -161,7 +161,27 @@ QUEUED → PLANNING → IMPLEMENTING → TESTING → REVIEWING → PR_OPEN → W
    - **Minor findings.** After an approval, the reviewer's actionable `minor` findings (never nits) get **one** extra round (`review.minor_fix_rounds`). Its result is re-checked and re-reviewed. If it isn't approved, or breaks a check, the engine restores the approved commit, re-runs the checks on it, and delivers it with its approval; the PR lists what stayed open. This round never uses up `max_fix_attempts`.
 6. **PR_OPEN** pushes (never force-pushes) and opens or reuses a **draft** PR. Its description lists the criteria (ticked only when the reviewer found them met, with criteria that need your judgement flagged at the top), the changes, the orchestrator-run checks, CI, screenshots, the review and its history. The orchestrator keeps the description of its own PR in step after every push and CI result. It never edits a PR it didn't write.
 7. **WAITING_FOR_CI** polls GitHub checks (`--ci-wait`, 30 min by default), then hands back. `resume` checks again.
-8. **READY_TO_MERGE** reports merge eligibility. With `pull_request.mark_ready_when_delivered`, the draft is marked ready for review once every gate passes on the reviewed commit. In `manual` mode the run parks here, a human merges, and `resume` records the merge.
+8. **READY_TO_MERGE** reports merge eligibility. With `pull_request.mark_ready_when_delivered`, the draft is marked ready for review once every gate passes on the reviewed commit. In `manual` mode the run parks here and a human merges.
+9. **Completion.** A read-only reconciliation records what a person did to the PR:
+   - merged → MERGED → COMPLETED, with who merged and whether the merged head was the reviewed commit (commits added outside Orchestrator are listed);
+   - closed without merging → CANCELLED.
+
+   It never pushes, merges or runs a step, so it needs no resume and no approval. `status`, `context`, `report` and `orchestrator watch <run>` (a bounded foreground loop, no daemon) all run it.
+
+**Delivery report and notifications.**
+- Whenever a run settles (delivered, blocked, failed, completed), `runs/<id>/delivery.md` and `delivery.json` are rewritten from durable state. They cover:
+  - the outcome and what is left for you;
+  - the PR and reviewed commit;
+  - checks and CI;
+  - every acceptance criterion with evidence;
+  - open findings;
+  - review history;
+  - screenshots;
+  - recovery attempts;
+  - **API-equivalent usage** (Claude Code's estimate; not a charge on a subscription).
+
+  `orchestrator report <run>` prints the report.
+- On macOS, a notification tells you when a run is blocked or failed, when its PR is ready for your review, and when it completed after your merge. Each fires once; `ORCHESTRATOR_NOTIFY=0` turns them off.
 
 All artifacts live in `~/.orchestrator/runs/<run-id>/`: prompts, agent transcripts, check logs, review JSON, plan, merge report. `orchestrator status <run-id>` lists them along with every external action the run took.
 
@@ -174,7 +194,7 @@ Run `orchestrator capabilities` for the live list.
 | Runs | durable state, dry run (also replayable from a Linear snapshot), supervised run, resume/cancel, single-driver lease, preflight, baseline checks, cost/time limits | plan-approval gate, queue/scheduler (disabled until a VM boundary exists) |
 | Isolation | scrubbed env, Seatbelt for setup/checks, Claude Code sandbox for the implementer, tripwires, secret scan, fail-closed | Linux (bubblewrap), VM/container boundary |
 | Linear | issue, relations, comments; evidence-based dependency classification; operator briefs; milestone comments (workspace-verified) | label-driven intake |
-| GitHub | protection/ruleset inspection, push, draft PR, CI polling, merge eligibility | CI log excerpts to the implementer, human review comments as findings, watcher |
+| GitHub | protection/ruleset inspection, push, draft PR (description kept in sync, opt-in mark ready), CI polling, merge eligibility, merge/close reconciliation, `watch` | CI log excerpts to the implementer, human review comments as findings |
 | Merging | eligibility report; auto-merge implemented behind explicit authorization + protected branch | enabling it per repository |
 | Agents | Claude Code (implementer/planner), Codex (reviewer), per-repo roles | security reviewer, test writer, docs |
 | T3 | `/orchestrate` skill, T3 origin detection, T3 server check in doctor | implementer inside a T3 thread (needs runtime-mode control in `t3 thread start`) |

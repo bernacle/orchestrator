@@ -23,7 +23,7 @@ Add `approval: { plan: required }` per repository. The run parks in a new `AWAIT
 
 ## 3. PR watching
 
-- `orchestrator watch` loops `resume` for runs in `WAITING_FOR_CI` / `READY_TO_MERGE`, with backoff. It runs as a foreground process or under launchd/systemd. Still no hosted infrastructure.
+- Done: `orchestrator watch` follows a delivered run in the foreground, recording a merge or close (read-only). `status`, `context` and `report` reconcile too. There is no daemon. The delivery report and macOS notifications are also done.
 - Feed CI *log excerpts* to the implementer (`gh run view --log-failed`), not just failing check names.
 - Pick up human GitHub review comments on the PR as findings for another FIXING round, with the human marked as the reviewer.
 - Detect a base branch that moved and rebase safely (never force-push without a recorded human decision).

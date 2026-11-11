@@ -66,6 +66,7 @@ import {
 } from "./isolation.js";
 import { matchGlob } from "./glob.js";
 import { ciState, evaluateMerge, type MergeEligibility } from "./policy.js";
+import { completionReason, describeMerge, mergeRecord } from "./reconcile.js";
 import { collectScreenshots, matchesOutputs, outputStamps, pngPixels, pngProblem, screenshotCheck, screenshotsRequired, SCREENSHOT_CHECK_NAME, type Screenshot } from "./screenshots.js";
 import type { RunState } from "./states.js";
 
@@ -203,6 +204,26 @@ export interface RunContext {
   prBodySha?: string | null;
   /** Re-checks of a restored approved commit that ended BLOCKED: a resume runs them again under new keys. */
   recheck?: number;
+  /** GitHub CI on the PR head as last observed (WAITING_FOR_CI / READY_TO_MERGE). */
+  lastCi?: PrCiStatus | null;
+  /**
+   * The merge a person made, as GitHub reports it. `headIsReviewed` false: commits were added outside
+   * the engine after its review (`outsideCommits`, null when they could not be listed).
+   */
+  merged?: {
+    at: string | null;
+    by: string | null;
+    mergeCommitSha: string | null;
+    headSha: string;
+    reviewedSha: string | null;
+    headIsReviewed: boolean;
+    outsideCommits: Array<{ sha: string; message: string }> | null;
+    recordedBy: "engine" | "reconcile";
+    /** The run had delivered (every gate held on the PR head) when the PR was merged. Absent on older records. */
+    delivered?: boolean;
+    stateAtMerge?: string;
+    reasonAtMerge?: string | null;
+  } | null;
   lastChecks?: CheckResult[];
   lastReview?: ReviewOutcome | null;
   reviewedSha?: string | null;
@@ -231,7 +252,7 @@ function require<T>(value: T | null | undefined, what: string): T {
 }
 
 /** The run's acceptance criteria, numbered AC1… (the issue's own first, then the planner's derived ones). */
-function runCriteria(c: RunContext): Criterion[] {
+export function runCriteria(c: RunContext): Criterion[] {
   return numberCriteria(c.plan?.acceptanceCriteria);
 }
 
@@ -244,7 +265,7 @@ function recheckSuffix(c: RunContext): string {
  * Correction rounds spent against merge.max_fix_attempts. The minor-finding round and the engine's
  * restore of the approved commit have their own bound, so they never use up this budget.
  */
-function correctionsUsed(run: { attempt: number; context: RunContext }): number {
+export function correctionsUsed(run: { attempt: number; context: RunContext }): number {
   return run.attempt - run.context.rounds.filter((r) => r.trigger === "minor" || r.trigger === "revert").length;
 }
 
@@ -1659,7 +1680,7 @@ const waitingForCi: Handler<RunContext> = async (ctx) => {
     const state = ciState(status, protection.requiredChecks);
     if (state === "pass" || (state === "none" && !config.merge.require_ci)) {
       ctx.log("info", "ci.result", `CI ${state} on ${status.headSha.slice(0, 8)}`);
-      return { to: "READY_TO_MERGE", patch: { pr: { ...pr, headSha: status.headSha } } };
+      return { to: "READY_TO_MERGE", patch: { pr: { ...pr, headSha: status.headSha }, lastCi: { state, sha: status.headSha, checks: status.checks } } };
     }
     if (state === "fail") {
       const failing = status.checks.filter((k) => k.bucket === "fail");
@@ -1667,8 +1688,9 @@ const waitingForCi: Handler<RunContext> = async (ctx) => {
       const max = config.merge.max_fix_attempts;
       const used = correctionsUsed(run);
       await syncPrBody(ctx, status, { state: "fail", sha: status.headSha, checks: status.checks, stopping: used >= max }, `CI failed on ${status.headSha.slice(0, 8)}`);
-      if (used >= max) return { to: "FAILED", reason: `CI failing after ${max} correction round(s)` };
-      return { to: "FIXING", reason: "CI failed", patch: { feedback: { trigger: "ci", prompt: fixPromptForCi(failing, used + 1, max) } } };
+      const lastCi: PrCiStatus = { state: "fail", sha: status.headSha, checks: status.checks };
+      if (used >= max) return { to: "FAILED", reason: `CI failing after ${max} correction round(s)`, patch: { lastCi } };
+      return { to: "FIXING", reason: "CI failed", patch: { lastCi, feedback: { trigger: "ci", prompt: fixPromptForCi(failing, used + 1, max) } } };
     }
     if (Date.now() >= deadline) {
       ctx.log("info", "ci.waiting", `CI still ${state}; check again with: orchestrator resume ${run.id}`);
@@ -1689,7 +1711,12 @@ const readyToMerge: Handler<RunContext> = async (ctx) => {
   const c = run.context;
   const pr = require(c.pr, "pr");
   const status = await adapters.codeHost.getPullRequest(config.repo, pr.number);
-  if (status.state === "MERGED") return { to: "MERGED", reason: `PR #${pr.number} merged` };
+  if (status.state === "MERGED") {
+    const merged = await mergeRecord(adapters.codeHost, config.repo, status, run, "engine");
+    const message = describeMerge(pr, merged);
+    ctx.log("info", "pr.merged", message, merged);
+    return { to: "MERGED", reason: message, patch: { merged } };
+  }
   if (status.state === "CLOSED") return { to: "CANCELLED", reason: `PR #${pr.number} was closed without merging` };
 
   const protection = await adapters.codeHost.getBranchProtection(config.repo, require(c.baseBranch, "baseBranch"));
@@ -1706,9 +1733,10 @@ const readyToMerge: Handler<RunContext> = async (ctx) => {
     actor,
   });
   const merge = { ...eligibility, checkedAt: ctx.now().toISOString(), headSha: status.headSha };
+  const lastCi: PrCiStatus = { state: eligibility.ciState, sha: status.headSha, checks: status.checks };
   ctx.writeArtifact("merge", "merge eligibility", `merge-${status.headSha.slice(0, 8)}.json`, JSON.stringify(merge, null, 2));
 
-  if (status.headSha !== c.reviewedSha) return { to: "WAITING_FOR_CI", reason: "PR head changed since review", patch: { merge } };
+  if (status.headSha !== c.reviewedSha) return { to: "WAITING_FOR_CI", reason: "PR head changed since review", patch: { merge, lastCi } };
 
   // The description reports CI on the delivered commit.
   await syncPrBody(ctx, status, { state: eligibility.ciState, sha: status.headSha, checks: status.checks }, `CI ${eligibility.ciState} on ${status.headSha.slice(0, 8)}`);
@@ -1752,14 +1780,14 @@ const readyToMerge: Handler<RunContext> = async (ctx) => {
       simulate: () => null,
       run: () => adapters.codeHost.mergePullRequest({ repo: config.repo, number: pr.number, headSha: status.headSha, method: config.merge.method }),
     });
-    return { to: "MERGED", reason: `merged PR #${pr.number} automatically under merge.auto_authorization`, patch: { merge } };
+    return { to: "MERGED", reason: `merged PR #${pr.number} automatically under merge.auto_authorization`, patch: { merge, lastCi } };
   }
-  return { to: "READY_TO_MERGE", reason: summary, patch: { merge } };
+  return { to: "READY_TO_MERGE", reason: summary, patch: { merge, lastCi } };
 };
 
 // ---- MERGED ------------------------------------------------------------------------
 
-const merged: Handler<RunContext> = async () => ({ to: "COMPLETED", reason: "merged" });
+const merged: Handler<RunContext> = async (ctx) => ({ to: "COMPLETED", reason: ctx.run.context.merged ? completionReason(ctx.run.context.merged) : "merged" });
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {

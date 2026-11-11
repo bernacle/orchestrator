@@ -1,6 +1,7 @@
 import type { Issue } from "../adapters/types.js";
 import type { App } from "../app.js";
 import { sandboxSupport } from "../core/isolation.js";
+import { reconcileRuns } from "../core/settle.js";
 import { describeTrustState } from "../core/trust.js";
 import type { RunRecord } from "../core/store.js";
 import type { RunContext } from "../core/workflow.js";
@@ -201,6 +202,9 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
   // ---- existing runs
   const runs = { active: [] as RunSummary[], recent: [] as RunSummary[] };
   if (selection.repo) {
+    // A PR a person merged or closed since the run handed back is recorded first (read-only), so a
+    // delivered-and-merged run never stands in the way as "active".
+    await reconcileRuns(app, app.store.runsFor(ref.key, selection.repo, 10) as Array<RunRecord<RunContext>>, loaded ?? undefined);
     const all = app.store.runsFor(ref.key, selection.repo, 10) as Array<RunRecord<RunContext>>;
     runs.active = all.filter((r) => r.mode === "supervised" && !["COMPLETED", "FAILED", "CANCELLED"].includes(r.state)).map((r) => summarizeRun(app.store, r));
     runs.recent = all.slice(0, 5).map((r) => summarizeRun(app.store, r));
