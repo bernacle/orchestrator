@@ -31,6 +31,14 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
 - **BLOCKED** means a human must act: an unresolved dependency, a missing permission, an agent failure, malformed reviewer output, or an unexpected error. It records `blocked_from`, and `resume` re-enters that state after reloading the config (so granting a permission and resuming works). The unblock is narrow: the drive leaves a block only if the run was BLOCKED when the drive started, on the same block (state and reason) the person approved in the resume prompt, and only once. A run resumed while not BLOCKED (interrupted, killed CLI) gets no unblock, and any block reached later in a drive ends it: a new blocker always goes back to a person.
 - **Baseline.** With `baseline_checks`, IMPLEMENTING runs every check on the untouched base before the agent starts. Only a green, clean baseline is saved as the accepted `baseline` and reused when the step is re-entered. A red one is kept in `baselineFailure` for audit and blocks the run; each attempt uses fresh effect keys (`baseline.<n>.<check>`), so an approved resume re-runs every check instead of replaying the red result. Only an interrupted attempt continues with its own completed checks.
 - **FAILED** is definitive: the correction budget ran out, or an invariant was violated (for example, the worktree changed during review).
+- **Reconciliation** (core/reconcile.ts) records a person's merge or close of the run's PR. It works without a drive or approval:
+  - It reads the PR, and a commit comparison when the merged head isn't the reviewed commit.
+  - Then it moves the run (from `WAITING_FOR_CI`, `READY_TO_MERGE` or `BLOCKED`) through `READY_TO_MERGE → MERGED → COMPLETED`, or to `CANCELLED`.
+  - It uses only existing transitions, and takes the run's lease, so a driving process is never raced.
+  - No step handler or effect runs, so nothing can be pushed, merged or edited.
+- **Settling** (core/settle.ts) runs after every drive and reconciliation:
+  - It rewrites `runs/<id>/delivery.{md,json}` from durable state.
+  - It sends the one notification the state deserves, deduplicated by `notify.sent` timeline events. Events don't bump the run's version, so they never conflict with a driver.
 - **Resting states** (`BLOCKED`, `WAITING_FOR_CI`, `READY_TO_MERGE`) hand control back. A state that transitions to itself ("CI still pending") ends the drive loop, and `resume` checks again.
 
 ## Durability, idempotency, retries

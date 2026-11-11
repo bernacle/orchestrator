@@ -203,7 +203,7 @@ export function nextStep(run: RunRecord): string {
     case "WAITING_FOR_CI":
       return `Next: orchestrator resume ${run.id}  (re-checks CI)`;
     case "READY_TO_MERGE":
-      return `Next: review and merge the PR yourself, then: orchestrator resume ${run.id}`;
+      return `Next: review and merge the PR yourself. The run completes by itself (orchestrator watch ${run.id} follows it; any status call records it)`;
     default:
       return `Next: orchestrator resume ${run.id}  (if no process is driving it)`;
   }

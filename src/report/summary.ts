@@ -1,3 +1,4 @@
+import { buildDeliveryReport, type DeliveryOutcome } from "./delivery.js";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { resolvePaths } from "../config/load.js";
@@ -48,6 +49,8 @@ export interface RunSummary {
   minorRound: { status: string; approvedSha: string; findings: string[]; reason: string | null } | null;
   pr: { number: number; url: string } | null;
   merge: { eligible: boolean; ciState: string; reasons: string[] } | null;
+  /** The delivery report's verdict (runs/<id>/delivery.md): what happened and what is left for a person. */
+  delivery: { outcome: DeliveryOutcome; headline: string; actionsForYou: string[]; reportPath: string | null } | null;
   worktreePath: string | null;
   association: RunContext["options"]["intake"] | null;
   next: string;
@@ -84,10 +87,18 @@ export function summarizeRun(store: Store, run: RunRecord<RunContext>): RunSumma
     minorRound: ctx.minorRound ? { status: ctx.minorRound.status, approvedSha: ctx.minorRound.approvedSha, findings: ctx.minorRound.findings.map((f) => f.id), reason: ctx.minorRound.reason ?? null } : null,
     pr: ctx.pr ? { number: ctx.pr.number, url: ctx.pr.url } : null,
     merge: ctx.merge ? { eligible: ctx.merge.eligible, ciState: ctx.merge.ciState, reasons: ctx.merge.reasons } : null,
+    delivery: deliverySummary(store, run),
     worktreePath: ctx.worktreePath ?? null,
     association: ctx.options.intake ?? null,
     next: nextStep(run).replace(ANSI, ""),
   };
+}
+
+function deliverySummary(store: Store, run: RunRecord<RunContext>): RunSummary["delivery"] {
+  if (run.mode !== "supervised") return null;
+  const r = buildDeliveryReport(store, run);
+  const path = [...store.artifacts(run.id)].reverse().find((a) => a.label === "delivery report")?.path ?? null;
+  return { outcome: r.outcome, headline: r.headline, actionsForYou: r.actionsForYou, reportPath: path };
 }
 
 /** Every review round's findings, newest last, as recorded by the engine (never re-derived). */

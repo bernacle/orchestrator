@@ -135,6 +135,27 @@ export class MockCodeHost implements CodeHost {
     this.bodyUpdates.push({ number: input.number, body: input.body });
   }
 
+  /** Commits in head not in base (tests point it at the origin repository). */
+  compare: (base: string, head: string) => Promise<Array<{ sha: string; message: string }>> = async () => [];
+  async compareCommits(_repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>> {
+    return this.compare(base, head);
+  }
+
+  /** A person merges (or closes) the PR on GitHub, with whatever head the branch has then. */
+  async simulateMerge(number: number, opts: { by?: string; close?: boolean } = {}): Promise<void> {
+    const pr = this.prs.find((p) => p.number === number);
+    if (!pr) throw new Error(`no PR ${number}`);
+    pr.headSha = this.headOverride ?? (await this.headOf(pr.headRefName));
+    if (opts.close) {
+      pr.state = "CLOSED";
+      return;
+    }
+    pr.state = "MERGED";
+    pr.mergedAt = "2026-11-11T19:13:43.000Z";
+    pr.mergeCommitSha = "f".repeat(40);
+    pr.mergedBy = opts.by ?? "a-person";
+  }
+
   async markPullRequestReady(input: { number: number }): Promise<void> {
     const pr = this.prs.find((p) => p.number === input.number);
     if (!pr) throw new Error(`no PR ${input.number}`);

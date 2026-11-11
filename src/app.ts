@@ -1,3 +1,5 @@
+import { defaultNotifier, type Notifier } from "./core/notify.js";
+import { reconcileRuns, settleRun, watchRun, type WatchOptions } from "./core/settle.js";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -45,6 +47,8 @@ export interface App {
    * macOS); only code can substitute another key store (tests).
    */
   trust: TrustStore;
+  /** Local notifications when a run needs a person or is done (core/notify.ts). Silent in tests. */
+  notifier: Notifier;
   close(): void;
 }
 
@@ -56,6 +60,7 @@ export function openApp(
     discovery?: DiscoveryDeps;
     approver?: Approver;
     trustKeys?: TrustKeyStore;
+    notifier?: Notifier;
     now?: () => Date;
   } = {},
 ): App {
@@ -92,6 +97,7 @@ export function openApp(
     approver: opts.approver ?? systemApprover(),
     ...(opts.approver ? {} : { approvalStatus: () => approvalChannelStatus() }),
     trust: new TrustStore(paths, opts.trustKeys ?? systemTrustKeys(paths)),
+    notifier: opts.notifier ?? defaultNotifier(env, Boolean(opts.adapters)),
     close: () => store.close(),
   };
 }
@@ -255,7 +261,32 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
     const how = authorization.basis === "trust" ? `Live run started under repository trust ${authorization.trust?.id} (granted by ${authorization.user}; no per-run prompt)` : `Live run approved by ${authorization.user} via ${authorization.channel}`;
     app.store.appendEvent(run.id, "QUEUED", "info", "run.authorized", `${how} (scope ${authorization.scopeHash.slice(0, 12)})`, authorization);
   }
-  return engineFor(app, loaded, snapshot, linearWorkspace).drive(run.id, { expect: { mode: run.mode, issueKey: run.issueKey, repo: run.repo }, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  return settled(app, await engineFor(app, loaded, snapshot, linearWorkspace).drive(run.id, { expect: { mode: run.mode, issueKey: run.issueKey, repo: run.repo }, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) }));
+}
+
+/** Every drive ends by writing the delivery report and sending the notification its state deserves. */
+async function settled(app: App, run: RunRecord<RunContext>): Promise<RunRecord<RunContext>> {
+  await settleRun(app, run);
+  return app.store.getRun<RunContext>(run.id) ?? run;
+}
+
+/**
+ * Record a person's merge or close of the run's PR without driving it: read-only towards GitHub,
+ * so it never asks for approval, in either mode (core/reconcile.ts). Then settle the run.
+ */
+export async function reconcileRunById(app: App, id: string): Promise<RunRecord<RunContext>> {
+  const run = findRunOrThrow(app, id);
+  const [after] = await reconcileRuns(app, [run]);
+  await settleRun(app, after!);
+  return app.store.getRun<RunContext>(run.id)!;
+}
+
+/** `orchestrator watch`: follow a delivered run until its PR is merged or closed (bounded, foreground). */
+export async function watchRunById(app: App, id: string, opts: WatchOptions): Promise<{ run: RunRecord<RunContext>; settled: boolean }> {
+  const run = findRunOrThrow(app, id);
+  const res = await watchRun(app, run.id, opts);
+  await settleRun(app, res.run);
+  return { run: app.store.getRun<RunContext>(run.id)!, settled: res.settled };
 }
 
 export function findRunOrThrow(app: App, id: string): RunRecord<RunContext> {
@@ -338,7 +369,7 @@ export async function resumeRun(
   });
   app.store.appendEvent(run.id, run.state, "info", "run.resume", `Resume requested at ${run.state}`);
   const snap = run.context.options.issueSnapshot;
-  return engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: approvedResume, expect, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) });
+  return settled(app, await engineFor(app, loaded, snap ? new SnapshotTracker(snap.file) : undefined, run.context.options.intake?.linearWorkspace).drive(run.id, { resume: approvedResume, expect, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}), ...(opts.interrupt ? { interrupt: opts.interrupt } : {}) }));
 }
 
 /**

@@ -12,6 +12,7 @@ import { openApp, type App } from "../src/app.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import type { ApprovalRequest, Approver } from "../src/core/approval.js";
 import { fileTrustKeys } from "../src/core/trust.js";
+import type { Notification, Notifier } from "../src/core/notify.js";
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
@@ -63,6 +64,10 @@ export interface Harness {
   approvals: ApprovalRequest[];
   /** How the stand-in for the person answers (default: approve). */
   answer: boolean | ((req: ApprovalRequest) => boolean);
+  /** Every notification the engine sent. */
+  notes: Notification[];
+  /** Make the notifier fail (e.g. no Notification Center). */
+  notifyFails: boolean;
   cleanup(): void;
 }
 
@@ -142,6 +147,20 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
     { branch: "main", protected: false, requiredChecks: [], requiredApprovals: 0, rulesetTypes: [], notes: [], ...opts.protection },
     async (branch) => git(origin, "rev-parse", `refs/heads/${branch}`),
   );
+  host.compare = async (base, head) =>
+    git(origin, "log", "--reverse", "--format=%H %s", `${base}..${head}`)
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => ({ sha: l.slice(0, 40), message: l.slice(41) }));
+  const notes: Notification[] = [];
+  const notifier: Notifier = {
+    name: "test",
+    async send(n) {
+      if (harness.notifyFails) throw new Error("no Notification Center");
+      notes.push(n);
+      return { ok: true, detail: "recorded" };
+    },
+  };
   const implementer = new MockAgent("anthropic-mock", opts.implement ?? writeFeature, "mock-implementer");
   const reviewer = new MockAgent(opts.reviewerProvider ?? "openai-mock", opts.review ?? (() => ({ structured: approve, text: JSON.stringify(approve) })), "mock-reviewer");
 
@@ -163,6 +182,7 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
       approver,
       // Never the real login Keychain in tests: trust seal keys go to the harness's own home.
       trustKeys: fileTrustKeys(join(root, "home", "credentials")),
+      notifier,
       tracker: () => tracker,
       adapters: (): Adapters => ({
         tracker,
@@ -197,6 +217,8 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
     writeConfig,
     approvals,
     answer: true,
+    notes,
+    notifyFails: false,
     cleanup: () => {
       try {
         harness.app.close();
