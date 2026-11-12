@@ -135,6 +135,12 @@ export class MockCodeHost implements CodeHost {
     this.bodyUpdates.push({ number: input.number, body: input.body });
   }
 
+  /** Failed-step log text per check name (tests). */
+  ciLogs: Record<string, string> = {};
+  async ciFailureLogs(_repo: string, failing: Array<{ name: string }>, maxChars: number): Promise<Array<{ name: string; excerpt: string }>> {
+    return failing.filter((f) => this.ciLogs[f.name]).map((f) => ({ name: f.name, excerpt: this.ciLogs[f.name]!.slice(-maxChars) }));
+  }
+
   /** Commits in head not in base (tests point it at the origin repository). */
   compare: (base: string, head: string) => Promise<Array<{ sha: string; message: string }>> = async () => [];
   async compareCommits(_repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>> {

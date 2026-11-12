@@ -108,6 +108,11 @@ export interface CodeHost {
   updatePullRequestBody(input: { repo: string; number: number; body: string }): Promise<void>;
   /** Mark a draft PR ready for review. Never merges. */
   markPullRequestReady(input: { repo: string; number: number }): Promise<void>;
+  /**
+   * Read-only: the tail of the failed steps' logs of failing CI checks (GitHub Actions jobs), at most
+   * `maxChars` in total. Checks without logs are left out. Never throws for a single check.
+   */
+  ciFailureLogs(repo: string, failing: Array<{ name: string; detailsUrl?: string }>, maxChars: number): Promise<Array<{ name: string; excerpt: string }>>;
   /** Read-only: the commits in `head` that `base` does not have, oldest first. */
   compareCommits(repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>>;
   /** Must pin the head SHA; implementations must never use admin overrides. */
@@ -140,6 +145,12 @@ export interface RepoInspection {
   nodeVersionFile: { file: string; content: string } | null;
 }
 
+/** Operator-owned push identity (config `push`), applied per command, never written to git config. */
+export interface PushOptions {
+  url?: string | null;
+  sshIdentityFile?: string | null;
+}
+
 export interface Workspace {
   /** Ensure a clone exists and is fetched (orchestrator-owned clones only). */
   ensureClone(repo: string, clonePath: string, opts: { fetch: boolean }): Promise<void>;
@@ -162,7 +173,12 @@ export interface Workspace {
    * were validated in memory cannot be swapped before they are committed. Null when HEAD already has them.
    */
   commitBlobs(worktreePath: string, files: Array<{ path: string; data: Buffer }>, message: string): Promise<string | null>;
-  push(worktreePath: string, branch: string): Promise<void>;
+  push(worktreePath: string, branch: string, opts?: PushOptions): Promise<void>;
+  /**
+   * Can this identity push to origin? `git push --dry-run` of `sha` to a branch: it authenticates
+   * against the remote (GitHub checks write access) and writes nothing.
+   */
+  probePush(repoPath: string, sha: string, branch: string, opts?: PushOptions): Promise<{ ok: boolean; detail: string }>;
   /**
    * Put the worktree back at `sha`, which must be an ancestor of HEAD (a local commit the branch
    * already contains): reset tracked files and remove untracked ones (ignored files stay).

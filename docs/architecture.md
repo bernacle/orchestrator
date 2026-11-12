@@ -31,6 +31,13 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
 - **BLOCKED** means a human must act: an unresolved dependency, a missing permission, an agent failure, malformed reviewer output, or an unexpected error. It records `blocked_from`, and `resume` re-enters that state after reloading the config (so granting a permission and resuming works). The unblock is narrow: the drive leaves a block only if the run was BLOCKED when the drive started, on the same block (state and reason) the person approved in the resume prompt, and only once. A run resumed while not BLOCKED (interrupted, killed CLI) gets no unblock, and any block reached later in a drive ends it: a new blocker always goes back to a person.
 - **Baseline.** With `baseline_checks`, IMPLEMENTING runs every check on the untouched base before the agent starts. Only a green, clean baseline is saved as the accepted `baseline` and reused when the step is re-entered. A red one is kept in `baselineFailure` for audit and blocks the run; each attempt uses fresh effect keys (`baseline.<n>.<check>`), so an approved resume re-runs every check instead of replaying the red result. Only an interrupted attempt continues with its own completed checks.
 - **FAILED** is definitive: the correction budget ran out, or an invariant was violated (for example, the worktree changed during review).
+- **Bounded recovery** happens inside the step that failed, under its own effect keys (`….retry`):
+  - one retry of an implementer round (resuming its session);
+  - one retry of a reviewer crash or schema mismatch.
+
+  A failed or unusable agent result is recorded as a failed effect, never a completed one. An approved resume after such a block runs the agent again, with its one retry, instead of replaying the failure. A usable result is reused as before.
+
+  Safety stops are `FailedError`s from tripwires, secret scans and changed-code checks, and they are never retried. Branch collisions and push access are settled in PLANNING, before any agent runs. The push identity (`push.url`, `push.ssh_identity_file`) is passed per command (`git -c remote.origin.pushurl`, `GIT_SSH_COMMAND`) and never written to a git config file.
 - **Reconciliation** (core/reconcile.ts) records a person's merge or close of the run's PR. It works without a drive or approval:
   - It reads the PR, and a commit comparison when the merged head isn't the reviewed commit.
   - Then it moves the run (from `WAITING_FOR_CI`, `READY_TO_MERGE` or `BLOCKED`) through `READY_TO_MERGE → MERGED → COMPLETED`, or to `CANCELLED`.

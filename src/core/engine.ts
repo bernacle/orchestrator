@@ -68,6 +68,8 @@ export interface StepContext<C> {
   artifactDir: string;
   redactor: Redactor;
   throwIfStopped(): void;
+  /** Read-only: other runs of this repository that use `branch` (branch-collision checks). */
+  runsOnBranch(branch: string): Array<{ id: string; state: RunState; mode: RunMode }>;
 }
 
 export type Handler<C> = (ctx: StepContext<C>) => Promise<Outcome<C>>;
@@ -318,6 +320,7 @@ export class Engine<C extends object> {
       redactor,
       now: () => this.now(),
       throwIfStopped,
+      runsOnBranch: (branch) => store.runsOnBranch(current.repo, branch).filter((r) => r.id !== current.id),
       log: (level, type, message, data) => emit(current, level, type, message, data),
       save: (patch) => {
         current = store.patchContext<C>(current.id, patch);

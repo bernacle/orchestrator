@@ -3,7 +3,7 @@ import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { describeNode, resolveRunToolchain, toolchainReadPaths, type NodeVersionFile, type ResolvedToolchain } from "../adapters/checks.js";
-import type { AgentResult, AgentRunner, ChangedFile, CheckResult, Issue, IssueRef, PrEvidence, PullRequestStatus } from "../adapters/types.js";
+import type { AgentResult, AgentRunner, ChangedFile, CheckResult, Issue, IssueRef, PrEvidence, PullRequestStatus, PushOptions } from "../adapters/types.js";
 import { loadBrief, type Brief } from "../config/brief.js";
 import type { AgentConfig, CheckConfig, RepoConfig } from "../config/schema.js";
 import { classifyDependencies, extractIssueMentions, keysNeedingEvidence } from "../planning/dependencies.js";
@@ -430,6 +430,59 @@ function totalCost(ctx: Ctx, add: number | null): number {
   return (ctx.run.context.costUsd ?? 0) + (add ?? 0);
 }
 
+/**
+ * An agent failure worth one retry: a crash, a hang (timeout) or unusable output. Not a cancellation,
+ * and not a spent budget (a limit, never retried around).
+ */
+export function retryableAgentFailure(r: AgentResult, signal: AbortSignal): boolean {
+  if (r.ok || signal.aborted) return false;
+  return !/budget|cancel/i.test(r.error ?? "");
+}
+
+function retryPrompt(error: string | null, prompt: string): string {
+  return [
+    "## The previous attempt stopped unexpectedly",
+    `The orchestrator's previous run of this task ended with: ${(error ?? "an unknown error").slice(0, 500)}`,
+    "Your work so far is still in the worktree. Check its state (git status, git diff), then finish the task below. Do not start over and do not repeat finished work.",
+    "",
+    prompt,
+  ].join("\n");
+}
+
+/**
+ * Thrown from inside an agent effect (after the tripwire check) when the agent's result is not usable,
+ * so the effect is recorded as failed, not completed: a later `resume` runs the agent again instead of
+ * reusing the failure. The caller catches it and handles the result as before.
+ */
+class UnusableAgentResult extends Error {
+  constructor(readonly result: AgentResult) {
+    super(result.error ?? "unusable agent result");
+  }
+}
+
+async function agentEffect(ctx: Ctx, opts: { key: string; description: string; run: () => Promise<AgentResult>; usable: (r: AgentResult) => boolean }): Promise<AgentResult> {
+  let r: AgentResult;
+  try {
+    const result = await ctx.effect({
+      key: opts.key,
+      permission: "agents.run",
+      description: opts.description,
+      simulate: () => SIMULATED_AGENT,
+      run: async () => {
+        const res = await opts.run();
+        if (!opts.usable(res)) throw new UnusableAgentResult(res);
+        return res;
+      },
+    });
+    r = require(result, "agent result");
+  } catch (err) {
+    if (!(err instanceof UnusableAgentResult)) throw err;
+    r = err.result;
+  }
+  ctx.throwIfStopped();
+  return r;
+}
+
 /** Simulated agent result for dry runs: obviously not real. */
 const SIMULATED_AGENT: AgentResult = { sessionId: null, text: "(dry run: agent not started)", structured: null, ok: true, error: null, costUsd: null, durationMs: 0, transcripts: [] };
 
@@ -552,10 +605,29 @@ const planning: Handler<RunContext> = async (ctx) => {
   const readiness = analyzeReadiness(issue);
   const criteria = extractAcceptanceCriteria(issue.description);
 
-  const branch = branchNameFor(config.branch.template, issue);
+  const choice = await chooseBranch(ctx, clonePath, branchNameFor(config.branch.template, issue));
+  if (choice.note) extraWarnings.push(choice.note);
+  if (choice.blocker) extraBlockers.push(choice.blocker);
+  const branch = choice.branch;
   const worktreePath = join(ctx.paths.worktrees, owner, name, run.id);
   const branchExists = await adapters.workspace.branchExists(clonePath, branch);
   const existingPr = await adapters.codeHost.findPullRequest(config.repo, branch);
+
+  // ---- publishing identity: checked now, so a push that cannot work stops the run in its first
+  // minute instead of after the implementation (BRU-485: the push went out as the wrong account).
+  if (config.permissions.github.push) {
+    const probe = await adapters.workspace.probePush(clonePath, inspection.headSha, branch, pushOptions(config));
+    if (probe.ok) ctx.log("info", "push.verified", `Push access to ${config.repo} confirmed (git push --dry-run${config.push.url ? ` via push.url ${config.push.url}` : ""}; nothing was pushed)`);
+    else {
+      extraBlockers.push(
+        `git cannot push to ${config.repo}${config.push.url ? ` via push.url ${config.push.url}` : " with the default identity"}: ${probe.detail}. ` +
+          `Set push.url (e.g. an SSH host alias whose key can push: git@<alias>:${config.repo}.git) or push.ssh_identity_file in the operator config, then resume. Nothing was pushed, and no git config was changed.`,
+      );
+    }
+  }
+  if (config.permissions.github.create_pr && !["admin", "maintain", "write"].includes(repoInfo.viewerPermission)) {
+    extraBlockers.push(`the GitHub CLI account has ${repoInfo.viewerPermission} access to ${config.repo}, but opening PRs needs write access (gh auth switch to an account that can write)`);
+  }
   const tc = await resolveRunToolchain({ toolchain: config.toolchain, versionFile: inspection.nodeVersionFile, cwd: worktreePath, dirs: isolationDirs(ctx.paths.home) });
 
   // ---- independence invariants
@@ -688,6 +760,45 @@ const planning: Handler<RunContext> = async (ctx) => {
   return { to: "IMPLEMENTING", patch };
 };
 
+// ---- branch and push identity ---------------------------------------------------------
+
+/** The operator's push identity (config `push`), applied per command by the workspace. */
+function pushOptions(config: RepoConfig): PushOptions {
+  return { url: config.push.url ?? null, sshIdentityFile: config.push.ssh_identity_file ?? null };
+}
+
+/**
+ * The branch this run works on. The template's name when it is free; when it already exists (locally,
+ * on origin, or with a PR), typically from a finished, failed or cancelled run, or held by an
+ * unfinished one, a run-scoped name instead. Existing branches, their worktrees and PRs are never
+ * deleted, reset or reused: another run's commits never leak into this one.
+ */
+async function chooseBranch(ctx: Ctx, clonePath: string, preferred: string): Promise<{ branch: string; note: string | null; blocker: string | null }> {
+  const { adapters, config, run } = ctx;
+  const taken = async (b: string): Promise<string | null> => {
+    const where: string[] = [];
+    const e = await adapters.workspace.branchExists(clonePath, b);
+    if (e.local) where.push("locally");
+    if (e.remote) where.push("on origin");
+    const pr = await adapters.codeHost.findPullRequest(config.repo, b).catch(() => null);
+    if (pr) where.push(`with PR #${pr.number} (${pr.state.toLowerCase()})`);
+    const owners = ctx.runsOnBranch(b).filter((r) => r.mode === "supervised");
+    if (owners.length) where.push(`used by ${owners.map((r) => `${r.id} (${r.state})`).join(", ")}`);
+    return where.length ? where.join(", ") : null;
+  };
+  const why = await taken(preferred);
+  if (!why) return { branch: preferred, note: null, blocker: null };
+  const suffix = run.id.split("-").at(-1) ?? "run";
+  for (let i = 1; i <= 5; i++) {
+    const candidate = i === 1 ? `${preferred}-${suffix}` : `${preferred}-${suffix}-${i}`;
+    if (!(await taken(candidate))) {
+      ctx.log("info", "branch.scoped", `Branch ${preferred} already exists (${why}); this run uses ${candidate}`);
+      return { branch: candidate, note: `branch ${preferred} already exists (${why}); this run uses ${candidate}. The existing branch, its worktrees and PRs are left untouched.`, blocker: null };
+    }
+  }
+  return { branch: preferred, note: null, blocker: `branch ${preferred} and its run-scoped alternatives all exist (${why}); delete stale branches or change branch.template` };
+}
+
 // ---- shared: checks ----------------------------------------------------------------
 
 async function runChecks(ctx: Ctx, input: { worktree: string; checks: CheckConfig[]; keyPrefix: string; logPrefix: string; defaultNetwork: NetworkPolicy; label: string }): Promise<CheckResult[]> {
@@ -752,36 +863,48 @@ async function implementerRound(
   // Review-driven rounds answer each finding (fixed / declined, with a note) for the reviewer to verify.
   const wantsReport = trigger === "review" || trigger === "minor";
 
-  const result = await ctx.effect({
-    key: `agent.implement.${attempt}`,
-    permission: "agents.run",
-    description: `run implementer ${agent.id} (round ${attempt}, ${trigger}) in ${worktree}`,
-    simulate: () => SIMULATED_AGENT,
-    run: () =>
-      guarded(ctx, `implementer round ${attempt}`, () =>
-        agent.run({
-          role: "implementer",
-          cwd: worktree,
-          prompt,
-          ...(resumeSessionId ? { resumeSessionId } : { sessionId }),
-          artifactDir: ctx.artifactDir,
-          artifactPrefix: prefix,
-          timeoutMs: config.agents.implementer.timeout_minutes * 60_000,
-          env,
-          readablePaths,
-          signal: ctx.signal,
-          ...(budget !== undefined ? { maxBudgetUsd: budget } : {}),
-          ...(wantsReport ? { outputSchema: IMPLEMENTER_REPORT_SCHEMA } : {}),
-        }),
-      ),
-  });
-  ctx.throwIfStopped();
-  const r = require(result, "implementer result");
-  ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
+  const callAgent = async (retry: boolean, text: string, maxBudgetUsd: number | undefined, retrySession?: string | null): Promise<AgentResult> => {
+    const r = await agentEffect(ctx, {
+      key: `agent.implement.${attempt}${retry ? ".retry" : ""}`,
+      description: `run implementer ${agent.id} (round ${attempt}, ${trigger}${retry ? ", retry" : ""}) in ${worktree}`,
+      usable: (res) => res.ok,
+      run: () =>
+        guarded(ctx, `implementer round ${attempt}${retry ? " (retry)" : ""}`, () =>
+          agent.run({
+            role: "implementer",
+            cwd: worktree,
+            prompt: text,
+            // A retry continues the same durable session (its work so far is in the worktree too).
+            ...(retry ? (retrySession ? { resumeSessionId: retrySession } : {}) : resumeSessionId ? { resumeSessionId } : { sessionId }),
+            artifactDir: ctx.artifactDir,
+            artifactPrefix: retry ? `${prefix}-retry` : prefix,
+            timeoutMs: config.agents.implementer.timeout_minutes * 60_000,
+            env,
+            readablePaths,
+            signal: ctx.signal,
+            ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
+            ...(wantsReport ? { outputSchema: IMPLEMENTER_REPORT_SCHEMA } : {}),
+          }),
+        ),
+    });
+    ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
+    return r;
+  };
+  let r = await callAgent(false, prompt, budget);
+  let retried = false;
+  if (retryableAgentFailure(r, ctx.signal)) {
+    retried = true;
+    // One retry for a crash, a hang or unusable output; never for a spent limit or a safety stop
+    // (those throw before reaching here). The run's cost and time limits apply to the retry too.
+    ctx.log("warn", "agent.retry", `Implementer round ${attempt} stopped unexpectedly (${r.error}); retrying once in the same session`);
+    const left = enforceLimits(ctx, `the retry of implementer round ${attempt}`);
+    r = await callAgent(true, retryPrompt(r.error, prompt), claudeBudget(config.agents.implementer, left), resumeSessionId ?? r.sessionId ?? (agent.id === "claude-code" ? sessionId : null));
+    ctx.log(r.ok ? "info" : "warn", "agent.retry_result", `Retry of implementer round ${attempt} ${r.ok ? "completed" : `failed too: ${r.error}`}`);
+  }
   const report = wantsReport ? parseImplementerReport(ctx.redactor.redactValue(r.structured)) : null;
   const summary = r.text || report?.summary || "";
   ctx.writeArtifact("agent-output", `implementer summary (round ${attempt})`, `${prefix}.summary.md`, `${summary || "(empty)"}${report ? `\n\n## Per finding\n${report.findings.map((f) => `- ${f.id}: ${f.status} — ${f.note}`).join("\n")}` : ""}`);
-  if (!r.ok) throw new BlockedError(`implementer failed in round ${attempt}: ${r.error}`);
+  if (!r.ok) throw new BlockedError(`implementer failed in round ${attempt}${retried ? " (after one retry)" : ""}: ${r.error}`);
 
   // Verify, don't trust: what actually changed on disk?
   const message = ctx.redactor.redact(`${ctx.run.issueKey}: ${c.issue?.title ?? "changes"}\n\nRound ${attempt} (${trigger}) by ${agent.id}, committed by orchestrator run ${ctx.run.id}.`);
@@ -1258,46 +1381,61 @@ const reviewStep: Handler<RunContext> = async (ctx) => {
   });
   ctx.writeArtifact("prompt", `review prompt (round ${run.attempt})`, `${prefix}.prompt.md`, prompt);
 
-  const result = await ctx.effect({
-    // Per round: a round that answered findings without changing code is reviewed again, with its answers.
-    key: `agent.review.${run.attempt}.${headSha}`,
-    permission: "agents.run",
-    description: `run independent reviewer ${reviewer.id} on ${headSha.slice(0, 8)}`,
-    simulate: () => SIMULATED_AGENT,
-    run: () =>
-      guarded(ctx, `review round ${run.attempt}`, () =>
-        reviewer.run({
-          role: "reviewer",
-          cwd: worktree,
-          prompt,
-          outputSchema: REVIEW_OUTPUT_SCHEMA,
-          artifactDir: ctx.artifactDir,
-          artifactPrefix: prefix,
-          timeoutMs: config.agents.reviewer.timeout_minutes * 60_000,
-          env,
-          signal: ctx.signal,
-          ...(shots?.files.length && shots.copyDir ? { images: shots.files.map((f) => join(shots.copyDir!, f.path)) } : {}),
-        }),
-      ),
-  });
-  ctx.throwIfStopped();
-  const r = require(result, "review result");
-  if (r.costUsd) ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
-  if (!r.ok) throw new BlockedError(`reviewer failed: ${r.error}`);
+  const callReviewer = async (retry: boolean, text: string): Promise<AgentResult> => {
+    const r = await agentEffect(ctx, {
+      // Per round: a round that answered findings without changing code is reviewed again, with its answers.
+      key: `agent.review.${run.attempt}.${headSha}${retry ? ".retry" : ""}`,
+      description: `run independent reviewer ${reviewer.id} on ${headSha.slice(0, 8)}${retry ? " (retry)" : ""}`,
+      usable: (res) => !("problem" in parse(res)),
+      run: () =>
+        guarded(ctx, `review round ${run.attempt}${retry ? " (retry)" : ""}`, () =>
+          reviewer.run({
+            role: "reviewer",
+            cwd: worktree,
+            prompt: text,
+            outputSchema: REVIEW_OUTPUT_SCHEMA,
+            artifactDir: ctx.artifactDir,
+            artifactPrefix: retry ? `${prefix}-retry` : prefix,
+            timeoutMs: config.agents.reviewer.timeout_minutes * 60_000,
+            env,
+            signal: ctx.signal,
+            ...(shots?.files.length && shots.copyDir ? { images: shots.files.map((f) => join(shots.copyDir!, f.path)) } : {}),
+          }),
+        ),
+    });
+    if (r.costUsd) ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
+    return r;
+  };
+  // The reviewer must not have changed what it reviewed: a safety stop, never retried.
+  const unchanged = async () => (await adapters.workspace.headSha(worktree)) === headSha && !(await adapters.workspace.hasUncommittedChanges(worktree));
+  const parse = (r: AgentResult): { outcome: ReviewOutcome } | { problem: string } => {
+    if (!r.ok) return { problem: `reviewer failed: ${r.error}` };
+    try {
+      // Reviewer output can end up in a public PR: redact it first.
+      return { outcome: parseReview(ctx.redactor.redactValue(r.structured)) };
+    } catch (err) {
+      return { problem: `reviewer output was not a valid review (${(err as Error).message}); see ${r.transcripts.join(", ")}` };
+    }
+  };
 
-  // The reviewer must not have changed what it reviewed.
-  const after = await adapters.workspace.headSha(worktree);
-  if (after !== headSha || (await adapters.workspace.hasUncommittedChanges(worktree))) {
-    return { to: "FAILED", reason: "the worktree changed during review; the reviewer is not allowed to modify code" };
+  let r = await callReviewer(false, prompt);
+  if (!(await unchanged())) return { to: "FAILED", reason: "the worktree changed during review; the reviewer is not allowed to modify code" };
+  let parsed = parse(r);
+  if ("problem" in parsed && (r.ok || retryableAgentFailure(r, ctx.signal))) {
+    // One retry for a crashed reviewer or output that does not match the schema, within the run's time limit.
+    ctx.log("warn", "agent.retry", `Review round ${run.attempt} did not produce a usable review (${parsed.problem}); retrying the reviewer once`);
+    enforceLimits(ctx, `the retry of review round ${run.attempt}`, config.agents.reviewer.adapter === "claude-code");
+    const note = r.ok
+      ? `\n\n## Your previous answer was not usable\n${parsed.problem.split("; see ")[0]}. Respond only with JSON that matches the provided schema exactly.`
+      : "";
+    r = await callReviewer(true, `${prompt}${note}`);
+    if (!(await unchanged())) return { to: "FAILED", reason: "the worktree changed during review; the reviewer is not allowed to modify code" };
+    parsed = parse(r);
+    ctx.log("problem" in parsed ? "warn" : "info", "agent.retry_result", `Retry of review round ${run.attempt} ${"problem" in parsed ? `failed too: ${parsed.problem}` : "produced a review"}`);
+    if ("problem" in parsed) throw new BlockedError(`${parsed.problem} (after one retry)`);
   }
-
-  let outcome: ReviewOutcome;
-  try {
-    // Reviewer output can end up in a public PR: redact it first.
-    outcome = parseReview(ctx.redactor.redactValue(r.structured));
-  } catch (err) {
-    throw new BlockedError(`reviewer output was not a valid review (${(err as Error).message}); see ${r.transcripts.join(", ")}`);
-  }
+  if ("problem" in parsed) throw new BlockedError(parsed.problem);
+  const outcome = parsed.outcome;
   const decision = decideReview(outcome, blockingSeverities, criteria);
   ctx.writeArtifact("review", `review (round ${run.attempt})`, `${prefix}.json`, JSON.stringify({ outcome, decision, reviewedSha: headSha }, null, 2));
   ctx.log(
@@ -1597,7 +1735,7 @@ const prOpen: Handler<RunContext> = async (ctx) => {
     description: `push ${branch} (${reviewedSha.slice(0, 8)}) to origin`,
     simulate: () => null,
     run: async () => {
-      await adapters.workspace.push(worktree, branch);
+      await adapters.workspace.push(worktree, branch, pushOptions(config));
       return { sha: reviewedSha };
     },
   });
@@ -1651,6 +1789,8 @@ const prOpen: Handler<RunContext> = async (ctx) => {
 // ---- WAITING_FOR_CI ----------------------------------------------------------------
 
 const POLL_MS = 30_000;
+/** Upper bound on CI log text handed to the implementer (all failing checks together). */
+const CI_LOG_CHARS = 12_000;
 /** Right after a push GitHub can still report the previous head for a few seconds. */
 const HEAD_SETTLE_MS = 60_000;
 const HEAD_SETTLE_POLL_MS = 3_000;
@@ -1690,7 +1830,13 @@ const waitingForCi: Handler<RunContext> = async (ctx) => {
       await syncPrBody(ctx, status, { state: "fail", sha: status.headSha, checks: status.checks, stopping: used >= max }, `CI failed on ${status.headSha.slice(0, 8)}`);
       const lastCi: PrCiStatus = { state: "fail", sha: status.headSha, checks: status.checks };
       if (used >= max) return { to: "FAILED", reason: `CI failing after ${max} correction round(s)`, patch: { lastCi } };
-      return { to: "FIXING", reason: "CI failed", patch: { lastCi, feedback: { trigger: "ci", prompt: fixPromptForCi(failing, used + 1, max) } } };
+      // The failed steps' log tails, so the implementer fixes the actual error instead of guessing from a check name.
+      const logs = (await adapters.codeHost.ciFailureLogs(config.repo, failing, CI_LOG_CHARS).catch(() => [])).map((l) => ({ name: l.name, excerpt: ctx.redactor.redact(l.excerpt) }));
+      if (logs.length) {
+        ctx.writeArtifact("ci-logs", `CI failure logs (round ${run.attempt})`, `ci-logs-${run.attempt}.md`, logs.map((l) => `## ${l.name}\n\n\`\`\`\n${l.excerpt}\n\`\`\``).join("\n\n"));
+        ctx.log("info", "ci.logs", `Fetched failed-step logs for ${logs.map((l) => l.name).join(", ")} (${logs.reduce((n, l) => n + l.excerpt.length, 0)} chars, redacted) for the implementer`);
+      }
+      return { to: "FIXING", reason: "CI failed", patch: { lastCi, feedback: { trigger: "ci", prompt: fixPromptForCi(failing, used + 1, max, logs) } } };
     }
     if (Date.now() >= deadline) {
       ctx.log("info", "ci.waiting", `CI still ${state}; check again with: orchestrator resume ${run.id}`);

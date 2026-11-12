@@ -1,9 +1,10 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { runChecked, runProcess } from "../core/exec.js";
 import { NODE_VERSION_FILES, parseNodePin } from "./checks.js";
-import type { ChangedFile, RepoInspection, Workspace } from "./types.js";
+import type { ChangedFile, PushOptions, RepoInspection, Workspace } from "./types.js";
 
 /**
  * Applied to every git command the orchestrator runs. Repository hooks and fsmonitor commands are
@@ -18,8 +19,27 @@ const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md"
 export class GitWorkspace implements Workspace {
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
 
-  private git(cwd: string, args: string[], timeoutMs = 120_000): Promise<string> {
-    return runChecked("git", [...SAFE_GIT, ...args], { cwd, env: { ...this.env, GIT_TERMINAL_PROMPT: "0" }, timeoutMs });
+  private git(cwd: string, args: string[], timeoutMs = 120_000, env: NodeJS.ProcessEnv = {}): Promise<string> {
+    return runChecked("git", [...SAFE_GIT, ...args], { cwd, env: { ...this.env, GIT_TERMINAL_PROMPT: "0", ...env }, timeoutMs });
+  }
+
+  /** Per-command push identity: `-c remote.origin.pushurl` and GIT_SSH_COMMAND, never a config file. */
+  private pushIdentity(opts: PushOptions | undefined): { args: string[]; env: NodeJS.ProcessEnv } {
+    const args = opts?.url ? ["-c", `remote.origin.pushurl=${opts.url}`] : [];
+    const key = opts?.sshIdentityFile?.replace(/^~\//, `${this.env.HOME ?? homedir()}/`);
+    const env: NodeJS.ProcessEnv = key ? { GIT_SSH_COMMAND: `ssh -i '${key}' -o IdentitiesOnly=yes -o BatchMode=yes` } : {};
+    return { args, env };
+  }
+
+  async probePush(repoPath: string, sha: string, branch: string, opts?: PushOptions): Promise<{ ok: boolean; detail: string }> {
+    const id = this.pushIdentity(opts);
+    const res = await runProcess("git", [...SAFE_GIT, ...id.args, "push", "--dry-run", "--porcelain", "origin", `${sha}:refs/heads/${branch}`], {
+      cwd: repoPath,
+      env: { ...this.env, GIT_TERMINAL_PROMPT: "0", ...id.env },
+      timeoutMs: 90_000,
+    });
+    const detail = `${res.stderr}\n${res.stdout}`.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("To ") && l !== "Done").slice(0, 4).join(" ");
+    return { ok: res.exitCode === 0, detail: detail || (res.exitCode === 0 ? "push access confirmed" : `git push --dry-run exited ${res.exitCode}`) };
   }
 
   async ensureClone(repo: string, clonePath: string, opts: { fetch: boolean }): Promise<void> {
@@ -230,9 +250,10 @@ export class GitWorkspace implements Workspace {
     await this.git(worktreePath, ["clean", "--quiet", "-fd"]);
   }
 
-  async push(worktreePath: string, branch: string): Promise<void> {
+  async push(worktreePath: string, branch: string, opts?: PushOptions): Promise<void> {
     // Plain push: never --force. A rejected push surfaces as an error for a human.
-    await this.git(worktreePath, ["push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000);
+    const id = this.pushIdentity(opts);
+    await this.git(worktreePath, [...id.args, "push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000, id.env);
   }
 }
 

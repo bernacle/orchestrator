@@ -182,6 +182,23 @@ export const RepoConfigSchema = z
         minor_fix_rounds: z.number().int().min(0).max(1).default(1),
       })
       .prefault({}),
+    /**
+     * How the orchestrator's own `git push` authenticates (it runs outside the sandbox, with your
+     * credentials). Applied per command only (`git -c remote.origin.pushurl=…`, `GIT_SSH_COMMAND`);
+     * no git config file is written. Use it when the default identity cannot push to this repository,
+     * e.g. an SSH host alias whose key belongs to the right account.
+     */
+    push: z
+      .object({
+        /** Push URL for this repository, e.g. git@github-personal:owner/name.git. Must name this repository. */
+        url: z.string().min(1).optional(),
+        /** SSH private key for pushes (absolute or ~/ path), used with IdentitiesOnly. */
+        ssh_identity_file: z
+          .string()
+          .regex(/^(~\/|\/)[^'"\s;$`\\]+$/, "push.ssh_identity_file must be an absolute or ~/ path without spaces or shell characters")
+          .optional(),
+      })
+      .prefault({}),
     pull_request: z
       .object({
         draft: z.boolean().default(true),
@@ -247,6 +264,13 @@ export const RepoConfigSchema = z
     }
     if ((c.permissions.linear.comment || c.permissions.linear.update_state) && !c.linear.workspace) {
       ctx.addIssue({ code: "custom", message: "Linear writes require linear.workspace (the workspace urlKey the API key must belong to)", path: ["linear", "workspace"] });
+    }
+    if (c.push.url) {
+      const u = c.push.url.toLowerCase().replace(/\.git$/, "");
+      if (!u.endsWith(`/${c.repo.toLowerCase()}`) && !u.endsWith(`:${c.repo.toLowerCase()}`)) {
+        ctx.addIssue({ code: "custom", message: `push.url (${c.push.url}) must point at ${c.repo}`, path: ["push", "url"] });
+      }
+      if (/[\s'"`$;]/.test(c.push.url) || c.push.url.startsWith("-")) ctx.addIssue({ code: "custom", message: "push.url contains characters that are not allowed", path: ["push", "url"] });
     }
     if (c.merge.mode === "auto" && !c.permissions.github.merge) {
       ctx.addIssue({ code: "custom", message: "merge.mode=auto requires permissions.github.merge=true", path: ["permissions"] });

@@ -63,6 +63,12 @@ const RECOVERY_EVENTS = new Set([
   "minor.restored",
   "review.declined",
   "pr.body_update_failed",
+  // Bounded recovery: one retry of a crashed or unusable agent, a run-scoped branch around a
+  // collision, and the failed CI steps' logs handed to the implementer.
+  "agent.retry",
+  "agent.retry_result",
+  "branch.scoped",
+  "ci.logs",
 ]);
 
 export function buildDeliveryReport(store: Store, run: RunRecord<RunContext>): DeliveryReport {
