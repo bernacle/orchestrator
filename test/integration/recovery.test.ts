@@ -6,6 +6,7 @@ import { GitWorkspace } from "../../src/adapters/git.js";
 import { ciLogTail } from "../../src/adapters/github.js";
 import { reconcileRunById, resumeRun, startRun } from "../../src/app.js";
 import { RepoConfigSchema } from "../../src/config/schema.js";
+import { Redactor } from "../../src/core/redact.js";
 import { trustScope } from "../../src/core/trust.js";
 import type { RunContext } from "../../src/core/workflow.js";
 import { buildDeliveryReport, renderDeliveryMarkdown } from "../../src/report/delivery.js";
@@ -59,6 +60,72 @@ describe("agent failures", () => {
     run = await resumeRun(h.app, run.id, { ciWaitMinutes: 0 });
     expect(run.state).toBe("READY_TO_MERGE");
     expect(h.implementer.calls).toHaveLength(3);
+  });
+
+  it("a resume after an interruption reuses a finished retry: no third call, each call paid once", async () => {
+    let calls = 0;
+    h = createHarness({
+      implement: (task, call) => {
+        calls = call;
+        return call === 1 ? { ok: false, error: "claude exited 1: socket hang up", costUsd: 2 } : { ...writeFeature(task, call), costUsd: 2 };
+      },
+    });
+    const interrupt = new AbortController();
+    let run = await startRun(h.app, {
+      issueKey: "ACM-1",
+      repo: "acme/widget",
+      configFile: h.configFile,
+      dryRun: false,
+      ciWaitMinutes: 0,
+      interrupt: interrupt.signal,
+      onEvent: (e) => {
+        if (e.type === "agent.retry_result") interrupt.abort();
+      },
+    });
+    expect(run.state).toBe("IMPLEMENTING");
+    expect(calls).toBe(2);
+    run = await resumeRun(h.app, run.id, { ciWaitMinutes: 0 });
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(h.implementer.calls).toHaveLength(2);
+    expect(run.context.costUsd).toBe(4);
+  });
+
+  it("does not retry an implementer that stopped after touching a forbidden path", async () => {
+    h = createHarness({
+      implement: (task) => {
+        mkdirSync(join(task.cwd, ".github", "workflows"), { recursive: true });
+        writeFileSync(join(task.cwd, ".github", "workflows", "ci.yml"), "on: push\n");
+        return { ok: false, error: "claude exited 1: socket hang up" };
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/forbidden paths \(\.github\/workflows\/ci\.yml\); not retried/);
+    expect(h.implementer.calls).toHaveLength(1);
+  });
+
+  it("does not retry an implementer that stopped after writing a secret", async () => {
+    h = createHarness({
+      implement: (task) => {
+        writeFileSync(join(task.cwd, "config.txt"), `token=ghp_${"a1B2c3D4e5".repeat(4).slice(0, 36)}\n`);
+        return { ok: false, error: "claude exited 1: socket hang up" };
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("FAILED");
+    expect(run.reason).toMatch(/possible secret in config\.txt|possible secret in the work implementer round 0 left/);
+    expect(h.implementer.calls).toHaveLength(1);
+  });
+
+  it("caps every agent call at what is left of the run's time window", async () => {
+    // Agents allowed 45 minutes each, in a 20-minute run window.
+    h = createHarness({ config: { limits: { max_run_minutes: 20 }, agents: { implementer: { timeout_minutes: 45 }, reviewer: { timeout_minutes: 45 } } } });
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    const t = h.implementer.calls[0]!.timeoutMs;
+    expect(t).toBeLessThanOrEqual(20 * 60_000);
+    expect(t).toBeGreaterThan(19 * 60_000);
+    expect(h.reviewer.calls[0]!.timeoutMs).toBeLessThanOrEqual(20 * 60_000);
   });
 
   it("never retries around a spent budget", async () => {
@@ -163,6 +230,36 @@ describe("branch collisions", () => {
     expect(h.app.store.getRun(first.id)!.state).toBe("COMPLETED");
   });
 
+  it("sees a branch on origin the clone has not fetched", async () => {
+    h = createHarness();
+    git(h.origin, "branch", BRANCH, "main");
+    const run = await start();
+    expect(run.state).toBe("READY_TO_MERGE");
+    expect(run.context.branch).not.toBe(BRANCH);
+    expect(renderDeliveryMarkdown(recovery(run.id))).toMatch(/already exists \(on origin\)/);
+  });
+
+  it("never attaches to a branch created after planning chose it", async () => {
+    h = createHarness();
+    let made = false;
+    const run = await startRun(h.app, {
+      issueKey: "ACM-1",
+      repo: "acme/widget",
+      configFile: h.configFile,
+      dryRun: false,
+      ciWaitMinutes: 0,
+      onEvent: (e) => {
+        if (!made && e.type === "step.started" && e.state === "IMPLEMENTING") {
+          made = true;
+          git(h.clone, "branch", BRANCH, "HEAD");
+        }
+      },
+    });
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/created by something else after planning; this run will not attach to it/);
+    expect(h.implementer.calls).toHaveLength(0);
+  });
+
   it("keeps the template branch when nothing uses it", async () => {
     h = createHarness();
     const run = await start();
@@ -222,6 +319,32 @@ describe("push identity", () => {
     expect(() => git(h.clone, "config", "--get", "remote.origin.pushurl")).toThrow();
   });
 
+  it("a configured push URL replaces the clone's own push URL instead of adding to it", async () => {
+    h = createHarness();
+    const alt = join(h.root, "alt", "acme", "widget.git");
+    mkdirSync(join(h.root, "alt", "acme"), { recursive: true });
+    execFileSync("git", ["clone", "-q", "--bare", h.origin, alt]);
+    // The operator's clone already pushes somewhere unreachable.
+    git(h.clone, "config", "remote.origin.pushurl", join(h.root, "stale", "widget.git"));
+    const ws = new GitWorkspace(process.env);
+    const sha = git(h.clone, "rev-parse", "HEAD");
+    expect((await ws.probePush(h.clone, sha, "orch/probe", { url: alt })).ok).toBe(true);
+    git(h.clone, "checkout", "-q", "-b", "orch/only-alt");
+    await ws.push(h.clone, "orch/only-alt", { url: alt });
+    expect(git(alt, "rev-parse", "refs/heads/orch/only-alt")).toBe(sha);
+    expect(git(h.clone, "config", "--get-all", "remote.origin.pushurl")).toBe(join(h.root, "stale", "widget.git"));
+  });
+
+  it("only accepts an SSH key inside ~/.ssh (denied to every sandbox) and ordinary push transports", () => {
+    const base = { repo: "o/r", linear: { teams: ["O"] }, agents: { implementer: { adapter: "claude-code" }, reviewer: { adapter: "codex" } } };
+    expect(() => RepoConfigSchema.parse({ ...base, push: { ssh_identity_file: "/tmp/orch-id" } })).toThrow(/inside ~\/\.ssh/);
+    expect(() => RepoConfigSchema.parse({ ...base, push: { ssh_identity_file: "~/.ssh/../keys/id" } })).toThrow();
+    expect(() => RepoConfigSchema.parse({ ...base, push: { url: "ext::sh%s-c%sx/o/r" } })).toThrow();
+    for (const url of ["https://github.com/o/r.git", "ssh://git@github.com/o/r.git", "git@github-personal:o/r.git"]) {
+      expect(RepoConfigSchema.parse({ ...base, push: { url } }).push.url).toBe(url);
+    }
+  });
+
   it("only accepts a push URL for the configured repository, and only puts it in the trust scope when set", () => {
     const base = { repo: "o/r", linear: { teams: ["O"] }, agents: { implementer: { adapter: "claude-code" }, reviewer: { adapter: "codex" } } };
     expect(() => RepoConfigSchema.parse({ ...base, push: { url: "git@github-personal:someone/else.git" } })).toThrow(/must point at o\/r/);
@@ -267,6 +390,15 @@ describe("CI failure logs", () => {
     const md = renderDeliveryMarkdown(recovery(run.id));
     expect(md).toContain("ci.logs: Fetched failed-step logs for CI");
     expect(md).not.toContain(token);
+  });
+
+  it("ciLogTail redacts the whole log before cutting it, so a cut cannot leave an unrecognised key fragment", () => {
+    const body = Array.from({ length: 30 }, (_, i) => `MIIEvQIBADANBgkqhkiG9w0BAQEFAASC${String(i).padStart(4, "0")}`).join("\n");
+    const log = `step\tsetup\t-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\nError: boom`;
+    const redactor = new Redactor({});
+    const out = ciLogTail(log, 300, (t) => redactor.redact(t));
+    expect(out).toContain("Error: boom");
+    expect(out).not.toMatch(/MIIEvQIBADANBgkqhkiG9w0BAQEFAASC/);
   });
 
   it("ciLogTail keeps the end of the log, without ANSI codes or gh's column prefixes, within the budget", () => {

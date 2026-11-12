@@ -23,17 +23,20 @@ export class GitWorkspace implements Workspace {
     return runChecked("git", [...SAFE_GIT, ...args], { cwd, env: { ...this.env, GIT_TERMINAL_PROMPT: "0", ...env }, timeoutMs });
   }
 
-  /** Per-command push identity: `-c remote.origin.pushurl` and GIT_SSH_COMMAND, never a config file. */
-  private pushIdentity(opts: PushOptions | undefined): { args: string[]; env: NodeJS.ProcessEnv } {
-    const args = opts?.url ? ["-c", `remote.origin.pushurl=${opts.url}`] : [];
+  /**
+   * Per-command push identity, never written to a config file. A configured URL is the push
+   * destination itself (not another `remote.origin.pushurl`, which git would push to in addition to
+   * any the clone already has); a key goes in GIT_SSH_COMMAND.
+   */
+  private pushIdentity(opts: PushOptions | undefined): { target: string; env: NodeJS.ProcessEnv } {
     const key = opts?.sshIdentityFile?.replace(/^~\//, `${this.env.HOME ?? homedir()}/`);
     const env: NodeJS.ProcessEnv = key ? { GIT_SSH_COMMAND: `ssh -i '${key}' -o IdentitiesOnly=yes -o BatchMode=yes` } : {};
-    return { args, env };
+    return { target: opts?.url ?? "origin", env };
   }
 
   async probePush(repoPath: string, sha: string, branch: string, opts?: PushOptions): Promise<{ ok: boolean; detail: string }> {
     const id = this.pushIdentity(opts);
-    const res = await runProcess("git", [...SAFE_GIT, ...id.args, "push", "--dry-run", "--porcelain", "origin", `${sha}:refs/heads/${branch}`], {
+    const res = await runProcess("git", [...SAFE_GIT, "push", "--dry-run", "--porcelain", id.target, `${sha}:refs/heads/${branch}`], {
       cwd: repoPath,
       env: { ...this.env, GIT_TERMINAL_PROMPT: "0", ...id.env },
       timeoutMs: 90_000,
@@ -111,13 +114,17 @@ export class GitWorkspace implements Workspace {
     };
   }
 
-  async branchExists(repoPath: string, branch: string): Promise<{ local: boolean; remote: boolean }> {
+  async branchExists(repoPath: string, branch: string, opts: { fresh?: boolean } = {}): Promise<{ local: boolean; remote: boolean }> {
     const local = (await runProcess("git", [...SAFE_GIT, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repoPath })).exitCode === 0;
-    const remote = (await runProcess("git", [...SAFE_GIT, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], { cwd: repoPath })).exitCode === 0;
+    const tracking = async () => (await runProcess("git", [...SAFE_GIT, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], { cwd: repoPath })).exitCode === 0;
+    if (!opts.fresh) return { local, remote: await tracking() };
+    // Ask origin itself (read-only): a clone that was not fetched can miss a branch pushed since.
+    const ls = await runProcess("git", [...SAFE_GIT, "ls-remote", "--exit-code", "--heads", "origin", `refs/heads/${branch}`], { cwd: repoPath, env: { ...this.env, GIT_TERMINAL_PROMPT: "0" }, timeoutMs: 60_000 });
+    const remote = ls.exitCode === 0 ? true : ls.exitCode === 2 ? false : await tracking();
     return { local, remote };
   }
 
-  async createWorktree(input: { repoPath: string; worktreePath: string; branch: string; baseRef: string }): Promise<{ created: boolean; headSha: string }> {
+  async createWorktree(input: { repoPath: string; worktreePath: string; branch: string; baseRef: string; newBranch?: boolean }): Promise<{ created: boolean; headSha: string }> {
     if (existsSync(join(input.worktreePath, ".git"))) {
       const current = await this.git(input.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
       if (current !== input.branch) {
@@ -126,7 +133,9 @@ export class GitWorkspace implements Workspace {
       return { created: false, headSha: await this.headSha(input.worktreePath) };
     }
     mkdirSync(dirname(input.worktreePath), { recursive: true });
-    const { local } = await this.branchExists(input.repoPath, input.branch);
+    // A new run creates its branch (`-b` fails if it exists, atomically): it never attaches to one
+    // that appeared since planning. Only a re-entered run reattaches to the branch it created.
+    const local = !input.newBranch && (await this.branchExists(input.repoPath, input.branch)).local;
     const args = local
       ? ["worktree", "add", input.worktreePath, input.branch]
       : ["worktree", "add", "--no-track", "-b", input.branch, input.worktreePath, input.baseRef];
@@ -163,6 +172,24 @@ export class GitWorkspace implements Workspace {
     if (staged.exitCode === 0) return null;
     await this.git(worktreePath, ["commit", "--quiet", "-m", message]);
     return this.headSha(worktreePath);
+  }
+
+  async uncommittedDiff(worktreePath: string): Promise<string> {
+    const tracked = await this.git(worktreePath, ["diff", "--no-ext-diff", "--no-textconv", "HEAD"]);
+    const untracked = (await this.git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean);
+    const root = realpathSync(resolve(worktreePath));
+    const parts = [tracked];
+    for (const path of untracked) {
+      try {
+        const full = resolve(root, path);
+        const st = lstatSync(full);
+        if (!full.startsWith(root + sep) || !st.isFile() || st.size > 2 * 1024 * 1024) continue;
+        parts.push(`+++ ${path} (untracked)\n${readFileSync(full, "utf8")}`);
+      } catch {
+        /* vanished meanwhile */
+      }
+    }
+    return parts.join("\n");
   }
 
   async uncommittedPaths(worktreePath: string): Promise<string[]> {
@@ -253,7 +280,9 @@ export class GitWorkspace implements Workspace {
   async push(worktreePath: string, branch: string, opts?: PushOptions): Promise<void> {
     // Plain push: never --force. A rejected push surfaces as an error for a human.
     const id = this.pushIdentity(opts);
-    await this.git(worktreePath, [...id.args, "push", "--quiet", "--set-upstream", "origin", `HEAD:refs/heads/${branch}`], 300_000, id.env);
+    // With a configured URL there is no remote name to track: no --set-upstream (it would write the URL into the clone's config).
+    const upstream = id.target === "origin" ? ["--set-upstream"] : [];
+    await this.git(worktreePath, ["push", "--quiet", ...upstream, id.target, `HEAD:refs/heads/${branch}`], 300_000, id.env);
   }
 }
 

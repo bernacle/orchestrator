@@ -184,7 +184,7 @@ export const RepoConfigSchema = z
       .prefault({}),
     /**
      * How the orchestrator's own `git push` authenticates (it runs outside the sandbox, with your
-     * credentials). Applied per command only (`git -c remote.origin.pushurl=…`, `GIT_SSH_COMMAND`);
+     * credentials). Applied per command only (the URL is the push destination, the key goes in `GIT_SSH_COMMAND`);
      * no git config file is written. Use it when the default identity cannot push to this repository,
      * e.g. an SSH host alias whose key belongs to the right account.
      */
@@ -192,10 +192,14 @@ export const RepoConfigSchema = z
       .object({
         /** Push URL for this repository, e.g. git@github-personal:owner/name.git. Must name this repository. */
         url: z.string().min(1).optional(),
-        /** SSH private key for pushes (absolute or ~/ path), used with IdentitiesOnly. */
+        /**
+         * SSH private key for pushes, used with IdentitiesOnly. Must live in ~/.ssh, which every
+         * sandbox (agents, setup, checks) is denied, so repository code can never read it.
+         */
         ssh_identity_file: z
           .string()
-          .regex(/^(~\/|\/)[^'"\s;$`\\]+$/, "push.ssh_identity_file must be an absolute or ~/ path without spaces or shell characters")
+          .regex(/^~\/\.ssh\/[A-Za-z0-9._@+-]+(\/[A-Za-z0-9._@+-]+)*$/, "push.ssh_identity_file must be a key inside ~/.ssh (e.g. ~/.ssh/id_personal), without spaces or shell characters")
+          .refine((p) => !p.split("/").includes(".."), "push.ssh_identity_file must not contain ..")
           .optional(),
       })
       .prefault({}),
@@ -270,7 +274,11 @@ export const RepoConfigSchema = z
       if (!u.endsWith(`/${c.repo.toLowerCase()}`) && !u.endsWith(`:${c.repo.toLowerCase()}`)) {
         ctx.addIssue({ code: "custom", message: `push.url (${c.push.url}) must point at ${c.repo}`, path: ["push", "url"] });
       }
-      if (/[\s'"`$;]/.test(c.push.url) || c.push.url.startsWith("-")) ctx.addIssue({ code: "custom", message: "push.url contains characters that are not allowed", path: ["push", "url"] });
+      if (/[\s'"`$;\\]/.test(c.push.url) || c.push.url.startsWith("-")) ctx.addIssue({ code: "custom", message: "push.url contains characters that are not allowed", path: ["push", "url"] });
+      // Ordinary transports only (no ext::, fd:: or other helpers): https://, ssh://, scp-like user@host:path, or a local path.
+      if (!/^(https:\/\/|ssh:\/\/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:(?!\/\/)|\/)/.test(c.push.url)) {
+        ctx.addIssue({ code: "custom", message: "push.url must be an https://, ssh:// or user@host: URL (or a local path)", path: ["push", "url"] });
+      }
     }
     if (c.merge.mode === "auto" && !c.permissions.github.merge) {
       ctx.addIssue({ code: "custom", message: "merge.mode=auto requires permissions.github.merge=true", path: ["permissions"] });

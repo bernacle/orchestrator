@@ -187,7 +187,7 @@ export class GitHubHost implements CodeHost {
     }
   }
 
-  async ciFailureLogs(repo: string, failing: Array<{ name: string; detailsUrl?: string }>, maxChars: number): Promise<Array<{ name: string; excerpt: string }>> {
+  async ciFailureLogs(repo: string, failing: Array<{ name: string; detailsUrl?: string }>, maxChars: number, redact: (text: string) => string): Promise<Array<{ name: string; excerpt: string }>> {
     const out: Array<{ name: string; excerpt: string }> = [];
     let left = maxChars;
     for (const check of failing) {
@@ -195,7 +195,7 @@ export class GitHubHost implements CodeHost {
       if (!job || left < 200) continue;
       try {
         const log = await this.gh(["run", "view", "--repo", repo, "--job", job, "--log-failed"]);
-        const excerpt = ciLogTail(log, Math.min(left, Math.ceil(maxChars / Math.max(1, failing.length))));
+        const excerpt = ciLogTail(log, Math.min(left, Math.ceil(maxChars / Math.max(1, failing.length))), redact);
         if (!excerpt) continue;
         out.push({ name: check.name, excerpt });
         left -= excerpt.length;
@@ -225,15 +225,20 @@ export class GitHubHost implements CodeHost {
 /**
  * The end of a `gh run view --log-failed` dump: lines are "job\tstep\ttimestamp message"; keep the
  * message, drop ANSI codes, and keep the last lines that fit (the error is almost always at the end).
+ * The whole cleaned log is redacted before anything is cut: a cut through a PEM block or a long
+ * token would otherwise leave a fragment the redactor no longer recognises.
  */
-export function ciLogTail(log: string, maxChars: number): string {
-  const lines = log
+export function ciLogTail(log: string, maxChars: number, redact: (text: string) => string = (t) => t): string {
+  const cleaned = log
     .replace(/\u001b\[[0-9;]*m/g, "")
     .split(/\r?\n/)
     .map((l) => {
       const parts = l.split("\t");
       return (parts.length >= 3 ? parts.slice(2).join("\t") : l).replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, "").trimEnd();
     })
+    .join("\n");
+  const lines = redact(cleaned)
+    .split("\n")
     .filter((l) => l.trim());
   const kept: string[] = [];
   let size = 0;

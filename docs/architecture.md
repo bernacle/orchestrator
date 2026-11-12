@@ -35,9 +35,11 @@ any working state → BLOCKED (resumable) | FAILED | CANCELLED
   - one retry of an implementer round (resuming its session);
   - one retry of a reviewer crash or schema mismatch.
 
-  A failed or unusable agent result is recorded as a failed effect, never a completed one. An approved resume after such a block runs the agent again, with its one retry, instead of replaying the failure. A usable result is reused as before.
+  A failed or unusable agent result is recorded as a failed effect, never a completed one. An approved resume after such a block runs the agent again, with its one retry, instead of replaying the failure. A usable result is reused, including a retry that finished before an interruption: the first attempt is not run again. An agent call's cost is added once, when it runs, never again when its result is reused. Every agent call's timeout is capped at what is left of the run's time window. Before an implementer is retried, what it left in the worktree goes through the forbidden-path and secret checks, so a retry can never erase the evidence of a violation.
 
-  Safety stops are `FailedError`s from tripwires, secret scans and changed-code checks, and they are never retried. Branch collisions and push access are settled in PLANNING, before any agent runs. The push identity (`push.url`, `push.ssh_identity_file`) is passed per command (`git -c remote.origin.pushurl`, `GIT_SSH_COMMAND`) and never written to a git config file.
+  Safety stops are `FailedError`s from tripwires, secret scans and changed-code checks, and they are never retried. Branch collisions and push access are settled in PLANNING, before any agent runs. Branches on origin are checked with `git ls-remote`, not the clone's tracking refs. A new run's worktree always creates its branch (`worktree add -b`, which fails if the branch exists), so it never attaches to one that appeared after planning. The push identity is passed per command and never written to a git config file:
+  - `push.url` is the push destination itself, so the clone's own `remote.origin.pushurl` is not pushed to as well;
+  - `push.ssh_identity_file` is passed through `GIT_SSH_COMMAND`, and must be inside `~/.ssh`, which every sandbox is denied.
 - **Reconciliation** (core/reconcile.ts) records a person's merge or close of the run's PR. It works without a drive or approval:
   - It reads the PR, and a commit comparison when the merged head isn't the reviewed commit.
   - Then it moves the run (from `WAITING_FOR_CI`, `READY_TO_MERGE` or `BLOCKED`) through `READY_TO_MERGE → MERGED → COMPLETED`, or to `CANCELLED`.

@@ -460,8 +460,13 @@ class UnusableAgentResult extends Error {
   }
 }
 
+/**
+ * Run (or reuse) one agent call through the effect ledger. Its cost is added to the run once, when
+ * the call actually runs: a result reused on resume was paid for already.
+ */
 async function agentEffect(ctx: Ctx, opts: { key: string; description: string; run: () => Promise<AgentResult>; usable: (r: AgentResult) => boolean }): Promise<AgentResult> {
   let r: AgentResult;
+  let ran = false;
   try {
     const result = await ctx.effect({
       key: opts.key,
@@ -470,6 +475,7 @@ async function agentEffect(ctx: Ctx, opts: { key: string; description: string; r
       simulate: () => SIMULATED_AGENT,
       run: async () => {
         const res = await opts.run();
+        ran = true;
         if (!opts.usable(res)) throw new UnusableAgentResult(res);
         return res;
       },
@@ -479,9 +485,46 @@ async function agentEffect(ctx: Ctx, opts: { key: string; description: string; r
     if (!(err instanceof UnusableAgentResult)) throw err;
     r = err.result;
   }
+  if (ran && r.costUsd) ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
   ctx.throwIfStopped();
   return r;
 }
+
+/**
+ * An agent call's timeout, capped at what is left of the run's time window (at least a minute), so a
+ * retry (or any late call) cannot run past limits.max_run_minutes.
+ */
+function agentTimeoutMs(ctx: Ctx, configuredMinutes: number): number {
+  const started = Date.parse(ctx.run.context.limitWindowStartedAt ?? ctx.run.createdAt);
+  const left = ctx.config.limits.max_run_minutes * 60_000 - (ctx.now().getTime() - started);
+  return Math.max(60_000, Math.min(configuredMinutes * 60_000, left));
+}
+
+/**
+ * Before retrying a failed implementer: what it left in the worktree must pass the same safety checks
+ * a successful round does (forbidden paths, secrets). A violation stops recovery, so a retry can never
+ * clean up the evidence of one.
+ */
+async function assertSafeBeforeRetry(ctx: Ctx, worktree: string, baseSha: string, attempt: number): Promise<void> {
+  const { adapters, config } = ctx;
+  const committed = await adapters.workspace.changedFiles(worktree, baseSha);
+  const pending = await adapters.workspace.uncommittedPaths(worktree);
+  const touched = [...committed, ...pending.map((path) => ({ status: existsInWorktree(worktree, path) ? "M" : "D", path }))];
+  const bad = forbiddenFiles(touched, config.forbidden_paths);
+  if (bad.length) throw new ForbiddenPathError(`implementer round ${attempt} stopped after touching forbidden paths (${[...new Set(bad)].join(", ")}); not retried. The worktree is left as it is for inspection`);
+  const left = `${await adapters.workspace.diff(worktree, baseSha)}\n${await adapters.workspace.uncommittedDiff(worktree)}`;
+  assertNoSecrets(ctx, left, `the work implementer round ${attempt} left before it stopped (not retried)`);
+}
+
+function existsInWorktree(worktree: string, path: string): boolean {
+  try {
+    lstatSync(join(worktree, path));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 
 /** Simulated agent result for dry runs: obviously not real. */
 const SIMULATED_AGENT: AgentResult = { sessionId: null, text: "(dry run: agent not started)", structured: null, ok: true, error: null, costUsd: null, durationMs: 0, transcripts: [] };
@@ -777,7 +820,7 @@ async function chooseBranch(ctx: Ctx, clonePath: string, preferred: string): Pro
   const { adapters, config, run } = ctx;
   const taken = async (b: string): Promise<string | null> => {
     const where: string[] = [];
-    const e = await adapters.workspace.branchExists(clonePath, b);
+    const e = await adapters.workspace.branchExists(clonePath, b, { fresh: true });
     if (e.local) where.push("locally");
     if (e.remote) where.push("on origin");
     const pr = await adapters.codeHost.findPullRequest(config.repo, b).catch(() => null);
@@ -878,7 +921,7 @@ async function implementerRound(
             ...(retry ? (retrySession ? { resumeSessionId: retrySession } : {}) : resumeSessionId ? { resumeSessionId } : { sessionId }),
             artifactDir: ctx.artifactDir,
             artifactPrefix: retry ? `${prefix}-retry` : prefix,
-            timeoutMs: config.agents.implementer.timeout_minutes * 60_000,
+            timeoutMs: agentTimeoutMs(ctx, config.agents.implementer.timeout_minutes),
             env,
             readablePaths,
             signal: ctx.signal,
@@ -887,15 +930,24 @@ async function implementerRound(
           }),
         ),
     });
-    ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
     return r;
   };
-  let r = await callAgent(false, prompt, budget);
+  let r: AgentResult;
   let retried = false;
-  if (retryableAgentFailure(r, ctx.signal)) {
+  if (ctx.effectStatus(`agent.implement.${attempt}.retry`) === "completed") {
+    // Re-entered after the first attempt failed and its retry finished: continue from the retry's
+    // result (reused, not run or paid for again) instead of running the first attempt once more.
+    retried = true;
+    r = await callAgent(true, prompt, budget);
+  } else {
+    r = await callAgent(false, prompt, budget);
+  }
+  if (!retried && retryableAgentFailure(r, ctx.signal)) {
     retried = true;
     // One retry for a crash, a hang or unusable output; never for a spent limit or a safety stop
-    // (those throw before reaching here). The run's cost and time limits apply to the retry too.
+    // (tripwires throw before reaching here; forbidden paths and secrets are checked first). The
+    // run's cost and time limits apply to the retry too.
+    await assertSafeBeforeRetry(ctx, worktree, baseSha, attempt);
     ctx.log("warn", "agent.retry", `Implementer round ${attempt} stopped unexpectedly (${r.error}); retrying once in the same session`);
     const left = enforceLimits(ctx, `the retry of implementer round ${attempt}`);
     r = await callAgent(true, retryPrompt(r.error, prompt), claudeBudget(config.agents.implementer, left), resumeSessionId ?? r.sessionId ?? (agent.id === "claude-code" ? sessionId : null));
@@ -1061,12 +1113,18 @@ const implementing: Handler<RunContext> = async (ctx) => {
   const branch = require(c.branch, "branch");
 
   if (!config.local_path) await adapters.workspace.ensureClone(config.repo, clonePath, { fetch: true });
+  // The first creation makes a new branch: planning chose a free name, and a branch that appeared
+  // since (another process) is never attached to. Only a re-entered run reattaches its own branch.
+  const newBranch = ctx.effectStatus("git.worktree") === null;
+  if (newBranch && (await adapters.workspace.branchExists(clonePath, branch)).local) {
+    throw new BlockedError(`branch ${branch} was created by something else after planning; this run will not attach to it (the branch is left untouched). Cancel this run and start a new one`);
+  }
   const wt = await ctx.effect({
     key: "git.worktree",
     permission: "local.worktree",
     description: `create worktree ${worktree} on ${branch} from origin/${c.baseBranch}`,
     simulate: () => ({ created: false, headSha: c.baseSha ?? "" }),
-    run: () => adapters.workspace.createWorktree({ repoPath: clonePath, worktreePath: worktree, branch, baseRef: c.baseSha ?? `origin/${c.baseBranch}` }),
+    run: () => adapters.workspace.createWorktree({ repoPath: clonePath, worktreePath: worktree, branch, baseRef: c.baseSha ?? `origin/${c.baseBranch}`, newBranch }),
   });
   ctx.log("info", "worktree.ready", `${wt?.created ? "Created" : "Reusing"} worktree at ${worktree} (${wt?.headSha.slice(0, 8)})`);
 
@@ -1396,14 +1454,13 @@ const reviewStep: Handler<RunContext> = async (ctx) => {
             outputSchema: REVIEW_OUTPUT_SCHEMA,
             artifactDir: ctx.artifactDir,
             artifactPrefix: retry ? `${prefix}-retry` : prefix,
-            timeoutMs: config.agents.reviewer.timeout_minutes * 60_000,
+            timeoutMs: agentTimeoutMs(ctx, config.agents.reviewer.timeout_minutes),
             env,
             signal: ctx.signal,
             ...(shots?.files.length && shots.copyDir ? { images: shots.files.map((f) => join(shots.copyDir!, f.path)) } : {}),
           }),
         ),
     });
-    if (r.costUsd) ctx.save({ costUsd: totalCost(ctx, r.costUsd) });
     return r;
   };
   // The reviewer must not have changed what it reviewed: a safety stop, never retried.
@@ -1418,10 +1475,12 @@ const reviewStep: Handler<RunContext> = async (ctx) => {
     }
   };
 
-  let r = await callReviewer(false, prompt);
+  // Re-entered after a failed review whose retry finished: continue from the retry's (reused) review.
+  const retryDone = ctx.effectStatus(`agent.review.${run.attempt}.${headSha}.retry`) === "completed";
+  let r = await callReviewer(retryDone, prompt);
   if (!(await unchanged())) return { to: "FAILED", reason: "the worktree changed during review; the reviewer is not allowed to modify code" };
   let parsed = parse(r);
-  if ("problem" in parsed && (r.ok || retryableAgentFailure(r, ctx.signal))) {
+  if (!retryDone && "problem" in parsed && (r.ok || retryableAgentFailure(r, ctx.signal))) {
     // One retry for a crashed reviewer or output that does not match the schema, within the run's time limit.
     ctx.log("warn", "agent.retry", `Review round ${run.attempt} did not produce a usable review (${parsed.problem}); retrying the reviewer once`);
     enforceLimits(ctx, `the retry of review round ${run.attempt}`, config.agents.reviewer.adapter === "claude-code");
@@ -1831,7 +1890,9 @@ const waitingForCi: Handler<RunContext> = async (ctx) => {
       const lastCi: PrCiStatus = { state: "fail", sha: status.headSha, checks: status.checks };
       if (used >= max) return { to: "FAILED", reason: `CI failing after ${max} correction round(s)`, patch: { lastCi } };
       // The failed steps' log tails, so the implementer fixes the actual error instead of guessing from a check name.
-      const logs = (await adapters.codeHost.ciFailureLogs(config.repo, failing, CI_LOG_CHARS).catch(() => [])).map((l) => ({ name: l.name, excerpt: ctx.redactor.redact(l.excerpt) }));
+      // Redacted whole, before it is cut (by the code host), and once more after as a backstop.
+      const redact = (t: string) => ctx.redactor.redact(t);
+      const logs = (await adapters.codeHost.ciFailureLogs(config.repo, failing, CI_LOG_CHARS, redact).catch(() => [])).map((l) => ({ name: l.name, excerpt: redact(l.excerpt) }));
       if (logs.length) {
         ctx.writeArtifact("ci-logs", `CI failure logs (round ${run.attempt})`, `ci-logs-${run.attempt}.md`, logs.map((l) => `## ${l.name}\n\n\`\`\`\n${l.excerpt}\n\`\`\``).join("\n\n"));
         ctx.log("info", "ci.logs", `Fetched failed-step logs for ${logs.map((l) => l.name).join(", ")} (${logs.reduce((n, l) => n + l.excerpt.length, 0)} chars, redacted) for the implementer`);

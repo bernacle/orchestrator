@@ -7,7 +7,7 @@ import type { Paths } from "../config/load.js";
 import { PermissionGate, type Permission } from "./policy.js";
 import type { Redactor } from "./redact.js";
 import { TERMINAL_STATES, type RunState } from "./states.js";
-import { hostName, type EventLevel, type RunMode, type RunRecord, type Store } from "./store.js";
+import { hostName, type EffectStatus, type EventLevel, type RunMode, type RunRecord, type Store } from "./store.js";
 
 /** Thrown by handlers to park the run in BLOCKED with an actionable reason. */
 export class BlockedError extends Error {
@@ -68,6 +68,8 @@ export interface StepContext<C> {
   artifactDir: string;
   redactor: Redactor;
   throwIfStopped(): void;
+  /** Read-only: the ledger status of this run's effect `key` (null when it never started). */
+  effectStatus(key: string): EffectStatus | null;
   /** Read-only: other runs of this repository that use `branch` (branch-collision checks). */
   runsOnBranch(branch: string): Array<{ id: string; state: RunState; mode: RunMode }>;
 }
@@ -320,6 +322,7 @@ export class Engine<C extends object> {
       redactor,
       now: () => this.now(),
       throwIfStopped,
+      effectStatus: (key) => store.getEffect(current.id, key)?.status ?? null,
       runsOnBranch: (branch) => store.runsOnBranch(current.repo, branch).filter((r) => r.id !== current.id),
       log: (level, type, message, data) => emit(current, level, type, message, data),
       save: (patch) => {

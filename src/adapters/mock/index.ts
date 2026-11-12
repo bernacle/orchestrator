@@ -9,6 +9,7 @@ import type {
   PullRequestStatus,
   RepoInfo,
 } from "../types.js";
+import { ciLogTail } from "../github.js";
 
 /** In-memory Linear. Records every write so tests can assert on them. */
 export class MockTracker implements IssueTracker {
@@ -137,8 +138,8 @@ export class MockCodeHost implements CodeHost {
 
   /** Failed-step log text per check name (tests). */
   ciLogs: Record<string, string> = {};
-  async ciFailureLogs(_repo: string, failing: Array<{ name: string }>, maxChars: number): Promise<Array<{ name: string; excerpt: string }>> {
-    return failing.filter((f) => this.ciLogs[f.name]).map((f) => ({ name: f.name, excerpt: this.ciLogs[f.name]!.slice(-maxChars) }));
+  async ciFailureLogs(_repo: string, failing: Array<{ name: string }>, maxChars: number, redact: (text: string) => string): Promise<Array<{ name: string; excerpt: string }>> {
+    return failing.filter((f) => this.ciLogs[f.name]).map((f) => ({ name: f.name, excerpt: ciLogTail(this.ciLogs[f.name]!, maxChars, redact) }));
   }
 
   /** Commits in head not in base (tests point it at the origin repository). */

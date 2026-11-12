@@ -99,7 +99,7 @@ pull_request:
   mark_ready_when_delivered: false    # opt in: mark the draft ready once CI, checks and the review pass (never merges)
 push:                                 # optional: the identity the orchestrator's own git push uses
   url: git@github-personal:bernacle/analyticool.git   # e.g. an SSH host alias whose key can push (must name this repo)
-  # ssh_identity_file: ~/.ssh/id_personal             # or a specific key (IdentitiesOnly)
+  # ssh_identity_file: ~/.ssh/id_personal             # or a specific key inside ~/.ssh (IdentitiesOnly)
 merge:
   mode: manual
   require_ci: true
