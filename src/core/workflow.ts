@@ -492,13 +492,13 @@ async function agentEffect(ctx: Ctx, opts: { key: string; description: string; r
 
 /**
  * An agent call's timeout, capped at exactly what is left of the run's time window, so a retry (or
- * any late call) cannot run past limits.max_run_minutes. (enforceLimits has already blocked a call
- * when the window is spent; the 1 s floor only keeps the timeout positive.)
+ * any late call) cannot run past limits.max_run_minutes. A spent window blocks the call instead.
  */
-function agentTimeoutMs(ctx: Ctx, configuredMinutes: number): number {
+export function agentTimeoutMs(ctx: Pick<Ctx, "run" | "config" | "now">, configuredMinutes: number): number {
   const started = Date.parse(ctx.run.context.limitWindowStartedAt ?? ctx.run.createdAt);
   const left = ctx.config.limits.max_run_minutes * 60_000 - (ctx.now().getTime() - started);
-  return Math.max(1_000, Math.min(configuredMinutes * 60_000, left));
+  if (left <= 0) throw new BlockedError(`run time limit reached before an agent call: ${ctx.config.limits.max_run_minutes} minutes (limits.max_run_minutes)`);
+  return Math.min(configuredMinutes * 60_000, left);
 }
 
 /**

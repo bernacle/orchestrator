@@ -8,7 +8,7 @@ import { reconcileRunById, resumeRun, startRun } from "../../src/app.js";
 import { RepoConfigSchema } from "../../src/config/schema.js";
 import { Redactor } from "../../src/core/redact.js";
 import { trustScope } from "../../src/core/trust.js";
-import type { RunContext } from "../../src/core/workflow.js";
+import { agentTimeoutMs, type RunContext } from "../../src/core/workflow.js";
 import { buildDeliveryReport, renderDeliveryMarkdown } from "../../src/report/delivery.js";
 import { approve, createHarness, git, writeFeature, type Harness } from "../helpers.js";
 
@@ -139,6 +139,18 @@ describe("agent failures", () => {
     expect(t).toBeLessThanOrEqual(20 * 60_000);
     expect(t).toBeGreaterThan(19 * 60_000);
     expect(h.reviewer.calls[0]!.timeoutMs).toBeLessThanOrEqual(20 * 60_000);
+  });
+
+  it("agentTimeoutMs never exceeds the window, and blocks at or past its end", () => {
+    const at = (leftMs: number) => {
+      const start = 1_000_000_000_000;
+      const ctx = { run: { createdAt: new Date(start).toISOString(), context: {} }, config: { limits: { max_run_minutes: 10 } }, now: () => new Date(start + 10 * 60_000 - leftMs) };
+      return agentTimeoutMs(ctx as unknown as Parameters<typeof agentTimeoutMs>[0], 45);
+    };
+    expect(at(500)).toBe(500);
+    expect(at(5 * 60_000)).toBe(5 * 60_000);
+    expect(() => at(0)).toThrow(/run time limit reached/);
+    expect(() => at(-1)).toThrow(/run time limit reached/);
   });
 
   it("never retries around a spent budget", async () => {
