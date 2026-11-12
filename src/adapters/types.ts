@@ -166,8 +166,11 @@ export interface Workspace {
   changedFiles(worktreePath: string, baseSha: string): Promise<ChangedFile[]>;
   hasUncommittedChanges(worktreePath: string): Promise<boolean>;
   diff(worktreePath: string, baseSha: string): Promise<string>;
-  /** Uncommitted work: the diff of tracked files against HEAD plus the text of untracked, not ignored files (regular files up to 2 MB). */
-  uncommittedDiff(worktreePath: string): Promise<string>;
+  /**
+   * Uncommitted work: the diff of tracked files against HEAD plus the text of untracked, not ignored
+   * files. Files it could not read (too large, not a regular file) are listed in `uninspected`.
+   */
+  uncommittedDiff(worktreePath: string): Promise<{ text: string; uninspected: string[] }>;
   /** Stage everything and commit. Returns null when there is nothing to commit. */
   commitAll(worktreePath: string, message: string): Promise<string | null>;
   /** Worktree-relative paths with uncommitted changes, untracked files included (ignored files excluded). */

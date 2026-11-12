@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { describeNode, resolveRunToolchain, toolchainReadPaths, type NodeVersionFile, type ResolvedToolchain } from "../adapters/checks.js";
@@ -491,13 +491,14 @@ async function agentEffect(ctx: Ctx, opts: { key: string; description: string; r
 }
 
 /**
- * An agent call's timeout, capped at what is left of the run's time window (at least a minute), so a
- * retry (or any late call) cannot run past limits.max_run_minutes.
+ * An agent call's timeout, capped at exactly what is left of the run's time window, so a retry (or
+ * any late call) cannot run past limits.max_run_minutes. (enforceLimits has already blocked a call
+ * when the window is spent; the 1 s floor only keeps the timeout positive.)
  */
 function agentTimeoutMs(ctx: Ctx, configuredMinutes: number): number {
   const started = Date.parse(ctx.run.context.limitWindowStartedAt ?? ctx.run.createdAt);
   const left = ctx.config.limits.max_run_minutes * 60_000 - (ctx.now().getTime() - started);
-  return Math.max(60_000, Math.min(configuredMinutes * 60_000, left));
+  return Math.max(1_000, Math.min(configuredMinutes * 60_000, left));
 }
 
 /**
@@ -512,8 +513,13 @@ async function assertSafeBeforeRetry(ctx: Ctx, worktree: string, baseSha: string
   const touched = [...committed, ...pending.map((path) => ({ status: existsInWorktree(worktree, path) ? "M" : "D", path }))];
   const bad = forbiddenFiles(touched, config.forbidden_paths);
   if (bad.length) throw new ForbiddenPathError(`implementer round ${attempt} stopped after touching forbidden paths (${[...new Set(bad)].join(", ")}); not retried. The worktree is left as it is for inspection`);
-  const left = `${await adapters.workspace.diff(worktree, baseSha)}\n${await adapters.workspace.uncommittedDiff(worktree)}`;
+  const pendingDiff = await adapters.workspace.uncommittedDiff(worktree);
+  const left = `${await adapters.workspace.diff(worktree, baseSha)}\n${pendingDiff.text}`;
   assertNoSecrets(ctx, left, `the work implementer round ${attempt} left before it stopped (not retried)`);
+  // What could not be read is not assumed clean: no retry that could erase it.
+  if (pendingDiff.uninspected.length) {
+    throw new BlockedError(`implementer round ${attempt} stopped and left files the secret scan cannot read (${pendingDiff.uninspected.slice(0, 5).join(", ")}); not retried. Inspect the worktree before resuming`);
+  }
 }
 
 function existsInWorktree(worktree: string, path: string): boolean {
@@ -1113,9 +1119,11 @@ const implementing: Handler<RunContext> = async (ctx) => {
   const branch = require(c.branch, "branch");
 
   if (!config.local_path) await adapters.workspace.ensureClone(config.repo, clonePath, { fetch: true });
-  // The first creation makes a new branch: planning chose a free name, and a branch that appeared
-  // since (another process) is never attached to. Only a re-entered run reattaches its own branch.
-  const newBranch = ctx.effectStatus("git.worktree") === null;
+  // The run owns its branch only once its worktree exists on it (a completed git.worktree effect is
+  // reused and never runs again). Until then, every attempt, including one after a failed or
+  // interrupted creation and an approved resume, must create the branch (`worktree add -b` refuses an
+  // existing one atomically): a branch something else made is never attached to.
+  const newBranch = !existsSync(join(worktree, ".git"));
   if (newBranch && (await adapters.workspace.branchExists(clonePath, branch)).local) {
     throw new BlockedError(`branch ${branch} was created by something else after planning; this run will not attach to it (the branch is left untouched). Cancel this run and start a new one`);
   }

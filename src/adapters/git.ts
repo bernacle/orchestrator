@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -15,6 +15,9 @@ import type { ChangedFile, PushOptions, RepoInspection, Workspace } from "./type
 export const SAFE_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "protocol.ext.allow=never"];
 
 const GUIDANCE_FILES = ["AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "README.md", ".github/pull_request_template.md", "docs/ARCHITECTURE.md"];
+
+/** Untracked files larger than this are not read by the pre-retry secret scan; they block the retry instead. */
+const UNCOMMITTED_SCAN_MAX_BYTES = 32 * 1024 * 1024;
 
 export class GitWorkspace implements Workspace {
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
@@ -174,22 +177,30 @@ export class GitWorkspace implements Workspace {
     return this.headSha(worktreePath);
   }
 
-  async uncommittedDiff(worktreePath: string): Promise<string> {
+  async uncommittedDiff(worktreePath: string): Promise<{ text: string; uninspected: string[] }> {
     const tracked = await this.git(worktreePath, ["diff", "--no-ext-diff", "--no-textconv", "HEAD"]);
     const untracked = (await this.git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean);
     const root = realpathSync(resolve(worktreePath));
     const parts = [tracked];
+    const uninspected: string[] = [];
     for (const path of untracked) {
+      const full = resolve(root, path);
+      let st;
       try {
-        const full = resolve(root, path);
-        const st = lstatSync(full);
-        if (!full.startsWith(root + sep) || !st.isFile() || st.size > 2 * 1024 * 1024) continue;
-        parts.push(`+++ ${path} (untracked)\n${readFileSync(full, "utf8")}`);
+        st = lstatSync(full);
       } catch {
-        /* vanished meanwhile */
+        continue; // vanished meanwhile
+      }
+      if (!full.startsWith(root + sep)) uninspected.push(path);
+      else if (st.isSymbolicLink()) parts.push(`+++ ${path} (untracked symlink)\n${readlinkSync(full)}`);
+      else if (!st.isFile() || st.size > UNCOMMITTED_SCAN_MAX_BYTES) uninspected.push(path);
+      else {
+        const data = readFileSync(full);
+        // Binary content is skipped, as git diff does for commits; text is scanned in full.
+        if (!data.subarray(0, 8000).includes(0)) parts.push(`+++ ${path} (untracked)\n${data.toString("utf8")}`);
       }
     }
-    return parts.join("\n");
+    return { text: parts.join("\n"), uninspected };
   }
 
   async uncommittedPaths(worktreePath: string): Promise<string[]> {

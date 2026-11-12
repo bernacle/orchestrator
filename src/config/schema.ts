@@ -193,8 +193,10 @@ export const RepoConfigSchema = z
         /** Push URL for this repository, e.g. git@github-personal:owner/name.git. Must name this repository. */
         url: z.string().min(1).optional(),
         /**
-         * SSH private key for pushes, used with IdentitiesOnly. Must live in ~/.ssh, which every
-         * sandbox (agents, setup, checks) is denied, so repository code can never read it.
+         * SSH private key for pushes, used with IdentitiesOnly. Must live in ~/.ssh, which the
+         * sandboxes that run repository code (setup, checks, screenshots) and the Claude Code
+         * implementer are denied. The Codex reviewer's read-only sandbox does not deny reads (see
+         * docs/isolation.md); that is the same exposure as every other key in ~/.ssh.
          */
         ssh_identity_file: z
           .string()

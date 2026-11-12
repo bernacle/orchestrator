@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { GitWorkspace } from "../../src/adapters/git.js";
@@ -114,6 +114,19 @@ describe("agent failures", () => {
     const run = await start();
     expect(run.state).toBe("FAILED");
     expect(run.reason).toMatch(/possible secret in config\.txt|possible secret in the work implementer round 0 left/);
+    expect(h.implementer.calls).toHaveLength(1);
+  });
+
+  it("does not retry when a file left behind is too large for the secret scan", async () => {
+    h = createHarness({
+      implement: (task) => {
+        writeFileSync(join(task.cwd, "dump.txt"), "a".repeat(33 * 1024 * 1024));
+        return { ok: false, error: "claude exited 1: socket hang up" };
+      },
+    });
+    const run = await start();
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/secret scan cannot read \(dump\.txt\); not retried/);
     expect(h.implementer.calls).toHaveLength(1);
   });
 
@@ -258,6 +271,33 @@ describe("branch collisions", () => {
     expect(run.state).toBe("BLOCKED");
     expect(run.reason).toMatch(/created by something else after planning; this run will not attach to it/);
     expect(h.implementer.calls).toHaveLength(0);
+  });
+
+  it("a branch created during the worktree step is never attached to, not even after a resume", async () => {
+    h = createHarness();
+    let made = false;
+    let run = await startRun(h.app, {
+      issueKey: "ACM-1",
+      repo: "acme/widget",
+      configFile: h.configFile,
+      dryRun: false,
+      ciWaitMinutes: 0,
+      onEvent: (e) => {
+        if (!made && e.type === "effect.started" && e.message.startsWith("create worktree")) {
+          made = true;
+          git(h.clone, "branch", BRANCH, "HEAD");
+        }
+      },
+    });
+    expect(made).toBe(true);
+    expect(run.state).toBe("BLOCKED");
+    const theirs = git(h.clone, "rev-parse", BRANCH);
+    run = await resumeRun(h.app, run.id, { ciWaitMinutes: 0 });
+    expect(run.state).toBe("BLOCKED");
+    expect(run.reason).toMatch(/will not attach to it/);
+    expect(h.implementer.calls).toHaveLength(0);
+    expect(git(h.clone, "rev-parse", BRANCH)).toBe(theirs);
+    expect(existsSync(join(run.context.worktreePath!, ".git"))).toBe(false);
   });
 
   it("keeps the template branch when nothing uses it", async () => {
