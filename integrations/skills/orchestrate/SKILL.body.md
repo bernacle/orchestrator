@@ -62,7 +62,7 @@ Handle `data.problems` before anything else:
 
   **After it exits**, act on `delivery.outcome` in its JSON:
   - `delivered`: report the delivery (§4). Say the merge is the user's decision, and that the run completes on its own after they merge. Then run `orchestrator watch <run-id> --json` in the background. It is read-only and needs no approval. It exits when the PR is merged or closed, or after about 110 minutes. When it exits merged, give a one-line confirmation that the run completed. When it times out, say nothing more: the next `status`, `context` or `report` records the merge automatically.
-  - `blocked` or `failed`: report the block or failure verbatim (§4) and stop.
+  - `blocked` or `failed`: report the block or failure verbatim (§4) and stop. The engine has already retried what it safely could (`recovery` in the report), so don't retry it yourself. For a push-access block, the fix is the operator's: `push.url` or `push.ssh_identity_file` in the repository config, or `gh auth switch`. Tell the user, and never change git config or credentials yourself.
   - `waiting_for_ci`: in a trusted repository, resume it once to keep following CI (see resume). Otherwise report it.
   - `not_deliverable`: report every reason verbatim. It is not a delivery.
 

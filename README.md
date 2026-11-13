@@ -97,6 +97,9 @@ review:
 pull_request:
   draft: true
   mark_ready_when_delivered: false    # opt in: mark the draft ready once CI, checks and the review pass (never merges)
+push:                                 # optional: the identity the orchestrator's own git push uses
+  url: git@github-personal:bernacle/analyticool.git   # e.g. an SSH host alias whose key can push (must name this repo)
+  # ssh_identity_file: ~/.ssh/id_personal             # or a specific key inside ~/.ssh (IdentitiesOnly)
 merge:
   mode: manual
   require_ci: true
@@ -153,6 +156,8 @@ QUEUED → PLANNING → IMPLEMENTING → TESTING → REVIEWING → PR_OPEN → W
    - inspect the repository at `origin/<base>` (scripts, CI workflow, guidance files, branch protection)
    - resolve the toolchain
    - check agent invariants, and verify isolation (it fails closed)
+   - choose the branch: the template's name, or a run-scoped one (`…-<run suffix>`) when that branch already exists locally, on origin, as a PR, or for another run. Existing branches, worktrees and PRs are never touched
+   - verify publishing before any agent works: `git push --dry-run` with the configured push identity (nothing is written) and the GitHub account's write access. If either fails, the run stops here with the fix
    - optionally run the read-only planner
 2. **IMPLEMENTING** creates a worktree on `orch/<key>-<slug>`, runs setup (sandboxed), and runs the **baseline** checks on the untouched base: a red base blocks the run. The implementer then works in its sandbox. Afterwards the orchestrator checks the tripwires, computes the diff itself, commits it with hooks disabled, and scans the diff for secrets.
 3. **TESTING** runs every configured check, recording exit codes and logs. When they pass and `screenshots` applies, it generates, validates and commits the screenshots.
@@ -167,6 +172,11 @@ QUEUED → PLANNING → IMPLEMENTING → TESTING → REVIEWING → PR_OPEN → W
    - closed without merging → CANCELLED.
 
    It never pushes, merges or runs a step, so it needs no resume and no approval. `status`, `context`, `report` and `orchestrator watch <run>` (a bounded foreground loop, no daemon) all run it.
+
+**Bounded recovery.** The engine handles the interruptions BRU-485 needed a person for. Each recovery is recorded in the timeline and the delivery report, and stays within the run's cost and time limits.
+- **Agent failures:** a crashed or hung implementer round is retried once, in the same session. A reviewer that crashed, or whose output didn't match the schema, is retried once, and told what was wrong. A spent budget is never retried, and neither is a safety stop: tripwires, secret-scan hits, forbidden paths, or a reviewer that changed code.
+- **CI failures:** the implementer gets the end of the failed GitHub Actions steps' logs, redacted, labelled untrusted and capped at 12k characters, within the usual correction budget. Required checks are never skipped or weakened.
+- **Branch collisions** and **push identity** are handled in planning, as described above.
 
 **Delivery report and notifications.**
 - Whenever a run settles (delivered, blocked, failed, completed), `runs/<id>/delivery.md` and `delivery.json` are rewritten from durable state. They cover:

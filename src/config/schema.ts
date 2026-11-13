@@ -182,6 +182,29 @@ export const RepoConfigSchema = z
         minor_fix_rounds: z.number().int().min(0).max(1).default(1),
       })
       .prefault({}),
+    /**
+     * How the orchestrator's own `git push` authenticates (it runs outside the sandbox, with your
+     * credentials). Applied per command only (the URL is the push destination, the key goes in `GIT_SSH_COMMAND`);
+     * no git config file is written. Use it when the default identity cannot push to this repository,
+     * e.g. an SSH host alias whose key belongs to the right account.
+     */
+    push: z
+      .object({
+        /** Push URL for this repository, e.g. git@github-personal:owner/name.git. Must name this repository. */
+        url: z.string().min(1).optional(),
+        /**
+         * SSH private key for pushes, used with IdentitiesOnly. Must live in ~/.ssh, which the
+         * sandboxes that run repository code (setup, checks, screenshots) and the Claude Code
+         * implementer are denied. The Codex reviewer's read-only sandbox does not deny reads (see
+         * docs/isolation.md); that is the same exposure as every other key in ~/.ssh.
+         */
+        ssh_identity_file: z
+          .string()
+          .regex(/^~\/\.ssh\/[A-Za-z0-9._@+-]+(\/[A-Za-z0-9._@+-]+)*$/, "push.ssh_identity_file must be a key inside ~/.ssh (e.g. ~/.ssh/id_personal), without spaces or shell characters")
+          .refine((p) => !p.split("/").includes(".."), "push.ssh_identity_file must not contain ..")
+          .optional(),
+      })
+      .prefault({}),
     pull_request: z
       .object({
         draft: z.boolean().default(true),
@@ -247,6 +270,17 @@ export const RepoConfigSchema = z
     }
     if ((c.permissions.linear.comment || c.permissions.linear.update_state) && !c.linear.workspace) {
       ctx.addIssue({ code: "custom", message: "Linear writes require linear.workspace (the workspace urlKey the API key must belong to)", path: ["linear", "workspace"] });
+    }
+    if (c.push.url) {
+      const u = c.push.url.toLowerCase().replace(/\.git$/, "");
+      if (!u.endsWith(`/${c.repo.toLowerCase()}`) && !u.endsWith(`:${c.repo.toLowerCase()}`)) {
+        ctx.addIssue({ code: "custom", message: `push.url (${c.push.url}) must point at ${c.repo}`, path: ["push", "url"] });
+      }
+      if (/[\s'"`$;\\]/.test(c.push.url) || c.push.url.startsWith("-")) ctx.addIssue({ code: "custom", message: "push.url contains characters that are not allowed", path: ["push", "url"] });
+      // Ordinary transports only (no ext::, fd:: or other helpers): https://, ssh://, scp-like user@host:path, or a local path.
+      if (!/^(https:\/\/|ssh:\/\/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:(?!\/\/)|\/)/.test(c.push.url)) {
+        ctx.addIssue({ code: "custom", message: "push.url must be an https://, ssh:// or user@host: URL (or a local path)", path: ["push", "url"] });
+      }
     }
     if (c.merge.mode === "auto" && !c.permissions.github.merge) {
       ctx.addIssue({ code: "custom", message: "merge.mode=auto requires permissions.github.merge=true", path: ["permissions"] });

@@ -63,6 +63,8 @@ export interface TrustScope {
   isolation: RepoConfig["isolation"];
   review: RepoConfig["review"];
   pullRequest: { draft: boolean; markReadyWhenDelivered?: boolean };
+  /** Present only when the config sets a push identity (absent: the scope hashes as before). */
+  push?: { url: string | null; sshIdentityFile: string | null };
   forbiddenPaths: string[];
   baselineChecks: boolean;
   /** Network a setup/check command asks for beyond its default (commands themselves run sandboxed). */
@@ -86,6 +88,7 @@ export function trustScope(loaded: LoadedRepoConfig): { scope: TrustScope; hash:
     isolation: c.isolation,
     review: c.review,
     pullRequest: { draft: c.pull_request.draft, markReadyWhenDelivered: c.pull_request.mark_ready_when_delivered },
+    ...(c.push.url || c.push.ssh_identity_file ? { push: { url: c.push.url ?? null, sshIdentityFile: c.push.ssh_identity_file ?? null } } : {}),
     forbiddenPaths: [...c.forbidden_paths],
     baselineChecks: c.baseline_checks,
     commandNetwork: [
@@ -142,6 +145,7 @@ export function describeTrust(scope: TrustScope, opts: { renewing?: boolean } = 
     `Limits:      $${scope.limits.max_run_cost_usd} and ${scope.limits.max_run_minutes} min per run (a trusted resume keeps the run's window), ${scope.merge.max_fix_attempts} fix rounds`,
     `Isolation:   sandbox required ${scope.isolation.require}, setup network ${scope.isolation.setup_network}, checks network ${scope.isolation.checks_network}${scope.isolation.read_paths.length ? `, extra read paths ${scope.isolation.read_paths.join(", ")}` : ""}`,
     `Review:      distinct provider ${scope.review.require_distinct_provider}, blocking ${scope.review.blocking_severities.join("/")}, minor-finding rounds ${scope.review.minor_fix_rounds ?? 0}`,
+    ...(scope.push ? [`Push as:     ${scope.push.url ?? "origin"}${scope.push.sshIdentityFile ? ` with key ${scope.push.sshIdentityFile}` : ""}`] : []),
     `PR:          draft ${scope.pullRequest.draft}, marked ready when delivered ${scope.pullRequest.markReadyWhenDelivered ?? false}; descriptions of its own PRs kept in sync`,
     `Ends:        on \`orchestrator repo untrust ${scope.repo}\`, or when any of the above changes in the config (runs then ask again)`,
   ];

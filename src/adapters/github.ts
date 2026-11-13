@@ -187,6 +187,25 @@ export class GitHubHost implements CodeHost {
     }
   }
 
+  async ciFailureLogs(repo: string, failing: Array<{ name: string; detailsUrl?: string }>, maxChars: number, redact: (text: string) => string): Promise<Array<{ name: string; excerpt: string }>> {
+    const out: Array<{ name: string; excerpt: string }> = [];
+    let left = maxChars;
+    for (const check of failing) {
+      const job = check.detailsUrl?.match(/\/actions\/runs\/\d+\/job\/(\d+)/)?.[1];
+      if (!job || left < 200) continue;
+      try {
+        const log = await this.gh(["run", "view", "--repo", repo, "--job", job, "--log-failed"]);
+        const excerpt = ciLogTail(log, Math.min(left, Math.ceil(maxChars / Math.max(1, failing.length))), redact);
+        if (!excerpt) continue;
+        out.push({ name: check.name, excerpt });
+        left -= excerpt.length;
+      } catch {
+        /* logs expired, not an Actions job, or no access: the check name alone goes to the implementer */
+      }
+    }
+    return out;
+  }
+
   async compareCommits(repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>> {
     if (![base, head].every((s) => /^[0-9a-f]{7,64}$/.test(s))) throw new Error("compareCommits takes commit ids only");
     const data = await this.json<{ commits?: Array<{ sha: string; commit: { message: string } }> }>(["api", `repos/${repo}/compare/${base}...${head}`]);
@@ -201,6 +220,35 @@ export class GitHubHost implements CodeHost {
     if (!/^[0-9a-f]{40}$/.test(input.headSha)) throw new Error("refusing to merge without a full head SHA");
     await this.gh(["pr", "merge", String(input.number), "--repo", input.repo, `--${input.method}`, "--match-head-commit", input.headSha]);
   }
+}
+
+/**
+ * The end of a `gh run view --log-failed` dump: lines are "job\tstep\ttimestamp message"; keep the
+ * message, drop ANSI codes, and keep the last lines that fit (the error is almost always at the end).
+ * The whole cleaned log is redacted before anything is cut: a cut through a PEM block or a long
+ * token would otherwise leave a fragment the redactor no longer recognises.
+ */
+export function ciLogTail(log: string, maxChars: number, redact: (text: string) => string = (t) => t): string {
+  const cleaned = log
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .map((l) => {
+      const parts = l.split("\t");
+      return (parts.length >= 3 ? parts.slice(2).join("\t") : l).replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, "").trimEnd();
+    })
+    .join("\n");
+  const lines = redact(cleaned)
+    .split("\n")
+    .filter((l) => l.trim());
+  const kept: string[] = [];
+  let size = 0;
+  for (const line of lines.reverse()) {
+    const clipped = line.length > 400 ? `${line.slice(0, 400)}…` : line;
+    if (size + clipped.length + 1 > maxChars || kept.length >= 120) break;
+    kept.unshift(clipped);
+    size += clipped.length + 1;
+  }
+  return kept.join("\n");
 }
 
 export function prNumbersFromUrls(repo: string, urls: string[]): number[] {

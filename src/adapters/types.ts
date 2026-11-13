@@ -108,6 +108,13 @@ export interface CodeHost {
   updatePullRequestBody(input: { repo: string; number: number; body: string }): Promise<void>;
   /** Mark a draft PR ready for review. Never merges. */
   markPullRequestReady(input: { repo: string; number: number }): Promise<void>;
+  /**
+   * Read-only: the tail of the failed steps' logs of failing CI checks (GitHub Actions jobs), at most
+   * `maxChars` in total. `redact` is applied to each whole log before it is cut, so a cut can never
+   * split a secret into a fragment the redactor no longer recognises. Checks without logs are left
+   * out. Never throws for a single check.
+   */
+  ciFailureLogs(repo: string, failing: Array<{ name: string; detailsUrl?: string }>, maxChars: number, redact: (text: string) => string): Promise<Array<{ name: string; excerpt: string }>>;
   /** Read-only: the commits in `head` that `base` does not have, oldest first. */
   compareCommits(repo: string, base: string, head: string): Promise<Array<{ sha: string; message: string }>>;
   /** Must pin the head SHA; implementations must never use admin overrides. */
@@ -140,17 +147,30 @@ export interface RepoInspection {
   nodeVersionFile: { file: string; content: string } | null;
 }
 
+/** Operator-owned push identity (config `push`), applied per command, never written to git config. */
+export interface PushOptions {
+  url?: string | null;
+  sshIdentityFile?: string | null;
+}
+
 export interface Workspace {
   /** Ensure a clone exists and is fetched (orchestrator-owned clones only). */
   ensureClone(repo: string, clonePath: string, opts: { fetch: boolean }): Promise<void>;
   inspect(repoPath: string, ref?: string): Promise<RepoInspection>;
-  branchExists(repoPath: string, branch: string): Promise<{ local: boolean; remote: boolean }>;
+  /** `fresh`: ask origin (git ls-remote) instead of trusting the clone's possibly stale tracking refs. */
+  branchExists(repoPath: string, branch: string, opts?: { fresh?: boolean }): Promise<{ local: boolean; remote: boolean }>;
   /** Idempotent: reuses an existing worktree for the same branch. */
-  createWorktree(input: { repoPath: string; worktreePath: string; branch: string; baseRef: string }): Promise<{ created: boolean; headSha: string }>;
+  /** `newBranch`: the branch must not exist yet (git refuses atomically); otherwise an existing one is reattached. */
+  createWorktree(input: { repoPath: string; worktreePath: string; branch: string; baseRef: string; newBranch?: boolean }): Promise<{ created: boolean; headSha: string }>;
   headSha(worktreePath: string): Promise<string>;
   changedFiles(worktreePath: string, baseSha: string): Promise<ChangedFile[]>;
   hasUncommittedChanges(worktreePath: string): Promise<boolean>;
   diff(worktreePath: string, baseSha: string): Promise<string>;
+  /**
+   * Uncommitted work: the diff of tracked files against HEAD plus the text of untracked, not ignored
+   * files. Files it could not read (too large, not a regular file) are listed in `uninspected`.
+   */
+  uncommittedDiff(worktreePath: string): Promise<{ text: string; uninspected: string[] }>;
   /** Stage everything and commit. Returns null when there is nothing to commit. */
   commitAll(worktreePath: string, message: string): Promise<string | null>;
   /** Worktree-relative paths with uncommitted changes, untracked files included (ignored files excluded). */
@@ -162,7 +182,12 @@ export interface Workspace {
    * were validated in memory cannot be swapped before they are committed. Null when HEAD already has them.
    */
   commitBlobs(worktreePath: string, files: Array<{ path: string; data: Buffer }>, message: string): Promise<string | null>;
-  push(worktreePath: string, branch: string): Promise<void>;
+  push(worktreePath: string, branch: string, opts?: PushOptions): Promise<void>;
+  /**
+   * Can this identity push to origin? `git push --dry-run` of `sha` to a branch: it authenticates
+   * against the remote (GitHub checks write access) and writes nothing.
+   */
+  probePush(repoPath: string, sha: string, branch: string, opts?: PushOptions): Promise<{ ok: boolean; detail: string }>;
   /**
    * Put the worktree back at `sha`, which must be an ancestor of HEAD (a local commit the branch
    * already contains): reset tracked files and remove untracked ones (ignored files stay).

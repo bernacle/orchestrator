@@ -237,6 +237,13 @@ export class Store {
     return rows.map((r) => toRecord(r));
   }
 
+  /** Runs of this repository whose context names `branch` (read-only; for branch-collision checks). */
+  runsOnBranch(repo: string, branch: string): Array<{ id: string; state: RunState; mode: RunMode }> {
+    return this.db
+      .prepare("SELECT id, state, mode FROM runs WHERE repo = ? AND json_extract(context, '$.branch') = ?")
+      .all(repo, branch) as unknown as Array<{ id: string; state: RunState; mode: RunMode }>;
+  }
+
   /** Active (non-terminal) runs for the same issue and repo, to prevent duplicate work. */
   activeRunsFor(issueKey: string, repo: string): RunRecord[] {
     const rows = this.db
