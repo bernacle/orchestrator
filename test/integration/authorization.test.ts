@@ -154,7 +154,10 @@ describe("resuming live runs", () => {
     const after = h.app.store.getRun<RunContext>(run.id)!;
     expect([after.state, after.version]).toEqual([run.state, run.version]);
     h.answer = true;
-    expect((await resumeRun(h.app, run.id, { ciWaitMinutes: 0 })).state).toBe("WAITING_FOR_CI");
+    const continued = await resumeRun(h.app, run.id, { ciWaitMinutes: 0 });
+    expect(continued.state).toBe("WAITING_FOR_CI");
+    expect(continued.context.limitWindowStartedAt).toBe(run.context.limitWindowStartedAt);
+    expect(h.approvals.at(-1)!.binding).toMatchObject({ safeguards: true, operation: { runId: run.id, version: run.version, state: "WAITING_FOR_CI", newTimeWindow: false, linearWorkspace: "mock-workspace", ciWaitMinutes: 0 } });
     expect(h.approvals.map((a) => a.purpose)).toEqual(["live_run", "resume_live_run", "resume_live_run"]);
   });
 

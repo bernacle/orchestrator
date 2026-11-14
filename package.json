@@ -30,6 +30,7 @@
     "eval:skills": "tsx scripts/eval-skill-activation.ts"
   },
   "dependencies": {
+    "@simplewebauthn/server": "14.1.0",
     "commander": "^14.0.3",
     "yaml": "^2.9.1",
     "zod": "^4.6.7"

@@ -62,7 +62,7 @@ Any change **fails** the run (it never auto-resumes), with the changed paths lis
 
 **6. Limits.**
 - Per call: Claude `--max-budget-usd`, capped at what is left of the run budget, plus per-agent timeouts.
-- Per run: `limits.max_run_cost_usd` and `limits.max_run_minutes` (an operator resume grants a new time window, never more money), and `merge.max_fix_attempts`.
+- Per run: `limits.max_run_cost_usd` and `limits.max_run_minutes` (only an explicit resume --require-approval grants a new time window, never more money), and `merge.max_fix_attempts`.
 
 **7. Fail closed.** With `isolation.require: true` (the default), PLANNING blocks a live run in any of these cases:
 - the check sandbox is unavailable (anything other than macOS today)

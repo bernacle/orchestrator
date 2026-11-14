@@ -29,7 +29,7 @@ import { runProcess } from "./exec.js";
  * that *Orchestrator* never becomes the vehicle for unapproved live work. See docs/skills.md.
  */
 
-export type ApprovalPurpose = "live_run" | "resume_live_run" | "authorize_repository" | "confirm_association" | "trust_repository";
+export type ApprovalPurpose = "live_run" | "resume_live_run" | "authorize_repository" | "confirm_association" | "trust_repository" | "enroll_remote_approval";
 
 export interface ApprovalRequest {
   purpose: ApprovalPurpose;
@@ -40,6 +40,11 @@ export interface ApprovalRequest {
   issue: string | null;
   repo: string;
   scopeHash: string;
+  /** Engine-built, immutable operation data. Required by the remote channel, never an agent answer. */
+  binding?: Record<string, unknown>;
+  /** Revalidate mutable context before accepting remote consent. Not serialized into the challenge. */
+  validate?: () => void;
+  signal?: AbortSignal;
 }
 
 export interface ApprovalResult {
@@ -73,6 +78,8 @@ export interface RunScope {
   agents: Record<string, string>;
   limits: RepoConfig["limits"];
   isolationRequired: boolean;
+  /** Complete normalized config, including checks/network/read paths omitted by the legacy scope. */
+  configHash: string;
   acceptedDependencies: string[];
 }
 
@@ -95,6 +102,7 @@ export function runScope(input: { issue: string; config: RepoConfig; configSourc
     agents: Object.fromEntries(Object.entries(c.agents).filter(([, v]) => v).map(([k, v]) => [k, agentLabel(v!)])),
     limits: c.limits,
     isolationRequired: c.isolation.require,
+    configHash: createHash("sha256").update(canonical(c)).digest("hex"),
     acceptedDependencies: [...new Set((input.acceptedDependencies ?? []).map((k) => k.toUpperCase()))].sort(),
   };
   return { scope, hash: sha256(canonical(scope)) };

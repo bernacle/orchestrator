@@ -9,7 +9,7 @@ import { z } from "zod";
 const duration = z.number().int().positive();
 
 export const CheckSchema = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).refine((s) => !/[\/\\\x00-\x1f\x7f]/.test(s) && s !== "." && s !== "..", "check name must not contain path separators or control characters"),
   run: z.string().min(1),
   timeout_minutes: duration.default(15),
   /** A failing optional check is reported but does not block review. */
@@ -262,6 +262,13 @@ export const RepoConfigSchema = z
       .optional(),
   })
   .superRefine((c, ctx) => {
+    for (const kind of ["setup", "checks"] as const) {
+      const names = new Set<string>();
+      for (const [index, check] of c[kind].entries()) {
+        if (names.has(check.name) || (kind === "checks" && c.screenshots && check.name === "screenshots")) ctx.addIssue({ code: "custom", message: "check names must be unique and must not shadow generated screenshots", path: [kind, index, "name"] });
+        names.add(check.name);
+      }
+    }
     if (c.merge.auto_authorization && c.merge.auto_authorization.repo !== c.repo) {
       ctx.addIssue({ code: "custom", message: `merge.auto_authorization.repo (${c.merge.auto_authorization.repo}) must equal repo (${c.repo})`, path: ["merge"] });
     }
