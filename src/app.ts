@@ -19,10 +19,11 @@ import { TERMINAL_STATES } from "./core/states.js";
 import { Store, type RunRecord } from "./core/store.js";
 import { HANDLERS, type RunContext } from "./core/workflow.js";
 import { parseIssueRef } from "./intake/issue-ref.js";
-import { approvalChannelStatus, auditApproval, describeScope, runScope, systemApprover, type ApprovalPurpose, type ApprovalResult, type Approver } from "./core/approval.js";
+import { auditApproval, canonical, describeScope, runScope, type ApprovalPurpose, type ApprovalRequest, type ApprovalResult, type Approver } from "./core/approval.js";
+import { configuredApprover, configuredApprovalStatus, REMOTE_CHANNEL, type ApprovalChannel } from "./core/remote-approval.js";
 import { saveAssociation, type SavedAssociation } from "./intake/association.js";
 import { prepareAuthorization, writeAuthorization } from "./intake/proposal.js";
-import { describeTrust, describeTrustState, systemTrustKeys, TRUST_CHANNEL, trustEligibility, trustScope, TrustStore, type TrustKeyStore, type TrustRecord, type TrustState } from "./core/trust.js";
+import { describeTrust, describeTrustState, scopeChanges, systemTrustKeys, TRUST_CHANNEL, trustEligibility, trustScope, TrustStore, type TrustKeyStore, type TrustRecord, type TrustState } from "./core/trust.js";
 
 export interface App {
   paths: Paths;
@@ -59,6 +60,7 @@ export function openApp(
     tracker?: (workspace: string | null) => IssueTracker;
     discovery?: DiscoveryDeps;
     approver?: Approver;
+    approvalChannel?: ApprovalChannel;
     trustKeys?: TrustKeyStore;
     notifier?: Notifier;
     now?: () => Date;
@@ -94,8 +96,8 @@ export function openApp(
       return { tracker: new LinearTracker(credential.key, undefined, credential.problem ?? undefined), credential };
     },
     discovery: opts.discovery ?? defaultDiscoveryDeps(env),
-    approver: opts.approver ?? systemApprover(),
-    ...(opts.approver ? {} : { approvalStatus: () => approvalChannelStatus() }),
+    approver: opts.approver ?? configuredApprover(paths.home, opts.approvalChannel),
+    ...(opts.approver ? {} : { approvalStatus: () => configuredApprovalStatus(paths.home, opts.approvalChannel) }),
     trust: new TrustStore(paths, opts.trustKeys ?? systemTrustKeys(paths)),
     notifier: opts.notifier ?? defaultNotifier(env, Boolean(opts.adapters)),
     close: () => store.close(),
@@ -207,6 +209,7 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
 
   // ---- live runs: repository permission, then a person's approval of this exact scope.
   let authorization: RunContext["authorization"] = null;
+  const runId = newRunId(issueKey);
   if (!opts.dryRun) {
     if (!loaded.config.permissions.agents.run) {
       throw new IntakeError("not_permitted", `${loaded.config.repo}'s configuration (${loaded.source}) does not grant live runs (permissions.agents.run is false); only dry runs are possible`);
@@ -226,13 +229,16 @@ export async function startRun(app: App, opts: StartOptions): Promise<RunRecord<
         acceptedDependencies: scope.acceptedDependencies,
         requireApproval: Boolean(opts.requireApproval),
         ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),
-        ask: (trustLine) => requireApproval(app, "live_run", { issue: issueKey, repo: loaded.config.repo, scopeHash: hash, reason: d.reason, details: [...d.details, trustLine] }),
+        ask: (trustLine) => requireApproval(app, "live_run", {
+          issue: issueKey, repo: loaded.config.repo, scopeHash: hash, reason: d.reason, details: [...d.details, trustLine], signal: opts.interrupt,
+          ...boundConfig(app, loaded, { runId, issue: issueKey, linearWorkspace: linearWorkspace ?? loaded.config.linear.workspace ?? null, acceptedDependencies: scope.acceptedDependencies, newTimeWindow: false, ciWaitMinutes: opts.ciWaitMinutes ?? null }),
+        }),
       })
     ).authorization;
   }
 
   const run = app.store.createRun<RunContext>({
-    id: newRunId(issueKey),
+    id: runId,
     issueKey,
     repo: loaded.config.repo,
     mode: opts.dryRun ? "dry_run" : "supervised",
@@ -307,6 +313,7 @@ export async function resumeRun(
   // What the operator is shown and approves. The engine leaves a block only if the run is still on
   // exactly this block when the drive starts; a run resumed while not BLOCKED gets no unblock at all.
   const approvedResume: ApprovedResume = { state: run.state, blockedFrom: run.blockedFrom, reason: run.reason };
+  const approvedVersion = run.version;
   if (run.mode === "supervised" && app.env.ORCHESTRATOR_NO_EXECUTE) throw new IntakeError("execution_disabled", "live runs are disabled in this environment (ORCHESTRATOR_NO_EXECUTE is set)");
   const source = run.context.configSource;
   const loaded = source && existsSync(source) ? loadRepoConfigFile(source) : loadRepoConfig(run.repo, app.paths);
@@ -344,10 +351,15 @@ export async function resumeRun(
           details: [
             `Run:         ${run.id} (${run.state}${run.reason ? `: ${run.reason}` : ""})`,
             run.state === "BLOCKED" ? "Approves:    leaving this block once; any later block stops the run again" : "Approves:    continuing from this state; any block reached stops the run (no unblock)",
-            "Grants:      a new time window of limits.max_run_minutes (the cost cap is never reset)",
+            opts.requireApproval ? "Grants:      a new time window of limits.max_run_minutes (the cost cap is never reset)" : "Limits:      keeps the existing time window and cumulative cost cap",
             ...d.details,
             trustLine,
           ],
+          signal: opts.interrupt,
+          ...boundConfig(app, loaded, { runId: run.id, version: approvedVersion, ...approvedResume, linearWorkspace: run.context.options.intake?.linearWorkspace ?? loaded.config.linear.workspace ?? null, acceptedDependencies: accepted, newTimeWindow: Boolean(opts.requireApproval), ciWaitMinutes: opts.ciWaitMinutes ?? run.context.options.ciWaitMinutes ?? null }, () => {
+            const current = app.store.getRun(run.id);
+            if (!current || current.version !== approvedVersion || current.cancelRequested) throw new Error("run changed or was cancelled while awaiting approval");
+          }),
         }),
     });
     authorization = r.authorization;
@@ -361,10 +373,9 @@ export async function resumeRun(
       authorization,
     );
   }
-  // A resume a person approved grants a fresh time window (the cost cap is never reset). A trusted
-  // resume does not: unattended resumes cannot extend a run past limits.max_run_minutes.
+  // Only an explicit --require-approval grants a new window. Consent to continue alone never does.
   run = app.store.patchContext<RunContext>(run.id, {
-    ...(byPerson || run.mode !== "supervised" ? { limitWindowStartedAt: new Date().toISOString() } : {}),
+    ...((byPerson && opts.requireApproval) || run.mode !== "supervised" ? { limitWindowStartedAt: new Date().toISOString() } : {}),
     options: { ...run.context.options, ...(opts.ciWaitMinutes !== undefined ? { ciWaitMinutes: opts.ciWaitMinutes } : {}), acceptedDependencies: accepted },
     authorization,
   });
@@ -391,11 +402,32 @@ export function cancelRun(app: App, id: string): { run: RunRecord<RunContext>; d
 
 // ---- approvals ------------------------------------------------------------------------------
 
+/** Build from engine state, never caller-provided approval text. Full config digest binds hidden values too. */
+function boundConfig(app: App, loaded: LoadedRepoConfig, operation: Record<string, unknown>, extraValidate: () => void = () => {}): Pick<ApprovalRequest, "binding" | "validate"> {
+  const configHash = createHash("sha256").update(canonical(loaded.config)).digest("hex");
+  const trust = app.trust.evaluate(loaded);
+  const previousScope = trust.status === "trusted" || trust.status === "stale" ? trust.record.scope : null;
+  const c = loaded.config;
+  const scope = trustScope(loaded).scope;
+  return {
+    binding: {
+      operation, configHash, scope, previousScope,
+      changes: previousScope ? scopeChanges(previousScope, scope).map((field) => ({ field, before: (previousScope as unknown as Record<string, unknown>)[field] ?? null, after: (scope as unknown as Record<string, unknown>)[field] ?? null })) : [],
+      safeguards: c.isolation.require && c.review.require_distinct_provider && c.merge.require_ci && c.merge.require_independent_review && c.merge.mode === "manual" && !c.permissions.github.merge && c.pull_request.draft,
+    },
+    validate() {
+      const current = loadRepoConfigFile(loaded.source);
+      if (createHash("sha256").update(canonical(current.config)).digest("hex") !== configHash) throw new Error("configuration changed while awaiting approval; request a fresh approval");
+      extraValidate();
+    },
+  };
+}
+
 /** Ask a person (never the caller's arguments) and record the answer; throws unless approved. */
 export async function requireApproval(
   app: App,
   purpose: ApprovalPurpose,
-  req: { issue: string | null; repo: string; scopeHash: string; reason: string; details: string[] },
+  req: Omit<ApprovalRequest, "purpose">,
 ): Promise<NonNullable<RunContext["authorization"]>> {
   const full = { purpose, ...req };
   let res: ApprovalResult;
@@ -406,7 +438,8 @@ export async function requireApproval(
   }
   auditApproval(app.paths.home, full, res);
   if (!res.approved) {
-    throw new IntakeError("approval_required", `not approved: ${res.detail}. Nothing was started or changed. To ${req.reason}, run the same command again and confirm the system prompt on this Mac (an agent cannot answer it for you).`, { purpose, channel: res.channel, scopeHash: req.scopeHash });
+    const next = res.channel === REMOTE_CHANNEL ? "request a fresh remote approval, or select --approval-channel local for Touch ID" : "run the same command again and confirm the system prompt on this Mac (an agent cannot answer it for you)";
+    throw new IntakeError("approval_required", `not approved: ${res.detail}. Nothing was started or changed. To ${req.reason}, ${next}.`, { purpose, channel: res.channel, scopeHash: req.scopeHash });
   }
   return { purpose, scopeHash: req.scopeHash, approvedAt: res.at, channel: res.channel, user: res.user, detail: res.detail };
 }
@@ -433,9 +466,11 @@ async function authorizeLive(
     ask: (trustLine: string) => Promise<Authorization>;
   },
 ): Promise<{ authorization: Authorization; trusted: boolean }> {
-  const trust = app.trust.evaluate(input.loaded);
+  let trust = app.trust.evaluate(input.loaded);
   const repo = input.loaded.config.repo;
   if (trust.status === "trusted" && !input.requireApproval && input.acceptedDependencies.length === 0) {
+    trust = app.trust.narrow(input.loaded);
+    if (trust.status !== "trusted") throw new IntakeError("approval_required", "repository trust changed before execution; request authorization again");
     const rec = trust.record;
     const at = new Date().toISOString();
     const detail = `trusted repository: trust ${rec.id}, granted by ${rec.trustedBy} on ${rec.trustedAt} via ${rec.channel}; no per-run prompt`;
@@ -479,6 +514,7 @@ export async function trustRepository(app: App, repo: string): Promise<{ state: 
     scopeHash: hash,
     reason: d.reason,
     details: [...d.details, ...(current.status === "stale" || current.status === "invalid" ? [`Replaces:    ${describeTrustState(current)}`] : [])],
+    ...boundConfig(app, loaded, { standingTrust: true }),
   });
   const record = app.trust.write({ scope, scopeHash: hash, trustedBy: res.user, trustedAt: res.approvedAt, channel: res.channel, detail: res.detail });
   app.trust.audit({ action: "trust", repo: record.repo, trustId: record.id, scopeHash: hash, configSource: loaded.source, by: res.user, channel: res.channel });
@@ -531,6 +567,9 @@ export async function authorizeRepository(app: App, repo: string, opts: { readOn
       `Permissions: agent runs ${p.agents.run}, push ${p.github.push}, draft PR ${p.github.create_pr}, merge ${p.github.merge}, Linear comment ${p.linear.comment}, Linear state ${p.linear.update_state}`,
       `Merge:       ${prep.config.merge.mode}`,
     ],
+    binding: { operation: { repo, replace: !!opts.replace, readOnly: !!opts.readOnly, destination: prep.file, contentHash: createHash("sha256").update(prep.content).digest("hex") }, scope: trustScope({ config: prep.config, source: prep.file }).scope,
+      safeguards: prep.config.isolation.require && prep.config.review.require_distinct_provider && prep.config.merge.require_ci && prep.config.merge.require_independent_review && prep.config.merge.mode === "manual" && !prep.config.permissions.github.merge && prep.config.pull_request.draft },
+    validate: () => {}, // Writes only prep.content, frozen before the request. Never re-reads the proposal.
   });
   if (!opts.replace && existsSync(prep.file)) throw new ConfigError(`${prep.file} appeared while waiting for approval; nothing was written (pass --replace to overwrite it)`);
   return writeAuthorization(prep);
@@ -544,6 +583,8 @@ export async function confirmAssociation(app: App, input: { issue: string; repo:
     scopeHash: `${input.issue}->${input.repo.toLowerCase()}`,
     reason: `record that Linear issue ${input.issue} is work for ${input.repo}`,
     details: [`Issue:      ${input.issue}${input.workspace ? ` (workspace ${input.workspace})` : ""}`, `Repository: ${input.repo}`],
+    binding: { operation: { ...input }, safeguards: true },
+    validate: () => {}, // The exact association tuple above is the only effect.
   });
   return saveAssociation(app.paths, { tracker: "linear", issue: input.issue, repo: input.repo, workspace: input.workspace });
 }

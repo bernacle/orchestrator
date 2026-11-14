@@ -15,9 +15,9 @@ import { canonical } from "./approval.js";
  * (`orchestrator repo trust`), is a *trust scope*: the repository, the config file it is read from,
  * and every security-relevant setting of that config (permissions, agents, limits, isolation,
  * review, merge, forbidden paths…). The engine then accepts a live run or resume of that repository
- * without asking, only while the current config still has exactly that scope. Any change to it,
- * narrowing included, makes the trust *stale*: the run falls back to the per-run prompt until the
- * operator renews the trust. Trust never grants anything: permissions still come from the config,
+ * without asking while the current config stays within that scope. Expanded authority or weaker
+ * safeguards make it stale. Narrowing is pinned on trusted execution, including newly added checks.
+ * Trust never grants anything: permissions still come from the config,
  * and the permission gate, sandbox, tripwires, secret scan, budgets and independent review apply
  * exactly as in a supervised run.
  *
@@ -69,6 +69,8 @@ export interface TrustScope {
   baselineChecks: boolean;
   /** Network a setup/check command asks for beyond its default (commands themselves run sandboxed). */
   commandNetwork: Array<{ kind: "setup" | "check"; name: string; network: string }>;
+  /** A safeguard floor, added without expanding legacy delegations on their first trusted use. */
+  verification?: { checks: Array<{ name: string; run: string }>; screenshots: RepoConfig["screenshots"] | null };
 }
 
 /** Everything a trust delegates, in canonical form. Its hash binds the trust record. */
@@ -92,9 +94,10 @@ export function trustScope(loaded: LoadedRepoConfig): { scope: TrustScope; hash:
     forbiddenPaths: [...c.forbidden_paths],
     baselineChecks: c.baseline_checks,
     commandNetwork: [
-      ...c.setup.filter((s) => s.network).map((s) => ({ kind: "setup" as const, name: s.name, network: s.network! })),
-      ...c.checks.filter((s) => s.network).map((s) => ({ kind: "check" as const, name: s.name, network: s.network! })),
+      ...c.setup.map((s) => ({ kind: "setup" as const, name: s.name, network: s.network ?? c.isolation.setup_network })),
+      ...c.checks.map((s) => ({ kind: "check" as const, name: s.name, network: s.network ?? c.isolation.checks_network })),
     ],
+    verification: { checks: c.checks.filter((s) => !s.optional).map(({ name, run }) => ({ name, run })), screenshots: c.screenshots ?? null },
   };
   // Round-trip through JSON so `undefined` fields hash the same as absent ones.
   const normalized = JSON.parse(JSON.stringify(scope)) as TrustScope;
@@ -106,14 +109,15 @@ export function trustScope(loaded: LoadedRepoConfig): { scope: TrustScope; hash:
  * hold: the things trusted mode promises to preserve (sandbox, independent review, manual merge,
  * draft PRs) are not left to the config to switch off.
  */
-export function trustEligibility(config: RepoConfig): string[] {
+export function trustEligibility(config: RepoConfig, requireRuns = true): string[] {
   const problems: string[] = [];
   const p = config.permissions;
-  if (!p.agents.run) problems.push("the configuration grants no live runs (permissions.agents.run is false)");
+  if (requireRuns && !p.agents.run) problems.push("the configuration grants no live runs (permissions.agents.run is false)");
   if (p.github.merge) problems.push("the configuration grants merging (permissions.github.merge): trusted mode never covers merges");
   if (config.merge.mode !== "manual") problems.push(`merge.mode is ${config.merge.mode}: trusted mode requires manual merging`);
   if (!config.isolation.require) problems.push("isolation.require is false: trusted mode requires the sandbox");
   if (!config.review.require_distinct_provider) problems.push("review.require_distinct_provider is false: trusted mode requires an independent reviewer");
+  if (!config.merge.require_ci || !config.merge.require_independent_review) problems.push("trusted mode requires CI and independent review");
   if (!config.pull_request.draft) problems.push("pull_request.draft is false: trusted mode opens draft PRs only");
   return problems;
 }
@@ -122,6 +126,58 @@ export function trustEligibility(config: RepoConfig): string[] {
 export function scopeChanges(approved: TrustScope, current: TrustScope): string[] {
   const keys = [...new Set([...Object.keys(approved), ...Object.keys(current)])].sort();
   return keys.filter((k) => canonical((approved as unknown as Record<string, unknown>)[k]) !== canonical((current as unknown as Record<string, unknown>)[k]));
+}
+
+const subset = <T>(small: T[], large: T[]) => small.every((v) => large.includes(v));
+const networkCovered = (approved: string, current: string) => current === "none" || current === approved;
+
+/** Conservative partial order. Unknown relationships require a person; glob inclusion is never guessed. */
+export function scopeExpansions(approved: TrustScope, current: TrustScope): string[] {
+  const equal = (a: unknown, b: unknown) => canonical(a) === canonical(b);
+  const covered = (a: unknown, b: unknown): boolean => {
+    if (typeof a === "boolean" && typeof b === "boolean") return !b || a;
+    if (a && b && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b)) {
+      return Object.keys(b).every((k) => k in a && covered((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+    }
+    return equal(a, b);
+  };
+  const agentsCovered = () => Object.entries(current.agents).every(([role, b]) => {
+    if (!b) return true;
+    const a = approved.agents[role as keyof typeof approved.agents];
+    if (!a || a.adapter !== b.adapter) return false;
+    const aa = { ...a } as Record<string, unknown>, bb = { ...b } as Record<string, unknown>;
+    delete aa.model; delete bb.model; // Model choice grants no additional tools or budget.
+    if (b.timeout_minutes > a.timeout_minutes) return false;
+    delete aa.timeout_minutes; delete bb.timeout_minutes;
+    if (a.adapter === "claude-code" && b.adapter === "claude-code") {
+      if (!subset(b.allowed_tools, a.allowed_tools) || !subset(a.disallowed_tools, b.disallowed_tools)) return false;
+      if (a.max_budget_usd !== undefined && (b.max_budget_usd === undefined || b.max_budget_usd > a.max_budget_usd)) return false;
+      for (const k of ["allowed_tools", "disallowed_tools", "max_budget_usd"]) { delete aa[k]; delete bb[k]; }
+    }
+    if (a.adapter === "codex" && b.adapter === "codex" && b.sandbox === "read-only") { delete aa.sandbox; delete bb.sandbox; }
+    return equal(aa, bb);
+  });
+  const checksCovered = !approved.verification || (!!current.verification &&
+    approved.verification.checks.every((a) => current.verification!.checks.some((b) => equal(a, b))) &&
+    (!approved.verification.screenshots || equal(approved.verification.screenshots, current.verification.screenshots)));
+  const policies: Partial<Record<keyof TrustScope, boolean>> = {
+    permissions: covered(approved.permissions, current.permissions),
+    limits: current.limits.max_run_cost_usd <= approved.limits.max_run_cost_usd && current.limits.max_run_minutes <= approved.limits.max_run_minutes,
+    forbiddenPaths: subset(approved.forbiddenPaths, current.forbiddenPaths),
+    baselineChecks: !approved.baselineChecks || current.baselineChecks,
+    agents: agentsCovered(),
+    isolation: (!approved.isolation.require || current.isolation.require) && subset(current.isolation.read_paths, approved.isolation.read_paths) &&
+      networkCovered(approved.isolation.setup_network, current.isolation.setup_network) && networkCovered(approved.isolation.checks_network, current.isolation.checks_network),
+    review: (!approved.review.require_distinct_provider || current.review.require_distinct_provider) &&
+      subset(approved.review.blocking_severities, current.review.blocking_severities) && (current.review.minor_fix_rounds ?? 0) <= (approved.review.minor_fix_rounds ?? 0),
+    merge: current.merge.mode === approved.merge.mode && current.merge.max_fix_attempts <= approved.merge.max_fix_attempts &&
+      (!approved.merge.require_ci || current.merge.require_ci) && (!approved.merge.require_independent_review || current.merge.require_independent_review) && equal(approved.merge.auto_authorization, current.merge.auto_authorization),
+    pullRequest: (!approved.pullRequest.draft || current.pullRequest.draft) && (!current.pullRequest.markReadyWhenDelivered || !!approved.pullRequest.markReadyWhenDelivered),
+    commandNetwork: current.commandNetwork.every((b) => networkCovered(
+      approved.commandNetwork.find((a) => a.kind === b.kind && a.name === b.name)?.network ?? (b.kind === "setup" ? approved.isolation.setup_network : approved.isolation.checks_network), b.network)),
+    verification: checksCovered,
+  };
+  return scopeChanges(approved, current).filter((k) => policies[k as keyof TrustScope] !== true);
 }
 
 /** What a person is shown before trusting: a verb phrase for the system prompt, and detail lines. */
@@ -135,7 +191,7 @@ export function describeTrust(scope: TrustScope, opts: { renewing?: boolean } = 
   if (p.linear.comment || p.linear.update_state) actions.push("updates Linear");
   const reason =
     `${opts.renewing ? "renew trust" : "trust"} ${scope.repo} for Orchestrator live runs and resumes WITHOUT asking you each time: ${actions.join(", ")}; ` +
-    `never merges; budget $${scope.limits.max_run_cost_usd} and ${scope.limits.max_run_minutes} min per run. Until you run \`orchestrator repo untrust ${scope.repo}\` or the config changes`;
+    `never merges; budget $${scope.limits.max_run_cost_usd} and ${scope.limits.max_run_minutes} min per run. Until you run \`orchestrator repo untrust ${scope.repo}\` or authority expands or safeguards weaken`;
   const details = [
     `Repository:  ${scope.repo} (only this repository)`,
     `Config:      ${scope.configSource}`,
@@ -147,7 +203,7 @@ export function describeTrust(scope: TrustScope, opts: { renewing?: boolean } = 
     `Review:      distinct provider ${scope.review.require_distinct_provider}, blocking ${scope.review.blocking_severities.join("/")}, minor-finding rounds ${scope.review.minor_fix_rounds ?? 0}`,
     ...(scope.push ? [`Push as:     ${scope.push.url ?? "origin"}${scope.push.sshIdentityFile ? ` with key ${scope.push.sshIdentityFile}` : ""}`] : []),
     `PR:          draft ${scope.pullRequest.draft}, marked ready when delivered ${scope.pullRequest.markReadyWhenDelivered ?? false}; descriptions of its own PRs kept in sync`,
-    `Ends:        on \`orchestrator repo untrust ${scope.repo}\`, or when any of the above changes in the config (runs then ask again)`,
+    `Ends:        on \`orchestrator repo untrust ${scope.repo}\`, expanded authority or weakened safeguards (provably narrower scope stays trusted)`,
   ];
   return { reason, details };
 }
@@ -284,12 +340,31 @@ export class TrustStore {
     if (seal.length !== expected.length || !timingSafeEqual(Buffer.from(seal, "hex"), Buffer.from(expected, "hex"))) {
       return { status: "invalid", file, problem: `${file}'s seal does not verify: it was edited, copied or restored, or not written by \`orchestrator repo trust\`` };
     }
+    if (createHash("sha256").update(canonical(record.scope)).digest("hex") !== record.scopeHash) return { status: "invalid", file, problem: "trust scope hash does not match its sealed scope" };
     const current = trustScope(loaded);
-    const problems = trustEligibility(loaded.config);
-    if (current.hash !== record.scopeHash || problems.length) {
-      return { status: "stale", record, file, changed: current.hash !== record.scopeHash ? scopeChanges(record.scope, current.scope) : [], problems };
+    const problems = trustEligibility(loaded.config, false);
+    let changed: string[];
+    try { changed = scopeExpansions(record.scope, current.scope); }
+    catch { return { status: "invalid", file, problem: "trust scope is malformed or incompatible" }; }
+    if (changed.length || problems.length) {
+      return { status: "stale", record, file, changed, problems };
     }
     return { status: "trusted", record, file };
+  }
+
+  /** Pin newly added safeguards and narrowing at execution, rotating the key to defeat rollback. */
+  narrow(loaded: LoadedRepoConfig): TrustState {
+    return this.mutate(loaded.config.repo, () => this.narrowLocked(loaded));
+  }
+
+  private narrowLocked(loaded: LoadedRepoConfig): TrustState {
+    const state = this.evaluate(loaded);
+    if (state.status !== "trusted") return state;
+    const { scope, hash } = trustScope(loaded);
+    if (state.record.scopeHash === hash) return state;
+    const record = this.writeLocked({ scope, scopeHash: hash, trustedBy: state.record.trustedBy, trustedAt: state.record.trustedAt, channel: state.record.channel, detail: state.record.detail });
+    this.audit({ action: "narrow", repo: record.repo, trustId: record.id, previousTrustId: state.record.id, scopeHash: hash });
+    return { status: "trusted", record, file: state.file };
   }
 
   /**
@@ -297,6 +372,10 @@ export class TrustStore {
    * this exact scope. A new key every time: any earlier record of this repository stops verifying.
    */
   write(input: { scope: TrustScope; scopeHash: string; trustedBy: string; trustedAt: string; channel: string; detail: string }): TrustRecord {
+    return this.mutate(input.scope.repo, () => this.writeLocked(input));
+  }
+
+  private writeLocked(input: { scope: TrustScope; scopeHash: string; trustedBy: string; trustedAt: string; channel: string; detail: string }): TrustRecord {
     const repo = input.scope.repo;
     const file = this.file(repo);
     const key = randomBytes(32).toString("hex");
@@ -312,11 +391,25 @@ export class TrustStore {
 
   /** Revoke: delete the key (so no copy of the record verifies again) and the record. */
   remove(repo: string): boolean {
+    return this.mutate(repo, () => this.removeLocked(repo));
+  }
+
+  private removeLocked(repo: string): boolean {
     const file = this.file(repo);
     const had = existsSync(file) || this.keys.get(repo.toLowerCase()) !== null;
     this.keys.delete(repo.toLowerCase());
     rmSync(file, { force: true });
     return had;
+  }
+
+  /** Serialize grants, narrowing and revocation across CLI processes. A crash lock fails closed. */
+  private mutate<T>(repo: string, fn: () => T): T {
+    const lock = `${this.file(repo)}.lock`;
+    mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
+    try { mkdirSync(lock, { mode: 0o700 }); }
+    catch { throw new TrustError(`trust mutation locked for ${repo}; retry after the other command exits. If a process crashed, inspect ${lock} locally before removing the lock`); }
+    try { writeFileSync(join(lock, "pid"), String(process.pid), { mode: 0o600 }); return fn(); }
+    finally { rmSync(lock, { recursive: true, force: true }); }
   }
 
   /** Repositories with a trust file (valid or not), for listings. */

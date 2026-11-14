@@ -26,6 +26,15 @@ describe("repository config", () => {
     expect(RepoConfigSchema.safeParse({ ...minimal, agents: { ...minimal.agents, reviewer: { adapter: "codex", sandbox: "danger-full-access" } } }).success).toBe(false);
   });
 
+  it("rejects duplicate/no-op check shadowing, screenshot collisions and log path traversal", () => {
+    for (const kind of ["setup", "checks"]) {
+      const duplicate = RepoConfigSchema.safeParse({ ...minimal, [kind]: [{ name: "test", run: "true" }, { name: "test", run: "pnpm test" }] });
+      expect(duplicate.success).toBe(false);
+      for (const name of ["../trust", "x/../../credentials", "x\\escape", "x\nheader"]) expect(RepoConfigSchema.safeParse({ ...minimal, [kind]: [{ name, run: "true" }] }).success).toBe(false);
+    }
+    expect(RepoConfigSchema.safeParse({ ...minimal, checks: [{ name: "screenshots", run: "true" }], screenshots: { run: "real-screenshots", outputs: ["shots/*.png"] } }).success).toBe(false);
+  });
+
   it("requires explicit authorization for auto merge", () => {
     const noAuth = RepoConfigSchema.safeParse({ ...minimal, merge: { mode: "auto" }, permissions: { github: { merge: true } } });
     expect(noAuth.success).toBe(false);

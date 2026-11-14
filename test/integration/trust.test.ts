@@ -229,7 +229,6 @@ describe("trust is scoped to one repository and one configuration", () => {
 
   it.each([
     ["a new permission", { permissions: { linear: { update_state: true } } }, "permissions"],
-    ["a narrowed permission", { permissions: { linear: { comment: false } } }, "permissions"],
     ["a larger budget", { limits: { max_run_cost_usd: 500 } }, "limits"],
     ["a different implementer", { agents: { implementer: { adapter: "mock", provider: "anthropic-mock", timeout_minutes: 9 } } }, "agents"],
     ["wider sandbox reads", { isolation: { read_paths: ["/opt/extra"] } }, "isolation"],

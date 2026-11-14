@@ -242,6 +242,7 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
     : null;
   if (trustState && (trustState.status === "stale" || trustState.status === "invalid")) warnings.push(describeTrustState(trustState));
   const approval = app.approvalStatus ? await app.approvalStatus() : null;
+  const approvalInstruction = approval?.channel === "remote-passkey" ? "The CLI presents a private, expiring approval link; the user verifies the exact operation with their enrolled passkey" : "The CLI asks the user to confirm with Touch ID / password on this Mac before anything starts";
   // A trusted repository needs no prompt to start; without trust, a live run needs one that can be shown.
   if (approval && !approval.available && !trusted) liveMissing.push(approval.detail);
   const modes: ExecutionMode[] = [
@@ -286,7 +287,7 @@ export async function inspectRequest(app: App, input: InspectInput): Promise<Req
       next.push(
         trusted
           ? { id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. The user trusted ${loaded!.config.repo} (orchestrator repo trust), so the engine starts it without a system prompt; the user's request to implement the issue with Orchestrator is the go-ahead`, needsUserApproval: false, trusted: true }
-          : { id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. The CLI asks the user to confirm with Touch ID / password on this Mac before anything starts`, needsUserApproval: true },
+          : { id: "execute", command: modes[2]!.command, description: `${modes[2]!.description}. ${approvalInstruction}`, needsUserApproval: true },
       );
     }
   }

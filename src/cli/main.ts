@@ -16,6 +16,8 @@ import { c, nextStep, renderEvent, renderPlanMarkdown, renderRunDetail, renderSt
 import { reviewFindings, summarizeRun } from "../report/summary.js";
 import { output, printJson, withApp } from "./common.js";
 import { registerAuthCommands } from "./auth.js";
+import { registerApprovalCommands } from "./approval.js";
+import { RemoteApprovalError } from "../core/remote-config.js";
 import { renderCapabilities } from "./capabilities.js";
 import { registerContextCommands } from "./context.js";
 import { renderDoctor, runDoctor } from "./doctor.js";
@@ -74,7 +76,12 @@ const program = new Command()
   .name("orchestrator")
   .description("Supervised engineering orchestrator: Linear issue → isolated implementation → independent review → PR.")
   .version(pkg.version)
+  .option("--approval-channel <channel>", "local Touch ID or enrolled remote passkey (default: remote when enrolled)", (v: string) => {
+    if (v !== "local" && v !== "remote") throw new InvalidArgumentError("expected local or remote");
+    return v;
+  })
   .showHelpAfterError();
+program.hook("preAction", () => { output.approvalChannel = program.opts().approvalChannel; });
 
 program
   .command("doctor")
@@ -82,9 +89,9 @@ program
   .option("--repo <owner/name>", "check one repository (default: all configured)")
   .option("--json", "machine-readable output")
   .action(async (opts: { repo?: string; json?: boolean }) => {
-    const app = openApp();
+    const app = openApp({ approvalChannel: output.approvalChannel });
     try {
-      const checks = await runDoctor(app.paths, { ...(opts.repo ? { repo: opts.repo } : {}) });
+      const checks = await runDoctor(app.paths, { ...(opts.repo ? { repo: opts.repo } : {}), approvalChannel: output.approvalChannel });
       console.log(opts.json ? JSON.stringify(checks, null, 2) : renderDoctor(checks));
       process.exitCode = checks.some((k) => k.status === "fail") ? 1 : 0;
     } finally {
@@ -290,7 +297,7 @@ program
   .option("--repo <owner/name>", "with an issue: only runs on this repository")
   .option("--ci-wait <minutes>", "how long to poll CI before handing back", positiveInt)
   .option("--accept-dependency <key>", "treat a dependency named in the description as non-blocking (repeatable; audited)", (v: string, prev: string[]) => [...prev, v], [] as string[])
-  .option("--require-approval", "ask for your approval in a system prompt even if the repository is trusted (also grants a new time window)")
+  .option("--require-approval", "explicitly approve a new time window (the cumulative cost cap is never reset), even in a trusted repository")
   .option("--json", "print a versioned JSON summary (schemaVersion 1)")
   .action((target: string, opts: { repo?: string; ciWait?: number; acceptDependency: string[]; requireApproval?: boolean; json?: boolean }) =>
     withApp(async (app) => {
@@ -361,10 +368,11 @@ program
   .action(() => console.log(renderCapabilities()));
 
 registerAuthCommands(program);
+registerApprovalCommands(program);
 registerSkillCommands(program, pkg.version);
 
 program.parseAsync(process.argv).catch((err: unknown) => {
-  const known = err instanceof RunError || err instanceof ConfigError || err instanceof LeaseError || err instanceof IssueRefError || err instanceof CredentialError || err instanceof TrustError;
+  const known = err instanceof RunError || err instanceof ConfigError || err instanceof LeaseError || err instanceof IssueRefError || err instanceof CredentialError || err instanceof TrustError || err instanceof RemoteApprovalError;
   if (output.json) {
     const e = err as Error;
     printJson("error", {

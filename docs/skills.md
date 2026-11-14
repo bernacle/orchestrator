@@ -130,7 +130,7 @@ Then the macOS prompt and the terminal show the **trust scope**:
 `startRun` and `resumeRun` check trust; the skill only reads the result. On every live run and resume, the engine re-evaluates the trust record against the config that run will actually use. It starts without a prompt only if all of these hold:
 
 - the record verifies: correct seal, this repository, and a key that still exists;
-- the config's current trust scope hashes to exactly what you approved;
+- the current authority is covered by the sealed scope and its verification safeguards are preserved;
 - the config still meets the conditions above;
 - the run has no operator-accepted dependencies, and you didn't pass `--require-approval`.
 
@@ -142,7 +142,15 @@ Otherwise the run asks you in the system prompt, exactly as in supervised mode. 
 - `pull_request.draft`, `pull_request.mark_ready_when_delivered`, `forbidden_paths` and `baseline_checks`;
 - any per-command `network` overrides.
 
-Changing any of these makes the trust **stale**, even if the change narrows something. So does an Orchestrator update that adds a field to the scope: the 2026-11 review-completion update added `review.minor_fix_rounds` and `pull_request.mark_ready_when_delivered`, so a repository trusted before it asks once more. That includes running from a different `--config`. `context`, `doctor` and `repo trusted` then say what changed, and `orchestrator repo trust` renews it, with a prompt. Check and setup *commands* are not part of the scope: they run in the sandbox either way, just as the per-run approval never covered them.
+Expanded authority or weakened safeguards makes trust **stale**. Provably narrower permissions,
+lower limits, additional forbidden paths, narrower tool/read allowlists and effective network
+restrictions stay trusted. Model changes within the same authority and additional required checks
+within approved bounds need no new consent. Removing or optionalizing a mandatory check, replacing
+its command, or weakening screenshot policy requires approval. Glob inclusion is never guessed;
+unproven relationships require consent. Read [remote-approval.md](remote-approval.md#trusted-mode-migration-and-verification-floor)
+for the legacy migration and how newly added safeguards are sealed on the next trusted use.
+`context`, `doctor` and `repo trusted` explain expansions. `repo trust` renews standing delegation
+through the selected local or enrolled remote channel.
 
 Every trusted start or resume is audited like an approval:
 
@@ -187,6 +195,14 @@ Use trusted mode for repositories you own, whose config you keep minimal, and wh
 1. Once, in a terminal on your Mac: `orchestrator repo trust --repo bernacle/analyticool`. Read the prompt and confirm it.
 2. In Analyticool, in T3: *"Implement BRU-485 using Orchestrator."* The skill runs `context`, which shows `trust.mode: "trusted"`. Then it runs the dry run, and if that is clean, `run --execute` with no prompt. It reports the run, follows CI, and tells you when the draft PR is up.
 3. A run that blocks comes back to you. Say *"resume it"* to continue without a prompt, or use `--require-approval` for a new time window.
+
+## Approval from an iPhone
+
+The optional [private passkey channel](remote-approval.md) retains Trusted Mode and local Touch ID.
+Every remote authorization verifies a fresh, single-use, operation-bound WebAuthn assertion. Setup
+is local, explicit and separate from requesting work; it never switches a work tailnet or enables
+a public endpoint. Ordinary resumes retain their time window. Only `resume --require-approval`
+explicitly requests a new one; the cumulative cost cap is never reset.
 
 ## Automatic discovery: what is and isn't guaranteed
 

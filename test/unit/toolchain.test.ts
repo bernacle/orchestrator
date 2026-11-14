@@ -192,7 +192,7 @@ describe("baseline acceptance", () => {
     { name: "lint", run: "pnpm lint", timeout_minutes: 15, optional: false },
     { name: "smoke", run: "pnpm smoke", timeout_minutes: 15, optional: true },
   ];
-  const r = (name: string, ok: boolean, optional = false) => ({ name, command: name, ok, optional, exitCode: ok ? 0 : 1, durationMs: 1, timedOut: false, logPath: null });
+  const r = (name: string, ok: boolean, optional = false) => ({ name, command: `pnpm ${name}`, ok, optional, exitCode: ok ? 0 : 1, durationMs: 1, timedOut: false, logPath: null });
 
   it("only a baseline whose required checks all passed counts as done", () => {
     expect(baselineAccepted([r("lint", true), r("smoke", false, true)], checks)).toBe(true);
@@ -203,5 +203,8 @@ describe("baseline acceptance", () => {
 
   it("a baseline missing a required check (e.g. added to the config since) is not done", () => {
     expect(baselineAccepted([r("smoke", true, true)], checks)).toBe(false);
+  });
+  it("a green result for a different command with the same name cannot satisfy the check", () => {
+    expect(baselineAccepted([{ ...r("lint", true), command: "true" }], checks)).toBe(false);
   });
 });

@@ -148,7 +148,7 @@ export interface RunContext {
     basis?: "approval" | "trust";
     trust?: { id: string; scopeHash: string; trustedBy: string; trustedAt: string } | null;
   } | null;
-  /** Start of the current limit window (run creation, reset on operator resume). */
+  /** Start of the current limit window (only an explicit approved extension resets it). */
   limitWindowStartedAt?: string;
   issue?: Issue;
   plan?: ExecutionPlan;
@@ -170,6 +170,8 @@ export interface RunContext {
   baseline?: Array<Omit<CheckResult, "outputTail">> | null;
   /** Baseline attempts so far. Each attempt uses fresh effect keys, so a re-entry re-runs every check. */
   baselineAttempts?: number;
+  /** Policy/commands of an accepted baseline; legacy or changed policies are verified again. */
+  baselinePolicyHash?: string;
   /** The last baseline attempt that did not pass (audit and status only, never treated as done). */
   baselineFailure?: { attempt: number; baseSha: string | null; reason: string; results: Array<Omit<CheckResult, "outputTail">> } | null;
   /** Feedback FIXING must address. `requested`: the finding / criterion ids the round must answer. */
@@ -857,7 +859,7 @@ async function runChecks(ctx: Ctx, input: { worktree: string; checks: CheckConfi
     const network = check.network ?? input.defaultNetwork;
     const sandbox = checkSandbox(ctx, input.worktree, network, readablePaths);
     const res = await ctx.effect({
-      key: `${input.keyPrefix}.${check.name}`,
+      key: `${input.keyPrefix}.${check.name}.${createHash("sha256").update(JSON.stringify({ check, network, isolation: ctx.config.isolation, toolchain: ctx.config.toolchain })).digest("hex")}`,
       permission: "local.checks",
       description: `${input.label} "${check.name}": ${check.run}`,
       simulate: () => null,
@@ -1046,7 +1048,7 @@ export function baselineChecks(config: Pick<RepoConfig, "checks" | "screenshots"
 export function baselineAccepted(baseline: BaselineResult[] | null | undefined, checks: CheckConfig[]): boolean {
   if (!baseline) return false;
   const byName = new Map(baseline.map((r) => [r.name, r]));
-  return checks.every((k) => k.optional || byName.get(k.name)?.ok === true) && baseline.every((r) => r.ok || r.optional);
+  return checks.every((k) => k.optional || (byName.get(k.name)?.ok === true && byName.get(k.name)?.command === k.run)) && baseline.every((r) => r.ok || r.optional);
 }
 
 /**
@@ -1058,7 +1060,8 @@ async function ensureGreenBaseline(ctx: Ctx, worktree: string): Promise<void> {
   const { config, adapters } = ctx;
   const c = ctx.run.context;
   const checks = baselineChecks(config);
-  if (baselineAccepted(c.baseline, checks)) {
+  const baselinePolicyHash = createHash("sha256").update(JSON.stringify({ checks, isolation: config.isolation, toolchain: config.toolchain })).digest("hex");
+  if (c.baselinePolicyHash === baselinePolicyHash && baselineAccepted(c.baseline, checks)) {
     ctx.log("info", "baseline.reused", `Baseline already green on ${c.baseSha?.slice(0, 8)}; not re-running`);
     return;
   }
@@ -1105,7 +1108,7 @@ async function ensureGreenBaseline(ctx: Ctx, worktree: string): Promise<void> {
   const cfg = config.screenshots;
   if (cfg) await adapters.workspace.discardPaths(worktree, (await adapters.workspace.uncommittedPaths(worktree)).filter((p) => matchesOutputs(p, cfg)));
   if (await adapters.workspace.hasUncommittedChanges(worktree)) fail("baseline checks modified the worktree; the check configuration must not write tracked files");
-  ctx.save({ baseline: recorded, baselineFailure: null });
+  ctx.save({ baseline: recorded, baselineFailure: null, baselinePolicyHash });
 }
 
 // ---- IMPLEMENTING ------------------------------------------------------------------

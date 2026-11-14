@@ -6,7 +6,7 @@ import { ClaudeCodeAgent } from "../adapters/claude.js";
 import { CodexAgent } from "../adapters/codex.js";
 import { GitHubHost, ghAuthStatus } from "../adapters/github.js";
 import { LinearCredentialStore, resolveLinearKey } from "../credentials/linear.js";
-import { approvalChannelStatus } from "../core/approval.js";
+import { configuredApprovalStatus, type ApprovalChannel } from "../core/remote-approval.js";
 import { LinearTracker } from "../adapters/linear.js";
 import { T3Cli } from "../adapters/t3.js";
 import { listRepoConfigs, loadRepoConfig, type LoadedRepoConfig, type Paths } from "../config/load.js";
@@ -25,7 +25,7 @@ export interface DoctorCheck {
 
 const MIN_NODE: [number, number] = [22, 5];
 
-export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJS.ProcessEnv }): Promise<DoctorCheck[]> {
+export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJS.ProcessEnv; approvalChannel?: ApprovalChannel }): Promise<DoctorCheck[]> {
   const env = opts.env ?? process.env;
   const out: DoctorCheck[] = [];
   const add = (section: string, name: string, status: Status, detail: string) => out.push({ section, name, status, detail });
@@ -85,7 +85,7 @@ export async function runDoctor(paths: Paths, opts: { repo?: string; env?: NodeJ
     }
   }
 
-  const approval = await approvalChannelStatus();
+  const approval = await configuredApprovalStatus(paths.home, opts.approvalChannel);
   add("approval", approval.channel, approval.available ? "ok" : "warn", approval.detail);
 
   const claude = await new ClaudeCodeAgent({ adapter: "claude-code", permission_mode: "acceptEdits", allowed_tools: [], disallowed_tools: [], timeout_minutes: 1 }).probe();

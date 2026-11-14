@@ -71,7 +71,7 @@ describe("resume must not auto-unblock a block that happens during the resumed d
     expect(run.context.baselineFailure?.attempt).toBe(2);
     // The check really ran again (a second, fresh effect), it was not replayed from the first attempt.
     const effects = h.app.store.effects(run.id).filter((e) => e.key.startsWith("baseline."));
-    expect(effects.map((e) => e.key).sort()).toEqual(["baseline.1.feature-exists", "baseline.2.feature-exists"]);
+    expect(effects.map((e) => e.key.replace(/\.[0-9a-f]{64}$/, "")).sort()).toEqual(["baseline.1.feature-exists", "baseline.2.feature-exists"]);
     expect(events(run.id, "run.resumed")).toHaveLength(1);
     expectNoExternalEffects();
   });
@@ -189,7 +189,23 @@ describe("legitimate recovery still works", () => {
     expect(run.state).toBe("READY_TO_MERGE");
     expect(run.context.baselineAttempts).toBe(1);
     expect(events(run.id, "baseline.reused")).toHaveLength(1);
-    expect(h.app.store.effects(run.id).filter((e) => e.key.startsWith("baseline.")).map((e) => e.key)).toEqual(["baseline.1.readme"]);
+    expect(h.app.store.effects(run.id).filter((e) => e.key.startsWith("baseline.")).map((e) => e.key.replace(/\.[0-9a-f]{64}$/, ""))).toEqual(["baseline.1.readme"]);
+  });
+
+  it("a changed command with the same name cannot reuse a green baseline or an earlier effect", async () => {
+    const interrupt = new AbortController();
+    h = createHarness({
+      config: { baseline_checks: true, checks: [{ name: "readme", run: "test -f README.md" }] },
+      implement: async () => { interrupt.abort(); await new Promise((r) => setTimeout(r, 1_200)); return { ok: false, error: "interrupted" }; },
+    });
+    const initial = await start({ interrupt: interrupt.signal });
+    expect(initial.context.baseline?.[0]?.ok).toBe(true);
+    h.writeConfig({ checks: [{ name: "readme", run: "exit 42" }] });
+    const resumed = await resumeRun(h.app, initial.id, { ciWaitMinutes: 0 });
+    expect(resumed.state).toBe("BLOCKED");
+    expect(resumed.context.baseline).toBeNull();
+    expect(resumed.context.baselineFailure?.results[0]).toMatchObject({ name: "readme", command: "exit 42", ok: false, exitCode: 42 });
+    expect(h.app.store.effects(initial.id).filter((e) => e.key.startsWith("baseline.1.readme."))).toHaveLength(2);
   });
 
   it("a baseline interrupted mid-way continues its own attempt, reusing checks that already completed", async () => {
@@ -216,7 +232,7 @@ describe("legitimate recovery still works", () => {
 
     expect(run.state).toBe("READY_TO_MERGE");
     expect(run.context.baselineAttempts).toBe(1);
-    expect(events(run.id, "effect.reused").map((e) => (e.data as { key?: string } | null)?.key)).toContain("baseline.1.first");
+    expect(events(run.id, "effect.reused").map((e) => (e.data as { key?: string } | null)?.key?.replace(/\.[0-9a-f]{64}$/, ""))).toContain("baseline.1.first");
     expect(run.context.baseline?.map((r) => r.name)).toEqual(["first", "second"]);
   });
 });
@@ -234,7 +250,7 @@ describe("toolchain in live execution", () => {
 
     expect(run.state).toBe("BLOCKED");
     expect(run.reason).toMatch(/^toolchain: wants 99\.0\.0 \(toolchain\.node\)/);
-    expect(h.app.store.effects(run.id).some((e) => e.key === "baseline.2.readme")).toBe(false);
+    expect(h.app.store.effects(run.id).some((e) => e.key.startsWith("baseline.2.readme."))).toBe(false);
     expectNoExternalEffects();
   });
 
