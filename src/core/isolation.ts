@@ -209,11 +209,15 @@ function sbString(p: string): string {
   return `"${p.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+/** macOS's DNS resolver socket (`/var/run` is a symlink to `/private/var/run`; Seatbelt matches the real path). */
+export const DNS_RESOLVER_SOCKET = "/private/var/run/mDNSResponder";
+
 /**
  * Seatbelt profile: everything not denied is allowed (so ordinary tooling
  * works), but file writes are denied except in `writable`, reads of
- * credential paths are denied, keychain services are unreachable, and
- * network is off (or outbound-only for setup).
+ * credential paths are denied, keychain services are unreachable, Unix-domain
+ * socket connections are denied (both modes), and network is off except
+ * loopback IP (or outbound for setup).
  */
 export function seatbeltProfile(spec: SandboxSpec): string {
   const writable = [...new Set(spec.writable.map(real))];
@@ -256,10 +260,19 @@ export function seatbeltProfile(spec: SandboxSpec): string {
     "",
   ];
   if (spec.network === "none") {
-    lines.push(";; No network except loopback (tests may bind localhost).", "(deny network-outbound)", '(allow network-outbound (remote ip "localhost:*"))', '(allow network-outbound (remote unix-socket))');
+    lines.push(";; No network except loopback IP (tests may bind localhost).", "(deny network-outbound)", '(allow network-outbound (remote ip "localhost:*"))');
   } else {
     lines.push(";; Outbound network allowed (package installation). Credentials above stay unreadable.");
   }
+  lines.push(
+    "",
+    ";; No connections to Unix-domain sockets, by type rather than by path: host daemons listen on them",
+    ";; (Docker/OrbStack /var/run/docker.sock, SSH agents, local databases) and a path list misses aliases",
+    ";; and new daemons. Deny after broad network allows. Outbound setup keeps exactly one exception below,",
+    ";; socket, the system DNS resolver: without it no hostname resolves (EAI/ENOTFOUND).",
+    "(deny network-outbound (remote unix-socket))",
+    ...(spec.network === "outbound" ? [`(allow network-outbound (remote unix-socket (path-literal ${sbString(DNS_RESOLVER_SOCKET)})))`] : []),
+  );
   return lines.join("\n");
 }
 

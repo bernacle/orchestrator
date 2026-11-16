@@ -1,7 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer, get as httpGet, type Server } from "node:http";
+import { connect as netConnect, type AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ShellCheckRunner } from "../../src/adapters/checks.js";
 import { ClaudeCodeAgent, DEFAULT_DENIED } from "../../src/adapters/claude.js";
 import {
@@ -10,15 +12,18 @@ import {
   compareTripwire,
   compareVersions,
   credentialPaths,
+  DNS_RESOLVER_SOCKET,
   defaultWritable,
   describeTripwireChanges,
   isolationDirs,
   isolationReadPaths,
   repositoryReadPaths,
+  sandboxedShell,
   sandboxSupport,
   seatbeltProfile,
   takeTripwire,
 } from "../../src/core/isolation.js";
+import { runProcess } from "../../src/core/exec.js";
 import { Redactor } from "../../src/core/redact.js";
 
 const scratch = mkdtempSync(join(tmpdir(), "orch-iso-"));
@@ -71,6 +76,27 @@ describe("seatbelt profile", () => {
     expect(p).toContain('global-name "com.apple.SecurityServer"');
     expect(p).toContain("(deny network-outbound)");
     expect(seatbeltProfile({ writable: ["/wt"], denyRead: [], network: "outbound" })).not.toContain("(deny network-outbound)");
+  });
+  it("denies Unix-socket connections by type in both setup and checks, after every network allow", () => {
+    const allows = (p: string) => p.split("\n").filter((l) => /^\(allow network/.test(l));
+    for (const network of ["none", "outbound"] as const) {
+      const p = seatbeltProfile({ writable: ["/wt"], denyRead: [], network });
+      const deny = p.lastIndexOf("(deny network-outbound (remote unix-socket))");
+      expect(deny, network).toBeGreaterThan(-1);
+      // Seatbelt: the last matching rule wins, so nothing allowed before the deny can re-open a socket.
+      for (const line of allows(p)) expect(p.indexOf(line) < deny || line.includes("path-literal"), `${network}: ${line}`).toBe(true);
+      // Never a blanket socket allow, nor a path-pattern one.
+      expect(p, network).not.toContain("(allow network-outbound (remote unix-socket))");
+      expect(p, network).not.toMatch(/\(allow network[^\n]*unix-socket[^\n]*(subpath|regex|prefix)/);
+      expect(p, network).not.toMatch(/\(allow network-(bind|inbound|\*)/);
+    }
+    // Checks: loopback IP only, no socket exception at all.
+    expect(allows(seatbeltProfile({ writable: [], denyRead: [], network: "none" }))).toEqual(['(allow network-outbound (remote ip "localhost:*"))']);
+    // Setup: exactly one socket, the DNS resolver (name resolution for package installs), by literal path.
+    expect(allows(seatbeltProfile({ writable: [], denyRead: [], network: "outbound" }))).toEqual([`(allow network-outbound (remote unix-socket (path-literal "${DNS_RESOLVER_SOCKET}")))`]);
+  });
+  it("reports no sandbox where Seatbelt does not exist (planning then blocks live runs)", () => {
+    for (const platform of ["linux", "win32"] as const) expect(sandboxSupport(platform)).toMatchObject({ available: false, mechanism: "none" });
   });
   it("covers the usual credential stores and orchestrator state", () => {
     const paths = credentialPaths({ HOME: "/Users/me", CLAUDE_CONFIG_DIR: "/Users/me/.claude-work2" }, "/Users/me/.orchestrator");
@@ -262,5 +288,158 @@ describe.runIf(sandboxSupport().available)("Seatbelt sandbox, for real (macOS)",
     await new Promise((r) => setTimeout(r, 2_000));
     expect(existsSync(marker)).toBe(false);
     expect(existsSync(`${marker}.2`)).toBe(false);
+  });
+
+  // ---- Unix-domain sockets (Docker, SSH agents, local daemons) and loopback ----------------------
+  // Ground truth comes from outside: canaries run in this (unsandboxed) test process and count what
+  // actually reached them. A sandboxed failure only counts when the same endpoint answers from outside
+  // and the error is the OS's EPERM, not ENOENT (wrong path) or ECONNREFUSED (nothing listening).
+  const probe = join(wt, "net-probe.cjs");
+  let sockDir = "";
+  let unixCanary = "";
+  let unixHits = 0;
+  let tcpHits = 0;
+  let tcpPort = 0;
+  const servers: Server[] = [];
+  const pingUnix = (socketPath: string, path = "/_ping") =>
+    new Promise<number | string>((resolve) => {
+      httpGet({ socketPath, path, timeout: 5_000 }, (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      })
+        .on("error", (e: NodeJS.ErrnoException) => resolve(e.code ?? e.message))
+        .on("timeout", () => resolve("TIMEOUT"));
+    });
+  const listen = (server: Server, ...args: unknown[]) => new Promise<void>((r) => (server.listen as (...a: unknown[]) => void)(...args, () => r()));
+
+  beforeAll(async () => {
+    // Short path: sun_path is 104 bytes on macOS, and macOS tmpdir() paths are long.
+    sockDir = mkdtempSync("/tmp/orch-sock-");
+    unixCanary = join(sockDir, "canary.sock");
+    const unix = createHttpServer((_req, res) => {
+      unixHits++;
+      res.end("canary");
+    });
+    const tcp = createHttpServer((_req, res) => {
+      tcpHits++;
+      res.end("db-ish");
+    });
+    servers.push(unix, tcp);
+    await listen(unix, unixCanary);
+    await listen(tcp, 0, "127.0.0.1");
+    tcpPort = (tcp.address() as AddressInfo).port;
+    writeFileSync(
+      probe,
+      `const net = require("node:net"), http = require("node:http");
+const [mode, a, b] = process.argv.slice(2);
+const done = (line, code) => { console.log(line); process.exit(code); };
+const fail = (e) => done("FAILED " + (e.code || e.message), 3);
+const got = (res) => { res.resume(); done("CONNECTED " + res.statusCode, 0); };
+if (mode === "http-unix") http.get({ socketPath: a, path: "/_ping", timeout: 5000 }, got).on("error", fail);
+else if (mode === "http-tcp") http.get({ host: b, port: Number(a), path: "/", timeout: 5000 }, got).on("error", fail);
+else if (mode === "raw-unix") { const s = net.connect(a); s.on("connect", () => { s.destroy(); done("CONNECTED raw", 0); }).on("error", fail); }
+else if (mode === "self-tcp" || mode === "self-unix") {
+  const srv = net.createServer((c) => c.end("ok"));
+  const onListen = () => { const to = mode === "self-tcp" ? [srv.address().port, "127.0.0.1"] : [a]; net.connect(...to).on("data", (d) => done("CONNECTED " + d, 0)).on("error", fail); };
+  if (mode === "self-tcp") srv.listen(0, "127.0.0.1", onListen); else srv.listen(a, onListen);
+} else done("FAILED unknown mode", 4);
+`,
+    );
+  });
+  afterAll(async () => {
+    await Promise.all(servers.map((s) => new Promise((r) => s.close(r))));
+    if (sockDir) rmSync(sockDir, { recursive: true, force: true });
+  });
+
+  const expectOsDenial = (r: { ok: boolean; outputTail: string }, what: string) => {
+    expect(r.ok, `${what}: ${r.outputTail}`).toBe(false);
+    expect(r.outputTail, what).toContain("FAILED EPERM");
+    expect(r.outputTail, what).not.toMatch(/ENOENT|ECONNREFUSED|CONNECTED/);
+  };
+
+  it("blocks a host Unix socket in setup and checks, under every alias, and the host side sees nothing", async () => {
+    // Positive control: the endpoint answers from outside the sandbox.
+    expect(await pingUnix(unixCanary)).toBe(200);
+    expect(unixHits).toBe(1);
+    const alias = join(wt, "canary-alias.sock");
+    rmSync(alias, { force: true });
+    symlinkSync(unixCanary, alias);
+    const paths = [unixCanary, realpathSync(unixCanary), alias]; // /tmp/…, /private/tmp/…, a symlink in the worktree
+    expect(paths[0]).not.toBe(paths[1]);
+    for (const network of ["none", "outbound"] as const) {
+      for (const p of paths) {
+        // `test -S` proves the sandbox can see the socket (not ENOENT); the connect is what is denied.
+        expectOsDenial(await run(`test -S "${p}" && node "${probe}" http-unix "${p}"`, network), `${network} ${p}`);
+      }
+    }
+    expect(unixHits).toBe(1);
+    // The endpoint was up the whole time.
+    expect(await pingUnix(alias)).toBe(200);
+    expect(unixHits).toBe(2);
+  });
+
+  it("blocks the Docker daemon socket (read-only /_ping) wherever a local daemon answers", async (ctx) => {
+    const h = homedir();
+    const candidates = ["/var/run/docker.sock", join(h, ".orbstack", "run", "docker.sock"), join(h, ".docker", "run", "docker.sock"), join(h, ".colima", "default", "docker.sock"), join(h, ".rd", "docker.sock")];
+    const live: string[] = [];
+    for (const c of candidates) if (existsSync(c) && (await pingUnix(c)) === 200) live.push(c);
+    // No daemon here: nothing to prove. The canary test above is the authoritative check.
+    if (live.length === 0) return ctx.skip();
+    for (const network of ["none", "outbound"] as const) {
+      for (const c of live) expectOsDenial(await run(`node "${probe}" http-unix "${c}"`, network), `${network} ${c}`);
+    }
+  });
+
+  it("keeps TCP loopback (local test servers and databases) reachable in setup and checks", async () => {
+    const before = tcpHits;
+    for (const network of ["none", "outbound"] as const) {
+      for (const host of ["127.0.0.1", "localhost"]) {
+        const r = await run(`node "${probe}" http-tcp ${tcpPort} ${host}`, network);
+        expect(r.ok, `${network} ${host}: ${r.outputTail}`).toBe(true);
+        expect(r.outputTail).toContain("CONNECTED 200");
+      }
+      // A server the command starts itself (a disposable test database on localhost).
+      const self = await run(`node "${probe}" self-tcp`, network);
+      expect(self.ok, `${network} self-tcp: ${self.outputTail}`).toBe(true);
+    }
+    expect(tcpHits - before).toBe(4);
+  });
+
+  it("has no exception for sockets the command creates itself (use TCP localhost instead)", async () => {
+    for (const network of ["none", "outbound"] as const) {
+      const own = join(sockDir, `own-${network}.sock`);
+      expectOsDenial(await run(`node "${probe}" self-unix "${own}"`, network), `${network} own socket`);
+    }
+  });
+
+  it.runIf(existsSync(DNS_RESOLVER_SOCKET))("lets setup, and only setup, reach the system DNS resolver", async () => {
+    // Positive control from outside: the resolver socket accepts connections.
+    const outside = await new Promise<string>((resolve) => {
+      const s = netConnect(DNS_RESOLVER_SOCKET);
+      s.on("connect", () => {
+        s.destroy();
+        resolve("connected");
+      }).on("error", (e: NodeJS.ErrnoException) => resolve(e.code ?? "error"));
+    });
+    expect(outside).toBe("connected");
+    const setup = await run(`node "${probe}" raw-unix ${DNS_RESOLVER_SOCKET}`, "outbound");
+    expect(setup.ok, setup.outputTail).toBe(true);
+    // Checks get no DNS at all: the resolver was also a way to send data out (queries for attacker names).
+    expectOsDenial(await run(`node "${probe}" raw-unix /var/run/mDNSResponder`, "none"), "checks DNS resolver");
+  });
+
+  it("fails closed: a profile Seatbelt rejects runs nothing", async () => {
+    const marker = join(wt, `ran-${process.pid}.txt`);
+    const exec = sandboxedShell(`touch "${marker}"`, { writable: defaultWritable(wt, process.env), denyRead: credentialPaths(process.env, join(scratch, "home")), network: "none" });
+    // The real profile compiles; the same profile with an unknown filter is refused before the command starts.
+    const broken = [...exec.args];
+    broken[1] = `${broken[1]}\n(deny network-outbound (remote unix-socket (no-such-filter "x")))`;
+    const r = await runProcess(exec.command, broken, { cwd: wt, env, timeoutMs: 20_000 });
+    expect(r.exitCode).not.toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    const ok = await runProcess(exec.command, exec.args, { cwd: wt, env, timeoutMs: 20_000 });
+    expect(ok.exitCode, ok.stderr).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+    rmSync(marker, { force: true });
   });
 });
