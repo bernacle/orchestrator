@@ -23,7 +23,16 @@ describe("skill installation through the CLI", () => {
   const ephemeral = ephemeralReasons(PACKAGE_ROOT, { HOME: home });
 
   it("refuses an ephemeral source (linked worktree, temp dir) unless explicitly allowed", () => {
-    const r = run(["skill", "install", "--all"]);
+    // A stable checkout installs successfully here. Keep that side effect out
+    // of the separate first-install/idempotency scenario below.
+    const guardHome = join(scratch, "source-guard-home");
+    mkdirSync(guardHome, { recursive: true });
+    const r = run(["skill", "install", "--all"], {
+      HOME: guardHome,
+      ORCHESTRATOR_HOME: join(guardHome, ".orchestrator"),
+      ORCHESTRATOR_T3_SETTINGS: join(guardHome, "t3.json"),
+      CLAUDE_CONFIG_DIR: join(guardHome, ".claude-work2"),
+    });
     if (ephemeral.length) {
       expect(r.status).toBe(1);
       expect(r.stderr).toMatch(/refusing to install skills from .*Installed skills would break when it disappears/);
