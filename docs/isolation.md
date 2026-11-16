@@ -7,9 +7,9 @@ This page states what the orchestrator isolates, how each claim was verified, an
 | Process | Code it executes | Runs as | Boundary |
 |---|---|---|---|
 | Orchestrator (git, gh, Linear API) | its own code only | you | none needed: repository hooks and fsmonitor are disabled for every git call (`-c core.hooksPath=/dev/null -c core.fsmonitor=false`) |
-| Setup (`pnpm install`) | package lifecycle scripts | you | **Seatbelt** + scrubbed env + private home, network outbound |
-| Checks (lint, tests, build, oracle) | repository code, including the agent's changes | you | **Seatbelt** + scrubbed env + private home, **no network** |
-| Screenshots (`screenshots.run`, e.g. Playwright) | repository code and a local browser + server | you | **Seatbelt** + scrubbed env + private home, **no network except localhost**. Only plain PNGs (image chunks only) whose bytes pass the secret scan are committed |
+| Setup (`pnpm install`) | package lifecycle scripts | you | **Seatbelt** + scrubbed env + private home, network outbound, **no Unix sockets** except the DNS resolver |
+| Checks (lint, tests, build, oracle) | repository code, including the agent's changes | you | **Seatbelt** + scrubbed env + private home, **no network** except loopback IP, **no Unix sockets** |
+| Screenshots (`screenshots.run`, e.g. Playwright) | repository code and a local browser + server | you | **Seatbelt** + scrubbed env + private home, **no network except localhost** (IP), **no Unix sockets**. Only plain PNGs (image chunks only) whose bytes pass the secret scan are committed |
 | Implementer (Claude Code) | the model's shell commands, plus tests it runs | you | **Claude Code sandbox** (Seatbelt) for Bash; permission fences for file tools |
 | Reviewer (Codex) | read-only shell commands | you | **Codex read-only sandbox** (Seatbelt); output redacted |
 | Planner (Claude Code) | none (Read/Grep/Glob only) | you | permission fences; no shell |
@@ -27,7 +27,8 @@ The main V1 hole was the checks. They execute code the agent just wrote (a test 
 - **private home:** file contents under `$HOME` are unreadable except an explicit list (`repositoryReadPaths`). The list is the worktree, the clone's `.git` (read-only), the pinned Node install, the orchestrator's empty git/gh stubs, specific caches (corepack, Playwright browsers, pnpm, npm), and the operator's `isolation.read_paths`. Shell history, other repositories and tool configs holding tokens (`~/.config/*`, `~/.pypirc`, `~/.cargo`, …) are unreadable even though they aren't on the credential list. Other caches stay writable but not readable. Metadata (`stat`) stays visible. Credential denies are emitted for both `file-read*` and `file-read-data`: in Seatbelt a rule on the more specific operation outranks a `file-read*` rule, so the data-only allow-list would otherwise re-open them. A regression test covers this
 - whatever a setup/check/screenshot command leaves running is killed with its process group when the command exits
 - mach-lookup to the keychain services denied
-- network: none for checks (loopback allowed), outbound for setup
+- network: none for checks (loopback IP allowed), outbound for setup
+- **Unix-domain sockets: connections denied by default in both modes.** The deny matches socket type rather than a path list and follows the broad network allows. Host daemons listen on Unix sockets: Docker/OrbStack (`/var/run/docker.sock`, `~/.orbstack/run/docker.sock`, `~/.docker/run/docker.sock`), whose API is root-equivalent on the host, SSH agents, local databases. A path list misses symlink aliases and daemons nobody listed. A subsequent literal-path exception permits only the system DNS resolver (`/private/var/run/mDNSResponder`) and only for setup: without it no hostname resolves, so package installs fail. Checks get no exception. Before this rule, checks could reach every Unix socket on the host, including Docker and the DNS resolver (a way to send data out through DNS queries)
 
 **3. Claude Code's own sandbox for the implementer.** It's configured with `--settings`, and `--setting-sources ""` so neither the repository's `.claude/settings*.json` nor your user settings apply:
 
@@ -87,8 +88,16 @@ The results below come from probes on this machine (macOS, Claude Code 2.1.318).
 | Read tool on `~/.gitconfig` | n/a | refused (`blockReadsOutsideWorkingDirectories`) |
 | Write tool to `/tmp/…` | n/a | refused (`blockWritesOutsideWorkingDirectories`) |
 | write inside the worktree | allowed | allowed |
+| connect to a host Unix socket (canary under `/tmp`, its `/private/tmp` path and a symlink in the worktree) | blocked in setup and checks (`EPERM`; the canary served from outside before and after and saw no connection) | n/a |
+| Docker daemon `GET /_ping` (`/var/run/docker.sock`, `~/.orbstack/run/docker.sock`) | blocked in setup and checks (`EPERM`; `200` from outside) | n/a |
+| TCP to a loopback server (`127.0.0.1`, `localhost`), and a server the command starts itself | allowed in setup and checks | n/a |
+| DNS resolver socket | setup only; checks blocked | n/a |
 
 These are re-checked on every `pnpm test` run on macOS (`test/unit/isolation.test.ts`, "Seatbelt sandbox, for real"). `orchestrator preflight --repo <r> --agent-probe` repeats them in a real worktree of the target repository, together with its setup and checks.
+
+The Unix-socket hardening was also checked on native arm64 macOS with Node 24.21.0 and pnpm 10.34.9: typecheck, all 504 tests across 27 files, and build passed. The real Docker endpoint answered outside the sandbox and was denied inside both setup/check profiles. The macOS security workflow requires Seatbelt before running the full suite and retains its JSON report; the controlled socket canary does not depend on Docker being installed on the CI host.
+
+Installation gate: a test build in an isolated checkout does not update the installed CLI. Independently review and manually merge the hardening PR before rebuilding the stable checkout used by the launcher. Verify the installed generated profile and run the target repository's preflight before any live run. Rebuilding must not replace repository configuration, credentials, runs or trust records; if existing trust becomes stale, report it rather than renewing it automatically.
 
 ## What is not covered
 
@@ -96,6 +105,8 @@ These are re-checked on every `pnpm test` run on macOS (`test/unit/isolation.tes
 - **File tools use permission rules, not the OS.** Claude's Read/Edit/Write are fenced by `blockReads/WritesOutsideWorkingDirectories`. That's a permission check inside Claude Code, not a kernel boundary.
 - **The reviewer can read.** Codex's read-only sandbox blocks writes and network, not reads. Its output reaches a public PR only after redaction and the secret scan.
 - **Setup has network.** Install scripts can reach the internet, but they cannot read credentials or write outside the worktree and caches.
+- **Loopback TCP stays open, by design** (test servers and local databases use it). Any host service listening on `localhost` is reachable from checks and setup: a local database, a dev server, the orchestrator's short-lived remote-approval listener, ports a container runtime forwards to localhost, and a Docker daemon exposed on TCP (Docker Desktop's "expose daemon on tcp://localhost:2375 without TLS", or `dockerd -H tcp://127.0.0.1:…`). The Unix-socket rule does not cover those. Keep Docker on its Unix socket only (the default for Docker Desktop, OrbStack and colima). Setup can also reach non-loopback addresses, including a Docker daemon on another host.
+- **Repository code cannot use Unix sockets, even its own.** A test that starts a server on a Unix socket and connects to it fails with `EPERM`. Use TCP on `localhost` instead (e.g. `PGHOST=localhost`, not a socket directory). There is deliberately no exception for sockets in the worktree or temp directories: host daemons and SSH agents keep sockets under `/tmp` and `/private/var/folders` too, and a symlink placed in the worktree could point at them. Socket pairs (child-process IPC, as vitest's workers and `tsx` use) are unaffected.
 - **Screenshots are images chosen by repository code.** Chunk filtering and the scan of raw and decompressed bytes stop plain-text leaks of what repository code can read (the private-home list). Data deliberately encoded or encrypted into pixels can't be detected.
 - **Outside `$HOME`, reads stay broad.** `/usr`, `/opt`, `/Library` and so on are readable, as is anything in the readable caches.
 - **A toolchain outside the defaults must be listed.** A repository whose checks run tools installed elsewhere under `$HOME` (`~/.pyenv`, `~/go`) needs `isolation.read_paths`. A repository that uses Node should pin `toolchain.node`, so that its install is readable.
